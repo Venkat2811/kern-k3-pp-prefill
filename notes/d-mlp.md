@@ -121,6 +121,48 @@ bandwidth, fixed EP layout), the residual epilogues sit at two dependent block r
 chain (logit load -> sigmoid -> picks -> last-block tables) at ~6.5 us. Every further trial is in the log
 and findings below with its measurement.
 
+## MLA decode lane (from 2026-10-11 00:11 UTC): a replacement for the DSL split kernel
+
+Target: `mla_attn` in D (the prebuilt FlashInfer CuTe-DSL `split_kv_kernel`: 2-CTA clusters, 96 heads padded to a
+128-row MMA tile, ~80% of bf16 peak counting the padding; 85 us at 24 rows / 128k, 34 us at 8 rows, per layer).
+Contract it must keep (k3_dcp.cu's merge): for row b, n = seq_lens[b], t = ceil(n / 128), per = ceil(t / bsk),
+S = ceil(t / per) splits of `per` tiles; acc_o[((b * 128 + h) * split_max + s) * 512 ..] the split's normalized o
+(f32), acc_lse[(b * 128 + h) * split_max + s] its log2-sum-exp of q.k * scale_log2. Pages: per layer, 64 tokens
+x 576 bf16 (73.7 KB), block_table [B, max_pages]; q_abs [B, 96, 576].
+
+Kernels (all swapped-AB: KV positions are the MMA's M, heads its N; raw PTX tcgen05, no CUTLASS), the sources in
+`work/h/k3_mla_decode_v*.cu`, the harness `work/h/mla_bench.cu CUBIN check|time` (random paged KV, a TMA map like
+the manifest's, a double-precision CPU reference of every split's o and lse; `time` at 8-48 rows x 16385 / 8193
+positions a member). Every version passes the check: lse within 1.7e-6 (log2 units), o within 7.4e-4 of max |o|
+1 (bf16 P), over rows of 1 to 3000 positions and up to 12 splits.
+
+| version | design | 24 rows / 128k | 8 rows / 128k |
+|---|---|---|---|
+| DSL (main) | heads as M (padded), 2-CTA | 85 us | 34 us |
+| v1 | 1 CTA a split, 96 heads (N 96), Q resident 110 KB, ring 2 x 32 KB, V re-read from L2, 6 warps | 293 | 142 |
+| v2 | v1 + two 48-head softmax groups, last K pairs kept for PV (7 loads a tile) | 211 | 103 |
+| v3 | a cluster pair a split, CTA r heads [48r, 48r+48) (N 48, Q 55 KB), KV by TMA multicast, ring 4 x 32 KB, S^T and P^T double-buffered (QK a tile ahead) | 172 | 71 |
+| v3 + L2 tensor prefetch of the next 1-2 tiles | | 168 | 70 |
+
+What bounds them (v3 variants in the harness): without the V re-load 172, without softmax 166, without MMAs and
+softmax 141, without multicast 174, a 2-slot ring 231, slot release by plain arrive instead of tcgen05.commit
+equal. A bare TMA stream (`work/h/tma_stream.cu`: 3D boxes of 64 x 64 bf16, 128B swizzle, all SMs) moves 8-9.5
+TB/s, 55-63 GB/s an SM. The model that fits every number: the SMs together ingest ~10 TB/s from L2, so a design
+costs its **ingest amplification** (bytes landed in shared memory over unique KV bytes). v3 lands every K byte in
+both CTAs of the pair and re-reads V: 3.8x, 1.7 GB a layer at 24 rows, 170 us predicted vs 172 measured. v1/v2
+sit below that bound only because a 2-slot ring is latency-bound.
+
+Designs by that model (24 rows / 128k, unique KV 453 MB a layer):
+- head-split pair with the whole 128-position tile resident (Q 55 + tile 147 + P 12 KB, no V re-read): 2x, ~91 us;
+- one CTA, all heads, tile resident, Q streamed from L2 in 64-column chunks: 1.75x, ~79 us, but S^T cannot be
+  double-buffered (O^T 4 x 96 + S^T 96 of the 512 TMEM columns), so QK, softmax and PV serialize;
+- a position-split pair on cta_group::2 (QK: positions as M split over the pair, Q split by N; PV: latent
+  columns as M split over the pair, each CTA also loading the partner's positions' V for its 256 columns, P^T
+  exchanged over DSMEM, per-head maxima exchanged every tile): 1.44x, ~65 us (HBM alone 57), i.e. -24%. A kernel
+  must use one cta_group for all its tcgen05 instructions, so PV cannot fall back to per-CTA MMAs. This is the
+  DSL kernel's level of machinery; not started.
+No version beat the DSL kernel, so nothing is wired into the manifest or committed in source/.
+
 ## What would still move D (2026-10-11 00:15 UTC)
 
 Every non-GEMM launch now sits between GEMMs or the prebuilt attention (launch floor), and each is at its
