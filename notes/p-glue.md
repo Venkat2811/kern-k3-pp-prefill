@@ -4,6 +4,35 @@ Target: P stage 0 since 19:54 (`loop/p/bench loop/out/p-stage0.json`), check `lo
 loop/out/p-l12.json`. Every timing claim goes through `loop/p/ab A B OUT [N]` (A, B, A, B in one
 lease; A-to-A spread 0.5-1.2% at 8192 rows); `work/swapmod.py MANIFEST main OUT` re-pins a manifest's cubins to main's.
 
+## Floor table (2026-10-11 01:50, main c593aa1 + this branch)
+
+Bytes per call at 8192 rows from the ncu pass (DRAM read + write, stage 0); "copy" is the 6.4 TB/s a
+235 MB D2D copy reaches on this GPU (the practical streaming rate), "8 TB/s" the spec rate. Harness
+times at 8192 rows, nb 1, one GPU, uncapped clocks; in-program from the stage bench (8192@0).
+
+| kernel | calls | GB a call | floor copy / 8 TB/s (us) | harness (us) | x copy floor | in-program (us) |
+|---|---|---|---|---|---|---|
+| moe_finalize_rms (ldo) | 11 | 0.99 | 155 / 124 | 150 | 0.97 | 158 |
+| land_add_attnres_rms_bf16 (K1b) | 12 | 0.54 | 85 / 68 | 112 | 1.31 | 147 |
+| land_add2_attnres_rms (K1d) | 11 | 0.56 | 87 / 70 | 113 | 1.30 | 148 |
+| moe_route | 11 | 0.40 | 62 / 49 | 83 | 1.34 | 111 |
+| mla_gate | 3 | 0.57 | 89 / 71 | 94 | 1.06 | 129 |
+| situ (layer 0) | 1 | 1.63 | 255 / 204 | 246 | 0.96 | 301 |
+| mla_prep_gather, head (8192@0) | 3 | ~0.08 | 12 / 10 | 32 | 2.6 | 48 |
+| embed_rms_setup | 1 | 0.47 | 73 / 59 | - | - | 75 |
+| land_add2 (stage end) | 1 | 0.35 | 55 / 44 | - | - | 53 |
+
+The issue-bound ones (residuals, route) lose another ~25% in the stage to the power-capped clock;
+the byte-bound ones (finalize, gate) ~5-35%. Past 1.3x: the route at 1.34x, issue-bound (60M warp
+instructions at 59% issue under ncu's fixed clock: the top-k and the situ math; transcendental pipe
+~5% busy; DRAM no longer idles through the top-k since 7b8a091), and the MLA head (one row a
+512-thread block, 3 calls ~0.1% of an item; multi-row heads measured, no gain).
+
+Lane status: closing. Every glue launch left sits between two GEMMs (or the prebuilt FMHA /
+FlashKDA), so launches are at the floor without opening those (16.7/layer, stage 0); the kernels
+are within ~1.35x of the copy rate but the MLA head; under the power cap a kernel's speedup shows in
+its own in-program time more than in the item's (this session's A/Bs: flat to -0.45% weighted).
+
 ## Session 2026-10-11 00:00- (main 6f047c6)
 
 Stage 0 A/B baseline this session: ~121-125 ms/item depending on the leased GPU (same-lease pairs
@@ -55,7 +84,16 @@ Residual now (ncu, K1d nb 1, 8192 rows): 8.6k warp-instr a row (11.4k at session
 SM at 40 registers), short-scoreboard 3.5, barrier 2.4. ~2.1k of the instructions are bf16 unpacks
 (8 a column: landing, score, candidates twice, prefix in the mix, mixed for rms and normalize).
 
+- `a quarter of the p route's warps take the top-k rows from 2048 rows` (7b8a091): the other 12
+  warps of a block start on the piece grabs at once (DRAM idled ~20 us through an all-warp top-k).
+  8192 rows 90.9 -> 83.9 us, 4096 -6%, 2048 -4%; 2 / 3 / 6 / 8 warps and thresholds 512 / 1024 /
+  4096 measured. In-program 118.0 -> 111.0 us a call at 8192@0; A/B 3 pairs flat.
+- `the p route barrier's generation sits on its own l2 line` (cef7339; p-kda's 53e41ef pattern:
+  304 blocks polled the line the arrivals' atomics hit): -0.7% at 8192 to -3.5% at 1024 rows; A/B
+  -0.45 / -0.19%. route_sync is 66 + 2 tables + 2 words.
+
 Tried, not kept (harness, bit-identical):
+- Route batch sizes again with the grabs (QBATCH 4 / 8 / 16 x SBATCH 2 / 4 / 8): 8 / 4 still best.
 - Residual on 28 warps (one vector a thread, current code): 1 block an SM at 52 registers 179 us,
   2 at 32 registers 121 us (vs 113).
 - Residual re-reading the prefix candidate for the mix (to free its registers): still 40 registers
