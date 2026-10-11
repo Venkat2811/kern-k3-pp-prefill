@@ -23,7 +23,40 @@ only). Committed (all bit-identical, P check PASS at every span):
   K1d 11.4k -> 9.4k warp-instr a row; residual -2..-7%, situ 259 -> 246 us. A/B 5 pairs +0.12% avg
   (in the band), in-program residuals + situ 4.02 -> 3.81 ms an 8192@0 item.
 
+- `the p route's situ and quant run on f32x2 and plain bf16 bits` (9348b07): route was issue-heavy
+  (73M warp-instr at 8192, 60% issue, FMUL 21%); situ pairs on mul/add.rn.f32x2, e^-g as
+  ex2.approx.ftz (only results < 2^-126 differ, and 1 + e^-g is 1 for both), fast test g >= -87.
+  97.9 -> 95.8 us; A/B -0.3%.
+- `the p route's warps take their streaming pieces off a counter` (a917b9b): ~17% of route's stall
+  samples were the grid barrier's spin (3328 of 4864 warps have two top-k rows at 8192, equal
+  static piece shares). Grabs of 8 / 4 pieces (16 / 8 from 1024 rows) off a per-call counter
+  (route_sync +2 words). 95.9 -> 90.8 us at 8192, -4..-9% from 354 rows, +0.3 us at 10 rows
+  (grabs of 8/4 at 8192: 107 us, atomic contention; 32/16 or 64/32: worse at small B).
+- `the p residual's elementwise steps run on f32x2` (1eed421): mix, landing adds, rms scaling.
+  nb 1 -0.4..-1.2%, nb 2 -2%, nb 4 -3.5%; stage 0 (nb 1) A/B flat: for the later stages.
+- `the p moe finalize runs four rows an sm` (9243a4c): __launch_bounds__(448, 4): 32 registers, no
+  spill. 157 -> 150 us; in-program 168.5 -> 158.5 us a call.
+- `the p residual reduces four sums a butterfly` (9f8225d): reduce-scatter butterfly (a lane trades
+  the values it drops for its partner's copies of the ones it keeps): each level's sums are the
+  full butterfly's, so bit-identical, 6 SHFL + 6 FADD for four values instead of 20 + 20. nb 1
+  -1..-2%, nb 2 -3.5%, nb 4 -6.5%; in-program residuals 147.6 / 148.1 -> 142.6 / 143.4 us a call.
+
+Residual now (ncu, K1d nb 1, 8192 rows): 8.6k warp-instr a row (11.4k at session start), issue
+51%, long-scoreboard 7 of ~17 cycles an issue (21% of samples at the one DRAM wait a row: 3 rows an
+SM at 40 registers), short-scoreboard 3.5, barrier 2.4. ~2.1k of the instructions are bf16 unpacks
+(8 a column: landing, score, candidates twice, prefix in the mix, mixed for rms and normalize).
+
 Tried, not kept (harness, bit-identical):
+- Residual on 28 warps (one vector a thread, current code): 1 block an SM at 52 registers 179 us,
+  2 at 32 registers 121 us (vs 113).
+- Residual re-reading the prefix candidate for the mix (to free its registers): still 40 registers
+  (the hoisted loads set the peak); with 4 blocks an SM it spills (STACK 104): +20%.
+- Residual softmax by warp 0 alone (row sums by reduce-scatter, weights through shared memory):
+  slower than every warp recomputing it (serial work before the barrier).
+- Finalize with an L2 prefetch of the 16 picked rows: 157 -> 150 at 8192 but 354 rows +28%; with
+  4 blocks an SM on top: no gain over 4 blocks alone.
+- mla_gate: 128 registers (the absorbed form shares the kernel), 2 blocks an SM, 60% issue; 3
+  calls an item: not pursued.
 - Residual keeping candidate 0 in registers for the mix (no reload): spills (STACK 104), +0..+20%.
 - Residual without the combine barrier (every warp reduces all 2(nb+1) sums, same tree) for nb <= 1
   or 2: +0..+4%. The barrier stalls are the slowest warp's DRAM wait, not the barrier.
