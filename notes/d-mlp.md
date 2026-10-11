@@ -3,6 +3,17 @@
 Check: `loop/d/check loop/out/d-l4-tp8.json` (~20 s on a free pool). Bench: `loop/d/bench loop/out/d-l16-tp8.json`
 (~20 s). main 2026-10-10 start: 24.7 launches/layer, 4.562 ms/step.
 
+## Status (2026-10-11 00:55 UTC)
+
+MLA decode lane (orchestrator 00:11): three swapped-AB tcgen05 kernels written and checked correct against a CPU
+reference (`work/h/k3_mla_decode_v*.cu`, harness `work/h/mla_bench.cu`), the best (v3: a cluster pair with
+multicast KV, 48 heads a CTA) at 172 us vs the DSL kernel's 85 at 24 rows / 128k. Measured why no swapped-AB
+layout wins for 96 heads on this GPU (section "MLA decode lane"): tcgen05.mma at M 128 / K 16 costs >= 49 cycles
+an instruction until N reaches 96-128 (shared-memory operand fetch), and shared memory fills at ~63 GB/s an SM
+(TMA, from L2 or HBM alike; DSMEM copies 40). The DSL kernel itself is fill-bound at ~1.7x KV amplification;
+the remaining upside is a heads-as-M 2-CTA kernel that re-loads less V (~1.44x, ~15% of the kernel, ~1.3% of the
+step). Nothing committed in source/ for this lane.
+
 ## Status (2026-10-10 23:50 UTC)
 
 D 16 layers: 24.7 -> 12.9 launches/layer, 4.562 -> 3.52 ms/step weighted (all runs' work; main dcf6ec0 3.53-3.58
