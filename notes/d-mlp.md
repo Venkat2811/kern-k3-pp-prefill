@@ -32,8 +32,8 @@ first all-reduce: host side, excluded). Bytes and FLOPs are one member's.
 
 Bounds, measured on this pool where it matters:
 - HBM 8 TB/s. The best kernels here reach 6.2-7.0 TB/s (MoE fc1/fc2, lm_head).
-- Tensor: ~1.6 PF bf16 and ~2.8 PF fp8 reachable on one GB300 (earlier calibration); the mxfp8 x mxfp4 MoE
-  runs at the fp8 rate. bf16 weights reach the ridge at ~200 rows, so at 8-48 rows every GEMM is HBM-bound.
+- Tensor: tcgen05 kind::f16 runs 8192 FLOP a cycle an SM from N 128 (`work/h/umma_rate.cu`; ~2.4 PF at ~1.9 GHz,
+  ~1.6 PF in the earlier whole-GEMM calibration) and ~2.8 PF fp8; the mxfp8 x mxfp4 MoE runs at the fp8 rate. bf16 weights reach the ridge at ~200 rows, so at 8-48 rows every GEMM is HBM-bound.
   MLA decode is the exception: 96 heads x 1088 MACs per 1152-byte KV row is 181 FLOP/B, at the ridge.
 - NVLink: 16-byte pushes from every SM with Lamport polling (`work/h/nvl_push8.cu`: 8 GPUs, 2 trays, fabric
   handles as kern maps them): ~2.5 us a hop, ~680 GB/s marginal egress a GPU (raw push + poll of 2.4 MB a GPU,
@@ -89,7 +89,7 @@ Non-GEMM items over 1% of the step, per call (24 / 48 rows):
 | item | % of step | median us | bound us | what is in the gap |
 |---|---|---|---|---|
 | `ar_finalize_rms` | 12.9 / 12.0 | 27.2 / 33.8 | 7.8 / 13.1 + ~2 epilogue | p10 11.2 / 16.4 = at the bound; the median waits ~16 us for the member with the most active experts (EP imbalance: the MoE GEMMs of the busiest member) |
-| MLA attention | 10.4 / 16.8 | 85 / 187 | 57 / 113 (HBM), 137 at 48 rows if 96 heads pad to 128 | prebuilt DSL cubin at 5.3 / 4.85 TB/s; the 48-row case is near the padded tensor bound |
+| MLA attention | 10.4 / 16.8 | 85 / 187 | 57 / 113 (HBM) | prebuilt DSL cubin at 5.3 / 4.85 TB/s of unique KV, ~1.7x that landed in shared memory (fill-bound, MLA lane); 48 rows ran on 96 SMs (plan fixed) |
 | `ar_attnres_rms` | 6.2 / 5.8 | 13.0 / 16.6 | 6.0 / 9.6 + ~2.3 epilogue | raw push + poll alone takes 8.4 / 11.9 us here: within ~1-2 us of the fabric |
 | KDA core | 3.9 / 3.8 | 11.0 / 14.6 | 4.7 / 9.4 | 43% / 65% of HBM (d-attn: register cliff at 128) |
 | `moe_front` | 3.5 / 2.5 | 7.4 / 7.5 | ~2 | dependent chain logits -> top-k -> last-block tables (harness floor 6.4) |
@@ -112,9 +112,10 @@ ms step (~6%): the largest gap left in D, and not reachable by anything outside 
 from the all-reduces already takes front and lat_up partway).
 
 MLA attention per tile (from the profile): a 2-CTA cluster runs a 128-token tile in ~1.46 us while <= ~53
-clusters run, and the GPU tops out at ~36 tiles a us (1.29 PF of padded bf16 MMA, ~80% of peak; 96 heads use 75%
-of the 128-row tile). So 24 rows (3 splits, 72 clusters) sits at that limit, and 48 rows ran 1 split on 96 SMs:
-fixed by the plan (log). Past that the kernel needs an unpadded head layout (a new kernel).
+clusters run, and the GPU tops out at ~36 tiles a us. That was first read as the padded tensor bound (1.29 PF
+of padded bf16 MMA); the MLA lane's measurements (below) say it is the shared-memory fill instead (~9.5 TB/s
+landed in all, the DSL kernel at ~1.7x KV amplification). 48 rows ran 1 split on 96 SMs: fixed by the plan
+(log).
 
 **After this round** (branch 52a4446 + notes, same tooling, `work/prof93b_*`): the critical path 19.66 -> 19.20 ms
 at 24 rows and 26.77 -> 25.79 at 48. Dense GEMMs 5.53 -> 5.02 / 5.87 -> 5.32 ms (front and lat_up from L2), MLA
@@ -206,8 +207,8 @@ registers), the head at member 0's logits ingress. What is left, all outside thi
   active experts (median ~16 us a layer; real text puts the busiest member at 1.23x the mean, ~6.6 extra
   experts x 17.5 MB). Needs a layout change (redundant hot experts / EPLB, or token-to-member balancing).
 - **Dense GEMMs at 4.3-5.6 TB/s, ~1.2 ms (~6%)**: a small-M GEMM at ~6.5 TB/s (see GEMM headroom).
-- **MLA attention's head padding, up to ~0.5 ms (~2.6%; more at 48 rows)**: the prebuilt DSL kernel runs 96
-  heads in a 128-row MMA tile, compute-bound at ~80% of bf16 peak counting the padding. Needs a new kernel.
+- **MLA attention, ~0.25 ms (~1.3%)**: the prebuilt DSL kernel is bound by filling shared memory (~1.7x the KV
+  bytes); a heads-as-M 2-CTA kernel loading less V would gain ~15% of it (MLA decode lane below).
 - **Runtime proposals below**: the head's logits gather (9-50 us a step), concurrent launch groups.
 
 ## Proposals that need the runtime
