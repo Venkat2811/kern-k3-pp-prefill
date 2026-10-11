@@ -225,51 +225,77 @@ __device__ __forceinline__ float tanh_approx(float x) {
   return r;
 }
 
-// k3_prefill_glue.cu's kern_k3g_situ: act = situ(gate, up) on 8 columns; `fast` when every
-// lane's sigmoid denominators are in rcp_fast's range.
-__device__ __forceinline__ float situ(float g, float u, bool fast) {
-  const float a = 4.0f * tanh_approx(g * 0.25f);
-  const float d = 1.0f + __expf(-g);
-  const float s = fast ? rcp_fast(d) : __frcp_rn(d);
-  const float c = 25.0f * tanh_approx(u * 0.04f);
-  return (a * s) * c;
+// bf16 pairs as plain bits: a bf16 is the top half of its f32; cvt.rn.bf16x2.f32 packs two
+__device__ __forceinline__ float2 unpack2(unsigned u) {
+  return make_float2(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u));
+}
+__device__ __forceinline__ unsigned pack2(float2 f) {
+  unsigned r;
+  asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(f.y), "f"(f.x));
+  return r;
+}
+// two IEEE multiplies / adds in one f32x2 instruction, each lane rounded as the scalar one
+__device__ __forceinline__ unsigned long long b64(float2 a) { return *reinterpret_cast<unsigned long long*>(&a); }
+__device__ __forceinline__ float2 f2(unsigned long long d) { return *reinterpret_cast<float2*>(&d); }
+__device__ __forceinline__ float2 mul2(float2 a, float2 b) {
+  unsigned long long d;
+  asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(d) : "l"(b64(a)), "l"(b64(b)));
+  return f2(d);
+}
+__device__ __forceinline__ float2 add2(float2 a, float2 b) {
+  unsigned long long d;
+  asm("add.rn.f32x2 %0, %1, %2;" : "=l"(d) : "l"(b64(a)), "l"(b64(b)));
+  return f2(d);
+}
+__device__ __forceinline__ float ex2_ftz(float x) {
+  float r;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+  return r;
+}
+
+// k3_prefill_glue.cu's kern_k3g_situ on a pair of columns: (4 tanh(g / 4) * sigmoid(g)) * 25 tanh(u / 25),
+// e^-g as __expf's ex2 of -g log2(e) (flushed below 2^-126, where 1 + e^-g is 1 either way); `fast`
+// when every lane's g >= -87, so 1 + e^-g < 2^126 is in rcp_fast's range.
+__device__ __forceinline__ unsigned situ2(unsigned gw, unsigned uw, bool fast) {
+  const float2 g = unpack2(gw), u = unpack2(uw);
+  const float2 tg = mul2(g, make_float2(0.25f, 0.25f)), tu = mul2(u, make_float2(0.04f, 0.04f));
+  const float2 x = mul2(g, make_float2(-1.44269502f, -1.44269502f));
+  const float2 d = add2(make_float2(ex2_ftz(x.x), ex2_ftz(x.y)), make_float2(1.0f, 1.0f));
+  const float2 a = mul2(make_float2(tanh_approx(tg.x), tanh_approx(tg.y)), make_float2(4.0f, 4.0f));
+  const float2 c = mul2(make_float2(tanh_approx(tu.x), tanh_approx(tu.y)), make_float2(25.0f, 25.0f));
+  const float2 sg = fast ? make_float2(rcp_fast(d.x), rcp_fast(d.y)) : make_float2(__frcp_rn(d.x), __frcp_rn(d.y));
+  return pack2(mul2(mul2(a, sg), c));
 }
 
 __device__ __forceinline__ void situ8(const uint4 g, const uint4 u, bf16_t* __restrict__ act) {
-  const __nv_bfloat162* gp = reinterpret_cast<const __nv_bfloat162*>(&g);
-  const __nv_bfloat162* upp = reinterpret_cast<const __nv_bfloat162*>(&u);
+  const unsigned* gp = reinterpret_cast<const unsigned*>(&g);
+  const unsigned* upp = reinterpret_cast<const unsigned*>(&u);
   uint4 o;
-  __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(&o);
+  unsigned* op = reinterpret_cast<unsigned*>(&o);
   bool ok = true;
 #pragma unroll
   for (int l = 0; l < 4; ++l) {
-    const float2 gf = __bfloat1622float2(gp[l]);
-    ok &= rcp_ok(1.0f + __expf(-gf.x)) & rcp_ok(1.0f + __expf(-gf.y));
+    const float2 gf = unpack2(gp[l]);
+    ok = ok && gf.x >= -87.0f && gf.y >= -87.0f;
   }
   if (__all_sync(0xffffffffu, ok)) {
 #pragma unroll
-    for (int l = 0; l < 4; ++l) {
-      const float2 gf = __bfloat1622float2(gp[l]), uf = __bfloat1622float2(upp[l]);
-      op[l] = __float22bfloat162_rn(make_float2(situ(gf.x, uf.x, true), situ(gf.y, uf.y, true)));
-    }
+    for (int l = 0; l < 4; ++l) op[l] = situ2(gp[l], upp[l], true);
   } else {
 #pragma unroll
-    for (int l = 0; l < 4; ++l) {
-      const float2 gf = __bfloat1622float2(gp[l]), uf = __bfloat1622float2(upp[l]);
-      op[l] = __float22bfloat162_rn(make_float2(situ(gf.x, uf.x, false), situ(gf.y, uf.y, false)));
-    }
+    for (int l = 0; l < 4; ++l) op[l] = situ2(gp[l], upp[l], false);
   }
   *reinterpret_cast<uint4*>(act) = o;
 }
 
 // kern_k3_moe_quant on 8 elements, four lanes a 32-element group.
 __device__ __forceinline__ void quant8(const uint4 u, uint8_t* __restrict__ q, uint8_t* __restrict__ sf, int lane) {
-  const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&u);
+  const unsigned* p = reinterpret_cast<const unsigned*>(&u);
   float2 v[4];
   float amax = 0.f;
 #pragma unroll
   for (int l = 0; l < 4; ++l) {
-    v[l] = __bfloat1622float2(p[l]);
+    v[l] = unpack2(p[l]);
     amax = fmaxf(amax, fmaxf(fabsf(v[l].x), fabsf(v[l].y)));
   }
   amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
@@ -281,8 +307,7 @@ __device__ __forceinline__ void quant8(const uint4 u, uint8_t* __restrict__ q, u
   uint2 w;
   unsigned short* h = reinterpret_cast<unsigned short*>(&w);
 #pragma unroll
-  for (int l = 0; l < 4; ++l)
-    h[l] = __nv_cvt_float2_to_fp8x2(make_float2(v[l].x * s, v[l].y * s), __NV_SATFINITE, __NV_E4M3);
+  for (int l = 0; l < 4; ++l) h[l] = __nv_cvt_float2_to_fp8x2(mul2(v[l], make_float2(s, s)), __NV_SATFINITE, __NV_E4M3);
   *reinterpret_cast<uint2*>(q) = w;
 }
 
