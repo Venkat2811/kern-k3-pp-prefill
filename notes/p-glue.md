@@ -75,6 +75,14 @@ Tried, not kept (harness, bit-identical):
   MUFU at 16 an SM a clock vs 207 us of bytes). Only the rcp could leave the MUFU bit-identically
   (an FMA-only correctly rounded reciprocal, needs an exhaustive check like rcp_fast's): ~30 us an
   item for the one dense call, and it would add ~15% instructions to the issue-bound route. Not done.
+- mla_prep_gather with 2 / 4 / 8 head rows a block (every row's loads first, slots via shared memory,
+  one grid for both forms: ceil(B / 4) + B + 1 + gather blocks): bit-identical (work/hp harness:
+  q_norm, slab, latent_g, the absorbed form's tables), but 2 rows flat, 4 rows +7..+12% (32
+  registers with spills) or +25% (53 registers: 2 blocks an SM, the gather blocks slowed too).
+  `when` alternatives per form would count as launches in loop/count (+3 a stage): not used.
+- Residual candidates in pairs (pass 1, pass 2 or both: two candidates' loads in flight): spills at
+  the 40-register cap, +1..+14% at every nb. At nb 8 the residual is 276 us at 8192 rows (bytes
+  ~172 us), each candidate past the first ~23 us; only fewer registers a row would help.
 - mla_gate: 128 registers (the absorbed form shares the kernel), 2 blocks an SM, 60% issue; 3
   calls an item: not pursued.
 - Residual keeping candidate 0 in registers for the mix (no reload): spills (STACK 104), +0..+20%.
