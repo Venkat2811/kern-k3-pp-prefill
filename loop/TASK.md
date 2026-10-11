@@ -33,9 +33,11 @@ unrelated loops glued in one grid with nothing shared); say which in
 slower. The score is the traffic-weighted step time.
 
 Out of scope:
-- the GEMMs: cuBLASLt (`gemm_bf16`, `gemm_f32`) and TRT-LLM gen batched
-  GEMMs (`moe_fc1`, `moe_fc2`) keep their kernels; fusing into their inputs
-  or outputs from the neighbouring kernel is in scope, replacing them is not
+- the GEMMs, unless your round opens them: cuBLASLt (`gemm_bf16`,
+  `gemm_f32`) and TRT-LLM gen batched GEMMs (`moe_fc1`, `moe_fc2`) keep their
+  kernels; fusing into their inputs or outputs from the neighbouring kernel
+  is in scope, replacing them is not. Round 2 opens D's GEMMs
+  (`loop/rounds/r2/GEMM.md`, with a stricter numerics rule)
 - quantization: no new low-precision weights, activations or KV beyond
   what the manifests already use
 - the parallel layout (TP / EP / DCP widths, PP split, MegaMoE): fixed
@@ -71,14 +73,14 @@ through `loop/withgpu`; never run GPU work outside it.
 | `loop/d/bench loop/out/d-l16-tp8.json OUT` | D step, 16 layers, real TP8 over two hosts, 64k/128k contexts, 8-48 rows; weighted cost | 8 | ~2 min |
 | `loop/d/check loop/out/d-l4-tp8.json OUT` | 4 TP8 layers teacher-forced over real text against the one-GPU oracle, judged against main's band | 8 | ~1.5 min |
 
-Main's numbers (measured on this pool, 2026-10-10; do not re-measure):
+Main's numbers (measured on this pool; do not re-measure; `$K3_LOOP_DATA/base/` is current):
 
 | | main |
 |---|---|
 | P stage 0, weighted (`loop/score`) | 132.00 ms/item at the loop's start (3ad4ec9); 8192 rows: 148.4 ms over an empty prefix, 350.6 ms over 196k. MLA attention (`mla_fmha`) is ~40% of it |
-| P launches | 325 per stage, 27.1/layer |
-| D 16 layers, weighted | 4.562 ms/step; 48 rows over 128k: 6.08 ms |
-| D launches | 395 per step, 24.7/layer |
+| P launches | 16.7/layer after round 1 (27.1 at its start); ~122-124 ms/item |
+| D 16 layers, weighted | 3.486 ms/step after round 1 (4.562 at its start) |
+| D launches | 207 per step, 12.9/layer after round 1 (395 at its start) |
 | D check | top-1 0.9176 · relRMS median 0.0177 max 0.0829 · 1 confident flip, vs the oracle; bit-identical run to run |
 
 `$K3_LOOP_DATA/base/` holds main's manifests and reports (`p-bench.json`,
