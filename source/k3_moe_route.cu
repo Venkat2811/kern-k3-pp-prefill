@@ -527,7 +527,8 @@ __device__ __forceinline__ float2 fma2(float2 a, float2 b, float2 c) {
   return *reinterpret_cast<float2*>(&d);
 }
 
-extern "C" __global__ void __launch_bounds__(LATENT / 8) kern_k3g_moe_finalize_rms(
+// four blocks an SM (32 registers): the more rows' gathers in flight, the less of the DRAM latency shows
+extern "C" __global__ void __launch_bounds__(LATENT / 8, 4) kern_k3g_moe_finalize_rms(
     const bf16_t* __restrict__ fc2, const int* __restrict__ exp2perm, const float* __restrict__ wts,
     const bf16_t* __restrict__ gamma, bf16_t* __restrict__ out, int ldo, int T) {
   __shared__ float sm[33];
