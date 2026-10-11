@@ -89,16 +89,16 @@ __device__ __forceinline__ V8 ldv(const void* p) {
   return v;
 }
 __device__ __forceinline__ void stv(void* p, const V8& v) { *(uint4*)p = make_uint4(v.w[0], v.w[1], v.w[2], v.w[3]); }
-__device__ __forceinline__ bf162_t as_bf162(unsigned u) {
-  return __halves2bfloat162(__ushort_as_bfloat16((unsigned short)(u & 0xffffu)),
-                            __ushort_as_bfloat16((unsigned short)(u >> 16)));
+// bf16 pairs as plain bits: a bf16 is the top half of its f32, and cvt.rn.bf16x2.f32 packs two
+// (what __float22bfloat162_rn emits) without the half-word moves of going through bf162_t
+__device__ __forceinline__ bf162_t as_bf162(unsigned u) { return *reinterpret_cast<const bf162_t*>(&u); }
+__device__ __forceinline__ unsigned from_bf162(bf162_t h) { return *reinterpret_cast<const unsigned*>(&h); }
+__device__ __forceinline__ float2 bf2f(unsigned u) { return make_float2(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u)); }
+__device__ __forceinline__ unsigned f2bf(float2 f) {
+  unsigned r;
+  asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(f.y), "f"(f.x));
+  return r;
 }
-__device__ __forceinline__ unsigned from_bf162(bf162_t h) {
-  return (unsigned)(unsigned short)__bfloat16_as_ushort(__low2bfloat16(h)) |
-         ((unsigned)(unsigned short)__bfloat16_as_ushort(__high2bfloat16(h)) << 16);
-}
-__device__ __forceinline__ float2 bf2f(unsigned u) { return __bfloat1622float2(as_bf162(u)); }
-__device__ __forceinline__ unsigned f2bf(float2 f) { return from_bf162(__float22bfloat162_rn(f)); }
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
