@@ -125,6 +125,30 @@ __device__ __forceinline__ float warp_sum(float v) {
   return v;
 }
 
+// Four (two) values reduced over the warp at once, each by the 32-lane xor butterfly's own tree: a lane
+// trades the values it drops for its partner's copies of the ones it keeps, so a level's sums are the
+// butterfly's (fp addition commutes) at half the shuffles. Lane l ends with the sum of value
+// 2 * bit4(l) + bit3(l) (of value bit4(l)).
+__device__ __forceinline__ float warp_sum4(float a, float b, float c, float d, int lane) {
+  const bool h = lane & 16, e = lane & 8;
+  float k0 = h ? c : a, k1 = h ? d : b;
+  k0 += __shfl_xor_sync(0xffffffffu, h ? a : c, 16);
+  k1 += __shfl_xor_sync(0xffffffffu, h ? b : d, 16);
+  float v = e ? k1 : k0;
+  v += __shfl_xor_sync(0xffffffffu, e ? k0 : k1, 8);
+#pragma unroll
+  for (int o = 4; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+  return v;
+}
+__device__ __forceinline__ float warp_sum2(float a, float b, int lane) {
+  const bool h = lane & 16;
+  float v = h ? b : a;
+  v += __shfl_xor_sync(0xffffffffu, h ? a : b, 16);
+#pragma unroll
+  for (int o = 8; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+  return v;
+}
+
 struct RowSmem {
   float red[(KNB_MAX + 1) * 2][RSLOTS];  // [value][group] partials
   float val[(KNB_MAX + 1) * 2];          // [value] row sums
@@ -184,28 +208,25 @@ __device__ __forceinline__ void attnres_rms_row(const bf16_t* __restrict__ blk_r
       w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w;
       w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
     };
-    auto score = [&](int c, const V8& x, int k) {
-      float w[8], sq, dp;
-      swk(k, w);
-      sq_dot(x, w, sq, dp);
-      sq = warp_sum(sq);
-      dp = warp_sum(dp);
-      if (lane == 0) {
-        s.red[c * 2][warp + k * RWARPS] = sq;
-        s.red[c * 2 + 1][warp + k * RWARPS] = dp;
-      }
-    };
+    // value 2k of a lane's four is group k's sum of squares, 2k + 1 its dot product with sw
+    auto score = [&](int c, const V8 (&x)[RGROUPS]) {
+      float w[8], sq[RGROUPS], dp[RGROUPS];
 #pragma unroll
-    for (int k = 0; k < RGROUPS; ++k) score(0, x0[k], k);
+      for (int k = 0; k < RGROUPS; ++k) {
+        swk(k, w);
+        sq_dot(x[k], w, sq[k], dp[k]);
+      }
+      const float v = warp_sum4(sq[0], dp[0], sq[1], dp[1], lane);
+      if ((lane & 7) == 0) s.red[c * 2 + (lane >> 3 & 1)][warp + (lane >> 4) * RWARPS] = v;
+    };
+    score(0, x0);
     for (int c = 1; c < nb; ++c) {
       V8 x[RGROUPS];
 #pragma unroll
       for (int k = 0; k < RGROUPS; ++k) x[k] = ldv(blk_row + (size_t)c * KH + (t + k * RTHREADS) * 8);
-#pragma unroll
-      for (int k = 0; k < RGROUPS; ++k) score(c, x[k], k);
+      score(c, x);
     }
-#pragma unroll
-    for (int k = 0; k < RGROUPS; ++k) score(nb, pv[k], k);
+    score(nb, pv);
     __syncthreads();
 
     for (int v = warp; v < 2 * ncand; v += RWARPS) {
@@ -252,18 +273,19 @@ __device__ __forceinline__ void attnres_rms_row(const bf16_t* __restrict__ blk_r
     }
   }
 
+  float sq[RGROUPS];
 #pragma unroll
   for (int k = 0; k < RGROUPS; ++k) {
-    float sq = 0.f;
+    sq[k] = 0.f;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       const float2 f = bf2f(mixed[k].w[j]);
-      sq += f.x * f.x;
-      sq += f.y * f.y;
+      sq[k] += f.x * f.x;
+      sq[k] += f.y * f.y;
     }
-    sq = warp_sum(sq);
-    if (lane == 0) s.red2[warp + k * RWARPS] = sq;
   }
+  const float sqs = warp_sum2(sq[0], sq[1], lane);
+  if ((lane & 15) == 0) s.red2[warp + (lane >> 4) * RWARPS] = sqs;
   __syncthreads();
   const float tot = warp_sum(s.red2[lane]);
   const float r = rsqrtf(tot * (1.0f / (float)KH) + KEPS);
