@@ -165,7 +165,17 @@ Designs by that model (24 rows / 128k, unique KV 453 MB a layer):
   the 93-layer step). A kernel
   must use one cta_group for all its tcgen05 instructions, so PV cannot fall back to per-CTA MMAs. This is the
   DSL kernel's level of machinery; not started.
-No version beat the DSL kernel, so nothing is wired into the manifest or committed in source/.
+- heads as M (as the DSL kernel), the KV tile loaded once and used as K-major B for QK and MN-major B for PV, P
+  in tensor memory: 1.0x would be ~50 us, but O^T over 512 latent columns fills one CTA's 512 TMEM columns, so the
+  pair must split the latent columns for PV while QK splits positions, and each CTA then lacks the partner's
+  positions' V for its columns. Copying it shared-to-shared over the cluster (`work/h/dsmem_copy.cu`:
+  cp.async.bulk shared::cluster, every SM sending and receiving) moves 39-40 GB/s an SM, slower than TMA from
+  global, so that sharing costs as much as loading it again: back to ~1.44x.
+No version beat the DSL kernel, so nothing is wired into the manifest or committed in source/. The lane's
+ceiling as measured: any decode MLA here lands KV in shared memory at <= ~9.5 TB/s in total, the DSL kernel
+already reaches 1.7x amplification at that rate, and the best feasible layout (1.44x) is worth ~15% of the
+kernel, ~1.3% of the 93-layer step, at the DSL kernel's level of machinery (cta_group::2 for both GEMMs,
+per-tile max exchange, P over DSMEM).
 
 ## What would still move D (2026-10-11 00:15 UTC)
 
