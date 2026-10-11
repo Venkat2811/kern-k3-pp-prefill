@@ -100,6 +100,13 @@ __device__ __forceinline__ unsigned f2bf(float2 f) {
   return r;
 }
 
+// bf16(f32(a) + f32(b)) for two bf16 pairs: their f32 sum is exact unless the exponents are more than 16
+// apart, and then the smaller cannot reach the bf16 half ulp, so one rounding of the exact sum is the same
+__device__ __forceinline__ unsigned add_bf2(unsigned a, unsigned b) {
+  unsigned r;
+  asm("add.rn.bf16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+  return r;
+}
 __device__ __forceinline__ unsigned long long b64(float2 a) { return *reinterpret_cast<unsigned long long*>(&a); }
 __device__ __forceinline__ float2 f2(unsigned long long d) { return *reinterpret_cast<float2*>(&d); }
 // two IEEE ops in one f32x2 instruction, each lane rounded as the scalar op
@@ -411,7 +418,7 @@ extern "C" __global__ void __launch_bounds__(RTHREADS, 3) kern_k3g_land_add_attn
     } else {
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
-        pv[k].w[j] = f2bf(add2f(bf2f(pv[k].w[j]), bf2f(f2bf(bf2f(lp[k].w[j])))));
+        pv[k].w[j] = add_bf2(pv[k].w[j], lp[k].w[j]);
       }
     }
     stv(prefix2 + (size_t)b * KH + (t + k * RTHREADS) * 8, pv[k]);
@@ -426,8 +433,7 @@ __device__ __forceinline__ V8 add2v(const V8& a, const V8& c, const V8& pr, int 
   V8 o;
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
-    const float2 h = add2f(bf2f(pr.w[j]), bf2f(a.w[j]));
-    o.w[j] = f2bf(two ? add2f(h, bf2f(c.w[j])) : h);
+    o.w[j] = two ? f2bf(add2f(add2f(bf2f(pr.w[j]), bf2f(a.w[j])), bf2f(c.w[j]))) : add_bf2(pr.w[j], a.w[j]);
   }
   return o;
 }
