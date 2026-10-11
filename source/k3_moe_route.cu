@@ -10,10 +10,10 @@
 //     q u8 [B, LATENT], sf u8 [B, LATENT / 32]: k3_moe_prefill.cu's kern_k3_moe_quant;
 //     idx i32 / wts f32 [B, 16]: k3_prefill_glue.cu's router top-k, bit for bit;
 //     act bf16 [B, ldact]: the shared expert's activation, k3_prefill_glue.cu's kern_k3g_situ;
-//     sync u32 [2 + 2 * TABLE]: the grid barrier (arrivals, generation) and two routing tables
-//       (Table below), the generation's parity picking this call's; zeroed by
+//     sync u32 [2 + 2 * TABLE + 2]: the grid barrier (arrivals, generation), two routing tables
+//       (Table below) and two piece counters, the generation's parity picking this call's; zeroed by
 //       kern_k3g_moe_route_init before a stage's first call, every call of a stage's B rows
-//       leaves the barrier and the next call's table zero;
+//       leaves the barrier and the next call's table and counter zero;
 //     the tables FlashInfer's routing writes for a rank holding every expert, `tile` rows a CTA.
 //   grid (64, 1, 1) up to 256 rows, then (304, 1, 1)   block (512, 1, 1): every block resident
 //   (two an SM) for the grid barrier
@@ -33,8 +33,9 @@
 // Phase 1: a warp a row's top-k (a grid-stride over rows when B passes 16 *
 // gridDim), its picks marked in this call's table (each expert's count, its
 // count per 256-row chunk, its rows' bitmap: fire-and-forget atomics); then
-// every warp a share of the rows' 256-column pieces of the latent to quantise
-// and of the shared activation; the next call's table zeroed. A grid barrier: every
+// the warps take grabs of the rows' 256-column pieces of the latent to quantise
+// and of the shared activation off a counter; the next call's table and counter
+// zeroed. A grid barrier: every
 // block is resident, the generation counts the calls. Phase 2: every block
 // scans the counts into the experts' CTA offsets and writes its share of the
 // CTA tables; a pick's place among its expert's rows is the picks in the
@@ -318,6 +319,7 @@ __device__ __forceinline__ void quant8(const uint4 u, uint8_t* __restrict__ q, u
 #define CHUNKS (MAX_ROWS / CHUNK)
 #define WORDS (MAX_ROWS / 32)
 #define TABLE (EXPERTS * (1 + CHUNKS + WORDS))
+#define SYNC_WORDS (2 + 2 * TABLE + 2)  // barrier count, generation, two tables, two piece counters
 static_assert(CHUNKS <= 32 && CHUNK / 32 <= 32, "a chunk prefix is one warp sum");
 struct Table {
   int* tot;   // [EXPERTS]
@@ -379,44 +381,55 @@ extern "C" __global__ void __launch_bounds__(THREADS, 2) kern_k3g_moe_route(
       atomicOr(cur.bits + pick_e * WORDS + b / 32, 1u << (b & 31));
     }
   }
-  // the rows' latent and shared activation, 256 columns a warp a pass over every warp, the first
-  // pieces to the warps that had no top-k row (on a short chunk, the top-k and these overlap)
+  // the rows' latent and shared activation in grabs of 256-column pieces, each warp taking the next
+  // grab off this call's counter when it is done with the last (and with its top-k rows): the warps
+  // with two top-k rows take fewer, and every warp reaches the grid barrier at about the same time
   const int nq = B * (LATENT / 256), ns = B * (SHARED / 256);
-  const int i0 = (r0 + rstride - min(B, rstride)) % rstride;
-  // a batch of pieces' loads in flight before any of the warp-wide votes and shuffles that would hold
-  // the next piece's loads back
-  for (int i = i0; i < nq; i += QBATCH * rstride) {
-    uint4 u[QBATCH];
+  const int gq = B >= 1024 ? 2 * QBATCH : QBATCH, gs = B >= 1024 ? 2 * SBATCH : SBATCH;  // fewer grabs, less contention
+  const int nqb = (nq + gq - 1) / gq, nsb = (ns + gs - 1) / gs;
+  u32* const ctr = sync + SYNC_WORDS - 2;
+  if (gt == 0) ctr[~gen & 1] = 0;
+  for (;;) {
+    int g = 0;
+    if (lane == 0) g = (int)atomicAdd(ctr + (gen & 1), 1u);
+    g = __shfl_sync(0xffffffffu, g, 0);
+    if (g >= nqb + nsb) break;
+    if (g < nqb) {
+      for (int i0 = g * gq; i0 < min(nq, (g + 1) * gq); i0 += QBATCH) {
+        uint4 u[QBATCH];
 #pragma unroll
-    for (int k = 0; k < QBATCH; ++k) {
-      const int ik = min(i + k * rstride, nq - 1);
-      const int b = ik / (LATENT / 256), c = ik % (LATENT / 256) * 256 + lane * 8;
-      u[k] = *reinterpret_cast<const uint4*>(x + (long long)b * ldx + c);
-    }
+        for (int k = 0; k < QBATCH; ++k) {
+          const int ik = min(i0 + k, nq - 1);
+          const int b = ik / (LATENT / 256), c = ik % (LATENT / 256) * 256 + lane * 8;
+          u[k] = *reinterpret_cast<const uint4*>(x + (long long)b * ldx + c);
+        }
 #pragma unroll
-    for (int k = 0; k < QBATCH; ++k) {
-      const int ik = i + k * rstride;
-      if (ik >= nq) break;
-      const int b = ik / (LATENT / 256), c = ik % (LATENT / 256) * 256 + lane * 8;
-      quant8(u[k], q + (long long)b * LATENT + c, sf + (long long)b * (LATENT / 32) + c / 32, lane);
-    }
-  }
-  for (int i = (i0 + rstride - nq % rstride) % rstride; i < ns; i += SBATCH * rstride) {
-    uint4 g[SBATCH], u[SBATCH];
+        for (int k = 0; k < QBATCH; ++k) {
+          const int ik = i0 + k;
+          if (ik >= nq) break;
+          const int b = ik / (LATENT / 256), c = ik % (LATENT / 256) * 256 + lane * 8;
+          quant8(u[k], q + (long long)b * LATENT + c, sf + (long long)b * (LATENT / 32) + c / 32, lane);
+        }
+      }
+    } else {
+      for (int i0 = (g - nqb) * gs; i0 < min(ns, (g - nqb + 1) * gs); i0 += SBATCH) {
+        uint4 gg[SBATCH], u[SBATCH];
 #pragma unroll
-    for (int k = 0; k < SBATCH; ++k) {
-      const int ik = min(i + k * rstride, ns - 1);
-      const int b = ik / (SHARED / 256), c = ik % (SHARED / 256) * 256 + lane * 8;
-      const bf16_t* gate = gu + (long long)b * ldgu + c;
-      g[k] = *reinterpret_cast<const uint4*>(gate);
-      u[k] = *reinterpret_cast<const uint4*>(gate + SHARED);
-    }
+        for (int k = 0; k < SBATCH; ++k) {
+          const int ik = min(i0 + k, ns - 1);
+          const int b = ik / (SHARED / 256), c = ik % (SHARED / 256) * 256 + lane * 8;
+          const bf16_t* gate = gu + (long long)b * ldgu + c;
+          gg[k] = *reinterpret_cast<const uint4*>(gate);
+          u[k] = *reinterpret_cast<const uint4*>(gate + SHARED);
+        }
 #pragma unroll
-    for (int k = 0; k < SBATCH; ++k) {
-      const int ik = i + k * rstride;
-      if (ik >= ns) break;
-      const int b = ik / (SHARED / 256), c = ik % (SHARED / 256) * 256 + lane * 8;
-      situ8(g[k], u[k], act + (long long)b * ldact + c);
+        for (int k = 0; k < SBATCH; ++k) {
+          const int ik = i0 + k;
+          if (ik >= ns) break;
+          const int b = ik / (SHARED / 256), c = ik % (SHARED / 256) * 256 + lane * 8;
+          situ8(gg[k], u[k], act + (long long)b * ldact + c);
+        }
+      }
     }
   }
 
@@ -500,7 +513,7 @@ extern "C" __global__ void __launch_bounds__(THREADS, 2) kern_k3g_moe_route(
 }
 
 extern "C" __global__ void __launch_bounds__(1024) kern_k3g_moe_route_init(u32* __restrict__ sync) {
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < 2 + 2 * TABLE; i += gridDim.x * blockDim.x) sync[i] = 0;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < SYNC_WORDS; i += gridDim.x * blockDim.x) sync[i] = 0;
 }
 
 // The row's 16 (permuted row, weight) pairs staged in shared memory, read back by every thread (a

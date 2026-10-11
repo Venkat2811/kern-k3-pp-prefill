@@ -88,7 +88,7 @@ def pieces(local, experts, tokens, tokens_max, rows_max, quant_rows, out_rows, p
            if flash and not fused else {} if fused else
            {n("blockcount"): {"dtype": "i32", "shape": [blocks_max, local], "kind": "workspace"},
             n("blockoff"): {"dtype": "i32", "shape": [blocks_max, local], "kind": "workspace"}}),
-        **({n("route_sync"): {"dtype": "u32", "shape": [2 + 2 * experts * (1 + ROUTE_ROWS // 256 + ROUTE_ROWS // 32)],
+        **({n("route_sync"): {"dtype": "u32", "shape": [4 + 2 * experts * (1 + ROUTE_ROWS // 256 + ROUTE_ROWS // 32)],
                               "kind": "workspace"}} if fused else {}),
         n("cta_batch"): {"dtype": "i32", "shape": [ctas_max], "kind": "workspace"},
         n("cta_limit"): {"dtype": "i32", "shape": [ctas_max], "kind": "workspace"},
@@ -224,7 +224,7 @@ def pieces(local, experts, tokens, tokens_max, rows_max, quant_rows, out_rows, p
         ]
 
     return {"buffers": buffers, "ops": ops, "quant_step": quant_step, "route_step": route_step,
-            "route_init_step": route_init_step, "route_sync_words": 2 + 2 * experts * (1 + ROUTE_ROWS // 256 + ROUTE_ROWS // 32),
+            "route_init_step": route_init_step, "route_sync_words": 4 + 2 * experts * (1 + ROUTE_ROWS // 256 + ROUTE_ROWS // 32),
             "steps": steps, "tile": tile,
             "padded_max": padded_max}
 
