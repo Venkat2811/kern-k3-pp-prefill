@@ -171,6 +171,13 @@ Designs by that model (24 rows / 128k, unique KV 453 MB a layer):
   positions' V for its columns. Copying it shared-to-shared over the cluster (`work/h/dsmem_copy.cu`:
   cp.async.bulk shared::cluster, every SM sending and receiving) moves 39-40 GB/s an SM, slower than TMA from
   global, so that sharing costs as much as loading it again: back to ~1.44x.
+- **Swapped-AB is also tensor-bound at these N.** `work/h/umma_rate.cu` (one thread issuing tcgen05.mma kind::f16,
+  M 128, K 16, both operands K-major SW128 in shared memory, all SMs): 48.8 cycles an instruction for every N
+  <= 64 (one accumulator or four in rotation), 56 at N 96, full rate (8192 FLOP a cycle an SM) only from N 128
+  (64 cycles). That is the shared-memory operand fetch: A alone is 4 KB an instruction (32 cycles at 128 B a
+  cycle), plus N x 32 B of B. With the heads as N, a CTA holding 48 heads runs its MMAs at 49% of the tensor
+  rate, 96 heads at 85%, and the same shared-memory bandwidth also absorbs the TMA fills; the DSL kernel (heads
+  as M, positions as N 128-256) runs every MMA at full rate. So no swapped-AB layout for 96 heads beats it here.
 No version beat the DSL kernel, so nothing is wired into the manifest or committed in source/. The lane's
 ceiling as measured: any decode MLA here lands KV in shared memory at <= ~9.5 TB/s in total, the DSL kernel
 already reaches 1.7x amplification at that rate, and the best feasible layout (1.44x) is worth ~15% of the
