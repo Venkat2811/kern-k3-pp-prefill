@@ -10,7 +10,7 @@
 //     q u8 [B, LATENT], sf u8 [B, LATENT / 32]: k3_moe_prefill.cu's kern_k3_moe_quant;
 //     idx i32 / wts f32 [B, 16]: k3_prefill_glue.cu's router top-k, bit for bit;
 //     act bf16 [B, ldact]: the shared expert's activation, k3_prefill_glue.cu's kern_k3g_situ;
-//     sync u32 [2 + 2 * TABLE + 2]: the grid barrier (arrivals, generation), two routing tables
+//     sync u32 [SYNC_WORDS]: the grid barrier (arrivals, generation), two routing tables
 //       (Table below) and two piece counters, the generation's parity picking this call's; zeroed by
 //       kern_k3g_moe_route_init before a stage's first call, every call of a stage's B rows
 //       leaves the barrier and the next call's table and counter zero;
@@ -319,7 +319,11 @@ __device__ __forceinline__ void quant8(const uint4 u, uint8_t* __restrict__ q, u
 #define CHUNKS (MAX_ROWS / CHUNK)
 #define WORDS (MAX_ROWS / 32)
 #define TABLE (EXPERTS * (1 + CHUNKS + WORDS))
-#define SYNC_WORDS (2 + 2 * TABLE + 2)  // barrier count, generation, two tables, two piece counters
+// the barrier's arrival count at word 0 and the generation its blocks poll at word 32 (own 128-byte
+// lines), the two tables from word 64, then the two piece counters
+#define GEN_AT 32
+#define TABLES_AT 64
+#define SYNC_WORDS (TABLES_AT + 2 * TABLE + 2)
 static_assert(CHUNKS <= 32 && CHUNK / 32 <= 32, "a chunk prefix is one warp sum");
 struct Table {
   int* tot;   // [EXPERTS]
@@ -327,7 +331,7 @@ struct Table {
   u32* bits;   // [EXPERTS][WORDS]
 };
 __device__ __forceinline__ Table table(u32* sync, u32 parity) {
-  u32* t = sync + 2 + parity * TABLE;
+  u32* t = sync + TABLES_AT + parity * TABLE;
   return {reinterpret_cast<int*>(t), reinterpret_cast<int*>(t + EXPERTS), t + EXPERTS * (1 + CHUNKS)};
 }
 
@@ -347,7 +351,7 @@ extern "C" __global__ void __launch_bounds__(THREADS, 2) kern_k3g_moe_route(
   const int nthreads = gridDim.x * THREADS, gt = blockIdx.x * THREADS + t;
   const int rstride = gridDim.x * WARPS, r0 = blockIdx.x * WARPS + warp;
 
-  if (t == 0) gen_s = ld_acquire(sync + 1);
+  if (t == 0) gen_s = ld_acquire(sync + GEN_AT);
   __syncthreads();
   const u32 gen = gen_s;
   const Table cur = table(sync, gen & 1), next = table(sync, ~gen & 1);
@@ -442,9 +446,9 @@ extern "C" __global__ void __launch_bounds__(THREADS, 2) kern_k3g_moe_route(
     __threadfence();
     if (atomicAdd(sync, 1u) == gridDim.x - 1) {
       sync[0] = 0;
-      st_release(sync + 1, gen + 1);
+      st_release(sync + GEN_AT, gen + 1);
     } else {
-      while (ld_acquire(sync + 1) == gen) __nanosleep(64);
+      while (ld_acquire(sync + GEN_AT) == gen) __nanosleep(64);
     }
     __threadfence();
   }
