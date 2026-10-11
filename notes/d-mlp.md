@@ -3,7 +3,7 @@
 Check: `loop/d/check loop/out/d-l4-tp8.json` (~20 s on a free pool). Bench: `loop/d/bench loop/out/d-l16-tp8.json`
 (~20 s). main 2026-10-10 start: 24.7 launches/layer, 4.562 ms/step.
 
-## Status (2026-10-11 02:00 UTC): the MLA fill ceiling was the issuing thread, the lane reopens
+## Status (2026-10-11 01:30 UTC): MLA lane closed on measurement; the fill ceiling was the issuing thread, the bound is the MMA
 
 Orchestrator 00:53 asked for the landing rate of other copy forms. `work/h/tma_fill.cu` (one thread a CTA issues
 into a ring, no consumer, KV pages as the manifest lays them out; GB/s an SM at 1 CTA, from L2 and HBM alike):
@@ -29,29 +29,42 @@ into a ring, no consumer, KV pages as the manifest lays them out; GB/s an SM at 
 - So the earlier ceiling (~63 GB/s an SM, ~9.5 TB/s in all) was one thread issuing 8 KB boxes, and the DSL
   kernel (~65 GB/s an SM: 136 KB a CTA a 2.1 us tile) is bound by exactly that.
 
-And the tensor side, `work/h/umma2_rate.cu` (one thread issuing back to back, K 16, cycles an instruction):
+The tensor side, `work/h/umma2_rate.cu` (one thread issuing back to back, K 16, random bf16 operands, cycles an
+instruction; 1.93-1.96 GHz by %globaltimer throughout). "Same atoms": every instruction reads the same four
+32-byte K slices (what my earlier rate test did); "streaming": operands walk new 8 KB atoms every 4 instructions
+as a K loop does (A chunks 6 KB apart, B 8 KB), fully unrolled with constant offsets:
 
-| shape | N 64 | N 96 | N 128 | N 192 | N 256 |
-|---|---|---|---|---|---|
-| cta_group::1 M 64 | 48.8 | 48.8 | 64.2 | 96.2 | 128.2 (50% a SM) |
-| cta_group::1 M 128 | 48.8 | 56.2 | 64.2 | 96.2 | 128.2 (100%) |
-| cta_group::2 M 128 (64 rows a CTA) | 48.8 | 48.8 | 48.8 (66%) | 48.8 (98%) | 64.2 (100%) |
-| cta_group::2 M 256 | 48.8 | 49.5 (97%) | 64.2 | 96.2 | 128.2 |
-
-The DSL budget I wrote before (64 cycles for its pair M 128 x N 128, 128 at N 256) was wrong: its tile (36 QK
-at N 128 + 16 PV at N 256) is 36 x 48.8 + 16 x 64.2 = 2784 cycles, 1.47 us, not 2.0. Its 2.1 us a tile is
-the fill (one producer, 8 KB boxes, 1.87x the unique bytes). **Redone estimate**, 24 rows / 128k (3072 tiles of
-128 positions a member, 76 pairs, unique KV 453 MB):
-
-| | per tile | step |
+| shape | same atoms N 64 / 96 / 128 / 192 / 256 | streaming N 64 / 96 / 128 / 192 / 256 |
 |---|---|---|
-| DSL (measured) | 2.1 us | 85 us |
-| its tensor bound (padded heads) | 1.47 | 59 |
-| HBM bound (7.2 TB/s) | | 63 |
-| heads-as-M pair, a CTA loads its own page as one 4D box (73.7 KB) and its 256 latent columns of both pages as V (2 x 32 KB 4D boxes), single K and V buffers (Q 54 + K 74 + V 64 + P 12 KB): QK(t), softmax(t), PV(t) serial on the tensor pipe, K(t+1) lands during softmax + PV | ~1.71 | ~70 (-18%) |
+| cta_group::1 M 64 | 48.8 / 48.8 / 64 / 96 / 128 | 69 / 69 / 69 / 96 / 128 |
+| cta_group::1 M 128 | 48.8 / 56 / 64 / 96 / 128 | 69 / 69 / 69 (93%) / 96 / 128 |
+| cta_group::2 M 128 (64 rows a CTA) | 48.8 / 48.8 / 48.8 / 48.8 / 64 | 69 / 69 / 69 (46%) / 69 / 69 (93%) |
+| cta_group::2 M 256 | 48.8 / 49.5 / 64 / 96 / 128 | 69 / 69 / 69 / 96 / 128 |
 
-At 48 rows the same ratio gives ~169 -> ~140 us an MLA layer. In the 93-layer step that is ~0.35 ms (1.9%) at
-24 rows and ~0.7 ms (2.7%) at 48. Building it (v4) next.
+So a streaming MMA costs at least ~69 cycles (73 with the descriptors computed in the loop): below N 192 (M 128)
+or N 256 (pair M 128) the instruction count, not the FLOPs, sets the time. The DSL layout's tile (36 QK at pair
+N 128 + 16 PV at pair N 256) is 52 x 69 = 3588 cycles, 1.83 us at 1.96 GHz; the DSL kernel's 2.1 us is within
+~13% of that. (An intermediate estimate in this section, 1.47 us from the same-atom rates, was wrong.)
+
+**v4 / v5, built and measured** (`work/h/k3_mla_decode_v4.cu`, `_v5.cu`, harnesses `mla_bench4.cu` /
+`mla_bench5.cu`): the DSL layout (heads as M, cta_group::2 M 128, CTA r heads 48r.. in rows 0-47, rows 48-63
+reading whatever follows), each CTA landing its own page as one 4D box for QK and its 256 latent columns of both
+pages as V, QK(i + 1) issued before PV(i - 1). Both pass the CPU reference (lse 1.6e-6, o 7.4e-4 of max |o| 1),
+both take ~156-164 us at 24 rows / 128k against the DSL kernel's 85:
+- v4 (single K and V buffers): the next page can load only after QK has completed, ~1 us of barrier round
+  trip (commit -> producer -> expect_tx -> MMA thread) a tile even with no loads at all (ablation: no loads, no
+  softmax, 1 MMA a step: 1.0 us a tile).
+- v5 (page in three 24 KB pieces and V in two pages, each its own producer warp and barriers; QK of the next
+  tile's pieces land while QK / PV run): loads off the critical path, but %globaltimer stamps show the MMAs
+  issue at ~40 ns each (the streaming rate above) and the softmax -> MMA hand-off across the pair costs 0.5-1.4 us
+  a `mbarrier.arrive.release.cluster` to the leader, with the leader waiting up to 2 us a tile for the peer's
+  four warps. Engineering those away would bring v5 to its tensor bound, ~1.83-2.0 us a tile: at best ~5-13%
+  under the DSL kernel (~0.1-0.2 ms of the 93-layer step).
+
+Conclusion: the DSL kernel is fill-limited only in the sense that its single producer issues 8 KB boxes; the
+layout's real tensor bound (69-cycle instructions) sits just under it. A layout with fewer, wider MMAs (swapped
+pair M 256 x N 96 heads: ~2346 cycles a 128 positions, -35%) needs the partner's V and P^T over DSMEM and does
+not fit shared memory (earlier analysis in the lane section). Lane closed; nothing wired into the manifest.
 
 ## Status (2026-10-11 00:55 UTC)
 
