@@ -10,9 +10,10 @@ reference (`work/h/k3_mla_decode_v*.cu`, harness `work/h/mla_bench.cu`), the bes
 multicast KV, 48 heads a CTA) at 172 us vs the DSL kernel's 85 at 24 rows / 128k. Measured why no swapped-AB
 layout wins for 96 heads on this GPU (section "MLA decode lane"): tcgen05.mma at M 128 / K 16 costs >= 49 cycles
 an instruction until N reaches 96-128 (shared-memory operand fetch), and shared memory fills at ~63 GB/s an SM
-(TMA, from L2 or HBM alike; DSMEM copies 40). The DSL kernel itself is fill-bound at ~1.7x KV amplification;
-the remaining upside is a heads-as-M 2-CTA kernel that re-loads less V (~1.44x, ~15% of the kernel, ~1.3% of the
-step). Nothing committed in source/ for this lane.
+(TMA, from L2 or HBM alike; DSMEM copies 40). The DSL kernel sits at its tensor and fill bounds at once
+(1.98 us a 128-token tile; it lands the latent twice, 1.89x); the remaining upside is a swapped position-split
+cta_group::2 pair below both (~-17% of the kernel, ~1.5% of the step), sketched in the lane section with the
+cta_group::2 layout already verified. Nothing committed in source/ for this lane.
 
 ## Status (2026-10-10 23:50 UTC)
 
@@ -192,6 +193,19 @@ Designs by that model (24 rows / 128k, unique KV 453 MB a layer):
   cycle), plus N x 32 B of B. With the heads as N, a CTA holding 48 heads runs its MMAs at 49% of the tensor
   rate, 96 heads at 85%, and the same shared-memory bandwidth also absorbs the TMA fills; the DSL kernel (heads
   as M, positions as N 128-256) runs every MMA at full rate. So no swapped-AB layout for 96 heads beats it here.
+- **The DSL kernel's own budget** (an agent read of its source: heads as M, 64 a CTA by cta_group::2, K split by
+  page, V split by latent columns through a second 32-token box, P from shared memory, O 2 x 256 columns a CTA):
+  it lands 272 KB a 128-token tile in the pair against 144 KB unique (1.89x: the latent twice). At the measured
+  MMA rates (64 cycles an N 128 instruction, 128 at N 256) a tile is 36 QK + 16 PV instructions, ~4350 cycles,
+  ~2.0-2.1 us, the same as its measured 1.98 us a tile: it sits at its tensor bound (padded M) and its fill bound
+  (136 KB a CTA at ~64 GB/s, 2.1 us) at once. So re-loading less V alone gains nothing; only a layout below both
+  bounds wins: the swapped position-split pair above (fill 106 KB a CTA a 128 tokens, ~1.65 us; MMA N 96 at 56
+  cycles, ~0.9 us), ~-17%. Its pieces: cta_group::2 for QK (positions as M over the pair, Q split by heads) and
+  PV (latent as M over the pair, each CTA loading the partner's tokens for its 256 columns), P^T for the
+  partner's 48 heads written into its shared memory (DSMEM, 12 KB a tile), the per-head max exchanged a tile.
+- cta_group::2 basics verified (`work/h/umma2.cu`, an M 128 pair MMA with marked operands): alloc by the same warp
+  in both CTAs, the leader issues, the commit multicasts to both; CTA r holds rows 64r..64r+63 on 128 lanes,
+  lanes 0-63 columns [0, N/2) and lanes 64-127 columns [N/2, N) of the instruction's N, so N/2 TMEM columns.
 No version beat the DSL kernel, so nothing is wired into the manifest or committed in source/. The lane's
 ceiling as measured: any decode MLA here lands KV in shared memory at <= ~9.5 TB/s in total, the DSL kernel
 already reaches 1.7x amplification at that rate, and the best feasible layout (1.44x) is worth ~15% of the
