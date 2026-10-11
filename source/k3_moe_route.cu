@@ -31,7 +31,7 @@
 //   grid (ceil(rows * (ka + kb) / 8 / 256), 1, 1)   block (256, 1, 1)
 //
 // Phase 1: a warp a row's top-k (a grid-stride over rows when B passes 16 *
-// gridDim), its picks marked in this call's table (each expert's count, its
+// gridDim; from 2048 rows over 4 warps a block), its picks marked in this call's table (each expert's count, its
 // count per 256-row chunk, its rows' bitmap: fire-and-forget atomics); then
 // the warps take grabs of the rows' 256-column pieces of the latent to quantise
 // and of the shared activation off a counter; the next call's table and counter
@@ -366,7 +366,10 @@ extern "C" __global__ void __launch_bounds__(THREADS, 2) kern_k3g_moe_route(
   }
 
   const float rsv = __bfloat162float(rs[0]);
-  for (int b = r0; b < B; b += rstride) {
+  // from 2048 rows a quarter of a block's warps take the top-k rows and the rest start on the pieces at
+  // once (an all-warp top-k leaves DRAM idle); the top-k warps join the grabs when their rows are done
+  const int tkw = B >= 2048 ? WARPS / 4 : WARPS;
+  for (int b = warp < tkw ? blockIdx.x * tkw + warp : B; b < B; b += gridDim.x * tkw) {
     int pick_e;
     float pick_w;
     topk_row(S + (long long)b * EXPERTS, bias, lane, ck[warp], ce[warp], pick_e, pick_w);
@@ -383,7 +386,7 @@ extern "C" __global__ void __launch_bounds__(THREADS, 2) kern_k3g_moe_route(
   }
   // the rows' latent and shared activation in grabs of 256-column pieces, each warp taking the next
   // grab off this call's counter when it is done with the last (and with its top-k rows): the warps
-  // with two top-k rows take fewer, and every warp reaches the grid barrier at about the same time
+  // with more top-k rows take fewer, and every warp reaches the grid barrier at about the same time
   const int nq = B * (LATENT / 256), ns = B * (SHARED / 256);
   const int gq = B >= 1024 ? 2 * QBATCH : QBATCH, gs = B >= 1024 ? 2 * SBATCH : SBATCH;  // fewer grabs, less contention
   const int nqb = (nq + gq - 1) / gq, nsb = (ns + gs - 1) / gs;
