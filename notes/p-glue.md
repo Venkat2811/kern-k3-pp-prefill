@@ -41,6 +41,15 @@ only). Committed (all bit-identical, P check PASS at every span):
   full butterfly's, so bit-identical, 6 SHFL + 6 FADD for four values instead of 20 + 20. nb 1
   -1..-2%, nb 2 -3.5%, nb 4 -6.5%; in-program residuals 147.6 / 148.1 -> 142.6 / 143.4 us a call.
 
+- `the p residual lands a one-partial add as one bf16x2 add` (02df83c): bf16(f32(a) + f32(b)) of two
+  bf16 is add.rn.bf16x2 (exact f32 sum unless exponents differ by > 16, and then no bf16 tie can
+  arise). nb 1 -1..-2%, in-program -0.7%.
+
+In-program at 8192@0 after these (b-1 of the last A/B): residuals 147 / 148 us a call (were 172 /
+173 at session start), finalize 158 (184), route 117 (130), situ 301 (339), gate 129: the lane's
+glue ~7.4 ms an item (was ~8.1). Harness vs in-program: the issue-bound kernels (residual, route)
+run ~25% slower in the stage than in the harness (power-capped clock), the latency-bound finalize ~5%.
+
 Residual now (ncu, K1d nb 1, 8192 rows): 8.6k warp-instr a row (11.4k at session start), issue
 51%, long-scoreboard 7 of ~17 cycles an issue (21% of samples at the one DRAM wait a row: 3 rows an
 SM at 40 registers), short-scoreboard 3.5, barrier 2.4. ~2.1k of the instructions are bf16 unpacks
@@ -55,6 +64,17 @@ Tried, not kept (harness, bit-identical):
   slower than every warp recomputing it (serial work before the barrier).
 - Finalize with an L2 prefetch of the 16 picked rows: 157 -> 150 at 8192 but 354 rows +28%; with
   4 blocks an SM on top: no gain over 4 blocks alone.
+- Residual sum-of-squares / dot-product chains of the two vector groups paired in f32x2 lanes (each
+  lane its group's chain: bit-identical): loading both groups' sw spills (STACK 64), +11%; the rms
+  half alone flat.
+- Route taking its next grab before processing the current one (atomic latency hidden): hoards
+  work, +1..+38% (1024 rows worst).
+- Finalize with two vectors a thread (224 threads, the 448-thread rms tree kept by a two-value
+  reduce-scatter): 52 registers, 161-172 us vs 150.
+- Situ is MUFU-bound (4 MUFU an element: two tanh, ex2, rcp; 277M elements at 8192 rows ~240 us of
+  MUFU at 16 an SM a clock vs 207 us of bytes). Only the rcp could leave the MUFU bit-identically
+  (an FMA-only correctly rounded reciprocal, needs an exhaustive check like rcp_fast's): ~30 us an
+  item for the one dense call, and it would add ~15% instructions to the issue-bound route. Not done.
 - mla_gate: 128 registers (the absorbed form shares the kernel), 2 blocks an SM, 60% issue; 3
   calls an item: not pursued.
 - Residual keeping candidate 0 in registers for the mix (no reload): spills (STACK 104), +0..+20%.
