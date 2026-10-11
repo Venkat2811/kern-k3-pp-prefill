@@ -147,18 +147,22 @@ positions a member). Every version passes the check: lse within 1.7e-6 (log2 uni
 What bounds them (v3 variants in the harness): without the V re-load 172, without softmax 166, without MMAs and
 softmax 141, without multicast 174, a 2-slot ring 231, slot release by plain arrive instead of tcgen05.commit
 equal. A bare TMA stream (`work/h/tma_stream.cu`: 3D boxes of 64 x 64 bf16, 128B swizzle, all SMs) moves 8-9.5
-TB/s, 55-63 GB/s an SM. The model that fits every number: the SMs together ingest ~10 TB/s from L2, so a design
-costs its **ingest amplification** (bytes landed in shared memory over unique KV bytes). v3 lands every K byte in
+TB/s, 55-63 GB/s an SM, and the same 63.5 GB/s an SM when the pages fit in L2 (1000 pages): the ceiling is the
+SM's TMA rate for these boxes (64 rows of 128 B each), not HBM or L2. The model that fits every number: the SMs
+together land ~9.5 TB/s in shared memory, so a design costs its **ingest amplification** (bytes landed in shared
+memory over unique KV bytes). The DSL kernel fits it too: 85 us at 24 rows is 1.7x of 453 MB at 9.1 TB/s (it
+loads V again through a second, 32-token box), so it is ingest-bound, not tensor-bound. v3 lands every K byte in
 both CTAs of the pair and re-reads V: 3.8x, 1.7 GB a layer at 24 rows, 170 us predicted vs 172 measured. v1/v2
 sit below that bound only because a 2-slot ring is latency-bound.
 
 Designs by that model (24 rows / 128k, unique KV 453 MB a layer):
-- head-split pair with the whole 128-position tile resident (Q 55 + tile 147 + P 12 KB, no V re-read): 2x, ~91 us;
-- one CTA, all heads, tile resident, Q streamed from L2 in 64-column chunks: 1.75x, ~79 us, but S^T cannot be
+- head-split pair with the whole 128-position tile resident (Q 55 + tile 147 + P 12 KB, no V re-read): 2x, ~100 us;
+- one CTA, all heads, tile resident, Q streamed from L2 in 64-column chunks: 1.75x, ~87 us, and S^T cannot be
   double-buffered (O^T 4 x 96 + S^T 96 of the 512 TMEM columns), so QK, softmax and PV serialize;
 - a position-split pair on cta_group::2 (QK: positions as M split over the pair, Q split by N; PV: latent
   columns as M split over the pair, each CTA also loading the partner's positions' V for its 256 columns, P^T
-  exchanged over DSMEM, per-head maxima exchanged every tile): 1.44x, ~65 us (HBM alone 57), i.e. -24%. A kernel
+  exchanged over DSMEM, per-head maxima exchanged every tile): 1.44x, ~72 us at 9.1 TB/s, i.e. -15% (~1.3% of
+  the 93-layer step). A kernel
   must use one cta_group for all its tcgen05 instructions, so PV cannot fall back to per-CTA MMAs. This is the
   DSL kernel's level of machinery; not started.
 No version beat the DSL kernel, so nothing is wired into the manifest or committed in source/.
