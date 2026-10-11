@@ -4,6 +4,37 @@ Target: P stage 0 since 19:54 (`loop/p/bench loop/out/p-stage0.json`), check `lo
 loop/out/p-l12.json`. Every timing claim goes through `loop/p/ab A B OUT [N]` (A, B, A, B in one
 lease; A-to-A spread 0.5-1.2% at 8192 rows); `work/swapmod.py MANIFEST main OUT` re-pins a manifest's cubins to main's.
 
+## Session 2026-10-11 00:00- (main 6f047c6)
+
+Stage 0 A/B baseline this session: ~121-125 ms/item depending on the leased GPU (same-lease pairs
+only). Committed (all bit-identical, P check PASS at every span):
+- `a p residual row issues all its dram reads before the first use` (e756711): ncu of K1d (nb 1)
+  showed ~30% of stall samples on the first use of each load: the landing's two vector groups and
+  each candidate waited on their own DRAM round trip (the `two` branch and the runtime candidate
+  loop kept the compiler from hoisting). Now partial/prefix (+p2) and candidate 0 load up front,
+  candidates >= 1 get an L2 prefetch (one a 128-byte line). Harness 8192 rows nb 1 128 -> 118 us,
+  nb 2 -9%, nb 4 -8%. A/B weighted flat (in-program residuals -4..-8%).
+- `the p moe finalize stages its row's picks in shared memory` (87b62c0): the ldo finalize the
+  stage runs since the back-GEMM merge was the pre-163-us form (the smem-picks + FFMA2 version
+  only lived in k3_prefill_glue.cu's unused kern_k3g_finalize_rms). 169.5 -> 156.9 us at 8192;
+  A/B -0.25% (both pairs), in-program 184 -> 168 us a call.
+- `the p glue packs and unpacks bf16 pairs as plain bits` (2245879): bf162_t half-word helpers cost
+  PRMT + shift per high unpack and F2FP + 2 PRMT per pack; now shift / and / cvt.rn.bf16x2.f32.
+  K1d 11.4k -> 9.4k warp-instr a row; residual -2..-7%, situ 259 -> 246 us. A/B 5 pairs +0.12% avg
+  (in the band), in-program residuals + situ 4.02 -> 3.81 ms an 8192@0 item.
+
+Tried, not kept (harness, bit-identical):
+- Residual keeping candidate 0 in registers for the mix (no reload): spills (STACK 104), +0..+20%.
+- Residual without the combine barrier (every warp reduces all 2(nb+1) sums, same tree) for nb <= 1
+  or 2: +0..+4%. The barrier stalls are the slowest warp's DRAM wait, not the barrier.
+- Residual prefetching row b + PFR's operands into L2 (one line a thread): nb 1 -3% at PFR 152, but
+  nb 2 / 4 +5..+20% (PFR 304-912 worse): dropped.
+- Route: L2 prefetch of the warp's quant pieces (and N situ pieces) before its top-k, so DRAM works
+  during the top-k: 97.9 -> 102.6 us (quant only), worse with situ. Not kept.
+- Situ as one block a row looping over pieces (U pieces' loads first): 128x3 threads U 4 -4%, every
+  other shape slower (352-1024 threads, U 2-6: +7..+45%); one call an item: not kept.
+- mla_gate with the bit helpers: 8192 rows flat (94 us, memory-bound), 354 rows 7.2 -> 6.5 us: not kept.
+
 ## Session 2026-10-10 23:00- (main 96fb15b, rebased f03a989)
 
 Stage 0 now: 200 launches (16.7/layer). Non-GEMM launches a layer: MoE `land_add_attnres_rms_bf16`,
