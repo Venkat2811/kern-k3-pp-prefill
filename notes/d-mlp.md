@@ -160,7 +160,9 @@ What bounds them (v3 variants in the harness): without the V re-load 172, withou
 softmax 141, without multicast 174, a 2-slot ring 231, slot release by plain arrive instead of tcgen05.commit
 equal. A bare TMA stream (`work/h/tma_stream.cu`: 3D boxes of 64 x 64 bf16, 128B swizzle, all SMs) moves 8-9.5
 TB/s, 55-63 GB/s an SM, and the same 63.5 GB/s an SM when the pages fit in L2 (1000 pages): the ceiling is the
-SM's TMA rate for these boxes (64 rows of 128 B each), not HBM or L2. The model that fits every number: the SMs
+SM's TMA rate for these boxes (64 rows of 128 B each), not HBM or L2. It is per SM (16, 32 or 152 SMs streaming:
+63.5 GB/s each), the same for rows 128 B apart in memory (65), and grows only a little with the box (16 KB 70,
+32 KB 78 GB/s); a KV page caps a 128B-swizzled box at 64 tokens x 128 B = 8 KB. The model that fits every number: the SMs
 together land ~9.5 TB/s in shared memory, so a design costs its **ingest amplification** (bytes landed in shared
 memory over unique KV bytes). The DSL kernel fits it too: 85 us at 24 rows is 1.7x of 453 MB at 9.1 TB/s (it
 loads V again through a second, 32-token box), so it is ingest-bound, not tensor-bound. v3 lands every K byte in
