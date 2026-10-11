@@ -132,10 +132,23 @@ __device__ __forceinline__ void sq_dot(const V8& x, const float* swv, float& sq,
   }
 }
 
-// mixed = attnres(candidates 0..nb-1 of blk_row, candidate nb = pv), then
+// A row's DRAM reads go out before its first use: candidate 0 into registers, the others' lines
+// (one prefetch a 128-byte line) into L2, so pass 1 waits on one round trip instead of one a candidate.
+__device__ __forceinline__ void load_cand0(const bf16_t* __restrict__ blk_row, int nb, int t, V8 (&x0)[RGROUPS]) {
+  if (nb > 0)
+#pragma unroll
+    for (int k = 0; k < RGROUPS; ++k) x0[k] = ldv(blk_row + (t + k * RTHREADS) * 8);
+  if ((t & 7) == 0)
+    for (int c = 1; c < nb; ++c)
+#pragma unroll
+      for (int k = 0; k < RGROUPS; ++k)
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(blk_row + (size_t)c * KH + (t + k * RTHREADS) * 8));
+}
+
+// mixed = attnres(candidates 0..nb-1 of blk_row, candidate 0 = x0, candidate nb = pv), then
 // normed_row = rms(mixed, gamma). Called by the whole block after zero_pads.
 __device__ __forceinline__ void attnres_rms_row(const bf16_t* __restrict__ blk_row, const V8 (&pv)[RGROUPS],
-                                                const float* __restrict__ sw, const bf16_t* __restrict__ gamma,
+                                                const V8 (&x0)[RGROUPS], const float* __restrict__ sw, const bf16_t* __restrict__ gamma,
                                                 bf16_t* __restrict__ normed_row, int nb, int t, RowSmem& s) {
   const int lane = t & 31, warp = t >> 5;
   const int ncand = nb + 1;
@@ -163,7 +176,9 @@ __device__ __forceinline__ void attnres_rms_row(const bf16_t* __restrict__ blk_r
         s.red[c * 2 + 1][warp + k * RWARPS] = dp;
       }
     };
-    for (int c = 0; c < nb; ++c) {
+#pragma unroll
+    for (int k = 0; k < RGROUPS; ++k) score(0, x0[k], k);
+    for (int c = 1; c < nb; ++c) {
       V8 x[RGROUPS];
 #pragma unroll
       for (int k = 0; k < RGROUPS; ++k) x[k] = ldv(blk_row + (size_t)c * KH + (t + k * RTHREADS) * 8);
@@ -276,8 +291,10 @@ extern "C" __global__ void __launch_bounds__(RTHREADS, 3) kern_k3g_attnres_rms(
   if (snapshot && nb < KNB_MAX)
 #pragma unroll
     for (int k = 0; k < RGROUPS; ++k) stv(blocks + ((size_t)b * KNB_MAX + nb) * KH + (t + k * RTHREADS) * 8, pv[k]);
+  V8 x0[RGROUPS];
+  load_cand0(blocks + (size_t)b * KNB_MAX * KH, nb, t, x0);
 
-  attnres_rms_row(blocks + (size_t)b * KNB_MAX * KH, pv, sw, gamma, normed + (size_t)b * KH, nb, t, s);
+  attnres_rms_row(blocks + (size_t)b * KNB_MAX * KH, pv, x0, sw, gamma, normed + (size_t)b * KH, nb, t, s);
 }
 
 // ---------------------------------------------------------------- K1a, first layer
@@ -314,7 +331,8 @@ extern "C" __global__ void __launch_bounds__(RTHREADS, 3) kern_k3g_embed_rms(
     stv(blocks + (size_t)b * KNB_MAX * KH + (t + k * RTHREADS) * 8, pv[k]);
   }
 
-  attnres_rms_row(blocks + (size_t)b * KNB_MAX * KH, pv, nullptr, gamma, normed + (size_t)b * KH, 0, t, s);
+  V8 x0[RGROUPS];
+  attnres_rms_row(blocks + (size_t)b * KNB_MAX * KH, pv, x0, nullptr, gamma, normed + (size_t)b * KH, 0, t, s);
 }
 
 extern "C" __global__ void __launch_bounds__(RTHREADS, 3) kern_k3g_attnres_rms_setup(
@@ -334,8 +352,10 @@ extern "C" __global__ void __launch_bounds__(RTHREADS, 3) kern_k3g_attnres_rms_s
   if (snapshot && nb < KNB_MAX)
 #pragma unroll
     for (int k = 0; k < RGROUPS; ++k) stv(blocks + ((size_t)b * KNB_MAX + nb) * KH + (t + k * RTHREADS) * 8, pv[k]);
+  V8 x0[RGROUPS];
+  load_cand0(blocks + (size_t)b * KNB_MAX * KH, nb, t, x0);
 
-  attnres_rms_row(blocks + (size_t)b * KNB_MAX * KH, pv, sw, gamma, normed + (size_t)b * KH, nb, t, s);
+  attnres_rms_row(blocks + (size_t)b * KNB_MAX * KH, pv, x0, sw, gamma, normed + (size_t)b * KH, nb, t, s);
 }
 
 // ---------------------------------------------------------------- K1b
@@ -349,36 +369,36 @@ extern "C" __global__ void __launch_bounds__(RTHREADS, 3) kern_k3g_land_add_attn
   const int t = threadIdx.x;
   zero_pads(s, t);
 
-  V8 pv[RGROUPS];
+  V8 pv[RGROUPS], lp[RGROUPS], x0[RGROUPS];
+#pragma unroll
+  for (int k = 0; k < RGROUPS; ++k) lp[k] = ldv(partial + (size_t)b * KH + (t + k * RTHREADS) * 8);
+  if (!snapshot)
+#pragma unroll
+    for (int k = 0; k < RGROUPS; ++k) pv[k] = ldv(prefix + (size_t)b * KH + (t + k * RTHREADS) * 8);
+  load_cand0(blocks + (size_t)b * KNB_MAX * KH, nb, t, x0);
 #pragma unroll
   for (int k = 0; k < RGROUPS; ++k) {
-    const size_t off = (size_t)b * KH + (t + k * RTHREADS) * 8;
-    const V8 lp = ldv(partial + off);
     if (snapshot) {
 #pragma unroll
-      for (int j = 0; j < 4; ++j) pv[k].w[j] = f2bf(bf2f(lp.w[j]));
+      for (int j = 0; j < 4; ++j) pv[k].w[j] = f2bf(bf2f(lp[k].w[j]));
     } else {
-      const V8 pr = ldv(prefix + off);
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
-        const float2 rf = bf2f(pr.w[j]);
-        const float2 lf = bf2f(f2bf(bf2f(lp.w[j])));
+        const float2 rf = bf2f(pv[k].w[j]);
+        const float2 lf = bf2f(f2bf(bf2f(lp[k].w[j])));
         pv[k].w[j] = f2bf(make_float2(rf.x + lf.x, rf.y + lf.y));
       }
     }
-    stv(prefix2 + off, pv[k]);
+    stv(prefix2 + (size_t)b * KH + (t + k * RTHREADS) * 8, pv[k]);
   }
 
-  attnres_rms_row(blocks + (size_t)b * KNB_MAX * KH, pv, sw, gamma, normed + (size_t)b * KH, nb, t, s);
+  attnres_rms_row(blocks + (size_t)b * KNB_MAX * KH, pv, x0, sw, gamma, normed + (size_t)b * KH, nb, t, s);
 }
 
 // ---------------------------------------------------------------- K1d
 // hidden = bf16(prefix2 + p1 (+ p2)) for one vector, K1c's sum order.
-__device__ __forceinline__ V8 add2(const bf16_t* __restrict__ p1, const bf16_t* __restrict__ p2,
-                                   const bf16_t* __restrict__ prefix2, int two, size_t off) {
-  const V8 a = ldv(p1 + off), pr = ldv(prefix2 + off);
-  V8 c, o;
-  if (two) c = ldv(p2 + off);
+__device__ __forceinline__ V8 add2v(const V8& a, const V8& c, const V8& pr, int two) {
+  V8 o;
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
     const float2 rf = bf2f(pr.w[j]), l1 = bf2f(a.w[j]);
@@ -391,6 +411,13 @@ __device__ __forceinline__ V8 add2(const bf16_t* __restrict__ p1, const bf16_t* 
     o.w[j] = f2bf(make_float2(x, y));
   }
   return o;
+}
+
+__device__ __forceinline__ V8 add2(const bf16_t* __restrict__ p1, const bf16_t* __restrict__ p2,
+                                   const bf16_t* __restrict__ prefix2, int two, size_t off) {
+  V8 c;
+  if (two) c = ldv(p2 + off);
+  return add2v(ldv(p1 + off), c, ldv(prefix2 + off), two);
 }
 
 extern "C" __global__ void __launch_bounds__(224) kern_k3g_land_add2(
@@ -412,15 +439,24 @@ extern "C" __global__ void __launch_bounds__(RTHREADS, 3) kern_k3g_land_add2_att
   const int t = threadIdx.x;
   zero_pads(s, t);
 
-  V8 pv[RGROUPS];
+  V8 pv[RGROUPS], a[RGROUPS], c[RGROUPS], x0[RGROUPS];
 #pragma unroll
   for (int k = 0; k < RGROUPS; ++k) {
     const size_t off = (size_t)b * KH + (t + k * RTHREADS) * 8;
-    pv[k] = add2(p1, p2, prefix2, two, off);
-    stv(hidden + off, pv[k]);
+    a[k] = ldv(p1 + off);
+    pv[k] = ldv(prefix2 + off);
+  }
+  if (two)
+#pragma unroll
+    for (int k = 0; k < RGROUPS; ++k) c[k] = ldv(p2 + (size_t)b * KH + (t + k * RTHREADS) * 8);
+  load_cand0(blocks + (size_t)b * KNB_MAX * KH, nb, t, x0);
+#pragma unroll
+  for (int k = 0; k < RGROUPS; ++k) {
+    pv[k] = add2v(a[k], c[k], pv[k], two);
+    stv(hidden + (size_t)b * KH + (t + k * RTHREADS) * 8, pv[k]);
   }
 
-  attnres_rms_row(blocks + (size_t)b * KNB_MAX * KH, pv, sw, gamma, normed + (size_t)b * KH, nb, t, s);
+  attnres_rms_row(blocks + (size_t)b * KNB_MAX * KH, pv, x0, sw, gamma, normed + (size_t)b * KH, nb, t, s);
 }
 
 // ---------------------------------------------------------------- K6
