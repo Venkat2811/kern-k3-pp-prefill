@@ -3,6 +3,56 @@
 Check: `loop/d/check loop/out/d-l4-tp8.json` (~20 s on a free pool). Bench: `loop/d/bench loop/out/d-l16-tp8.json`
 (~20 s). main 2026-10-10 start: 24.7 launches/layer, 4.562 ms/step.
 
+## Status (2026-10-11 02:00 UTC): the MLA fill ceiling was the issuing thread, the lane reopens
+
+Orchestrator 00:53 asked for the landing rate of other copy forms. `work/h/tma_fill.cu` (one thread a CTA issues
+into a ring, no consumer, KV pages as the manifest lays them out; GB/s an SM at 1 CTA, from L2 and HBM alike):
+
+| copy form (ops a barrier, slots) | GB/s an SM |
+|---|---|
+| 3D box 64 x 64 sw128 (8 KB, the DSL kernel's), 1 a barrier, 16 slots | 20 |
+| same, 4 a barrier, 6 x 32 KB | 52 |
+| same, 8 a barrier, 3 x 64 KB | 69 |
+| 3D box 256 x 64 no swizzle (32 KB, rows 512 B of 1152) | 80 |
+| 2D box 64 x 256 rows sw128 / no swizzle (32 KB contiguous) | 78 |
+| 1D bulk 2 KB x 36 a page / 4 KB x 8 / 16 KB x 2 | 17 / 30 / 63 |
+| 1D bulk half page (36.9 KB) 1 a barrier / 2 a barrier | 86 / 136 |
+| 1D bulk whole page (73.7 KB), 1 / 2 / 3 slots | 100 / 166 / 167 |
+| **4D box 64 x 64 x 9 chunks sw128: a whole page as nine MMA-ready 8 KB tiles**, 2-3 slots | **158-162** |
+| 4D box 64 x 64 x 4 (32 KB) 1 a barrier / 64 x 64 x 3 x 3 a barrier | 74 / 106 |
+
+- The cost is per operation and per barrier in the issuing thread (~90-100 ns an op, ~250 ns more a barrier
+  group), not per byte: relaxed `arrive.expect_tx` and `test_wait` instead of `try_wait` change nothing.
+- It is per thread, not per SM: 2 / 3 producer warps in one CTA land 2x / 3x (8 KB boxes 48 -> 96 -> 144 GB/s;
+  page boxes, 3 producers: 246 GB/s an SM); 2 CTAs an SM likewise. 152 SMs land ~20-22 TB/s from L2 and reach
+  HBM's 7.2 TB/s with page boxes from HBM (8 KB boxes: 6.5).
+- So the earlier ceiling (~63 GB/s an SM, ~9.5 TB/s in all) was one thread issuing 8 KB boxes, and the DSL
+  kernel (~65 GB/s an SM: 136 KB a CTA a 2.1 us tile) is bound by exactly that.
+
+And the tensor side, `work/h/umma2_rate.cu` (one thread issuing back to back, K 16, cycles an instruction):
+
+| shape | N 64 | N 96 | N 128 | N 192 | N 256 |
+|---|---|---|---|---|---|
+| cta_group::1 M 64 | 48.8 | 48.8 | 64.2 | 96.2 | 128.2 (50% a SM) |
+| cta_group::1 M 128 | 48.8 | 56.2 | 64.2 | 96.2 | 128.2 (100%) |
+| cta_group::2 M 128 (64 rows a CTA) | 48.8 | 48.8 | 48.8 (66%) | 48.8 (98%) | 64.2 (100%) |
+| cta_group::2 M 256 | 48.8 | 49.5 (97%) | 64.2 | 96.2 | 128.2 |
+
+The DSL budget I wrote before (64 cycles for its pair M 128 x N 128, 128 at N 256) was wrong: its tile (36 QK
+at N 128 + 16 PV at N 256) is 36 x 48.8 + 16 x 64.2 = 2784 cycles, 1.47 us, not 2.0. Its 2.1 us a tile is
+the fill (one producer, 8 KB boxes, 1.87x the unique bytes). **Redone estimate**, 24 rows / 128k (3072 tiles of
+128 positions a member, 76 pairs, unique KV 453 MB):
+
+| | per tile | step |
+|---|---|---|
+| DSL (measured) | 2.1 us | 85 us |
+| its tensor bound (padded heads) | 1.47 | 59 |
+| HBM bound (7.2 TB/s) | | 63 |
+| heads-as-M pair, a CTA loads its own page as one 4D box (73.7 KB) and its 256 latent columns of both pages as V (2 x 32 KB 4D boxes), single K and V buffers (Q 54 + K 74 + V 64 + P 12 KB): QK(t), softmax(t), PV(t) serial on the tensor pipe, K(t+1) lands during softmax + PV | ~1.71 | ~70 (-18%) |
+
+At 48 rows the same ratio gives ~169 -> ~140 us an MLA layer. In the 93-layer step that is ~0.35 ms (1.9%) at
+24 rows and ~0.7 ms (2.7%) at 48. Building it (v4) next.
+
 ## Status (2026-10-11 00:55 UTC)
 
 MLA decode lane (orchestrator 00:11): three swapped-AB tcgen05 kernels written and checked correct against a CPU
