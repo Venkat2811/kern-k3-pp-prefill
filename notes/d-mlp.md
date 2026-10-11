@@ -280,6 +280,39 @@ already reaches 1.7x amplification at that rate, and the best feasible layout (1
 kernel, ~1.3% of the 93-layer step, at the DSL kernel's level of machinery (cta_group::2 for both GEMMs,
 per-tile max exchange, P over DSMEM).
 
+## What a layout change would gain (2026-10-11 01:45 UTC; analysis only, no parallelism change)
+
+**ar_finalize's expert-parallel skew** (`work/epskew.py` over `work/route93`: 92 layers' `topk_idx` of
+teacher-forced real text, 48 rows x 64 steps; placements fitted on the first 32 steps, scored on the last 32).
+A member's MoE time in a layer step is its active experts x 17.5 MB at ~6.5 TB/s (2.7 us an expert), and every
+member waits in `ar_finalize` for the busiest. The model gives 6.6 extra experts on the busiest member at 24
+rows, ~18 us a layer: the ~16 us median wait measured in the 93-layer profile. Busiest member's experts
+(ratio to the mean) and the 93-layer step's MoE critical path at the bound:
+
+| placement | 8 rows | 24 rows | 48 rows | step gain at 8 / 24 / 48 rows |
+|---|---|---|---|---|
+| today: expert e on member e % 8 | 18.2 (1.39x) | 35.8 (1.23x) | 51.0 (1.17x) | |
+| blocks of 112 | 18.1 | 36.0 | 51.0 | 0 |
+| static rebalance (LPT on each layer's expert frequency) | 17.7 | 35.2 | 50.0 | 0.12 / 0.16 / 0.24 ms |
+| + 4 replicas a member a layer, copy chosen per step | 15.6 | 32.4 | 47.5 | 0.63 / 0.85 / 0.87 ms |
+| + 8 replicas | 14.7 | 30.9 | 45.5 | 0.85 / 1.23 / 1.36 ms |
+| + 16 replicas | 14.2 | 30.3 | 44.7 | 0.98 / 1.38 / 1.56 ms |
+| ideal (distinct / 8 every step) | 13.6 | 29.7 | 44.1 | 1.15 / 1.52 / 1.70 ms |
+
+- The skew is chance within a step, not persistently hot experts: placing experts by frequency recovers ~10%
+  of it. What recovers it is a choice per step: a second copy of some experts and, in `moe_front`'s table
+  builder (it sees every pick), each such expert's rows sent to the copy on the less-loaded member (the
+  power of two choices). Which experts get copies hardly matters (here the first half's hottest).
+- 8 replicas a member a layer is 8 x 17.5 MB x 93 = 13 GB more weight a member and wins ~1.2-1.4 ms of a
+  19-25 ms step (~6%); it needs the replica weights in the layout and a member-of-copy column in the routing
+  tables, i.e. a layout change (EPLB-like), not a kernel one.
+
+**The head's logits gather**: `kern_k3_head_argmax` takes 29 us at 24 rows and 51 us at 48 on member 0 (nsys,
+93-layer step), nearly all of it member 0's NVLink ingress of the other seven slices (13.8 / 27.5 MB, ~500
+GB/s); the vocab-parallel GEMM before it is at HBM (294 MB in 47-49 us). Without the gather (a serving
+program that returns token ids only, proposal below) the head is the local argmax and one key exchange,
+~5-8 us: 0.1-0.17% of the step. Gathering bf16 logits would halve the ingress but is a precision change.
+
 ## What would still move D (2026-10-11 00:15 UTC)
 
 Every non-GEMM launch now sits between GEMMs or the prebuilt attention (launch floor), and each is at its
