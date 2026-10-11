@@ -11,9 +11,8 @@ multicast KV, 48 heads a CTA) at 172 us vs the DSL kernel's 85 at 24 rows / 128k
 layout wins for 96 heads on this GPU (section "MLA decode lane"): tcgen05.mma at M 128 / K 16 costs >= 49 cycles
 an instruction until N reaches 96-128 (shared-memory operand fetch), and shared memory fills at ~63 GB/s an SM
 (TMA, from L2 or HBM alike; DSMEM copies 40). The DSL kernel sits at its tensor and fill bounds at once
-(1.98 us a 128-token tile; it lands the latent twice, 1.89x); the remaining upside is a swapped position-split
-cta_group::2 pair below both (~-17% of the kernel, ~1.5% of the step), sketched in the lane section with the
-cta_group::2 layout already verified. Nothing committed in source/ for this lane.
+(1.98 us a 128-token tile; it lands the latent twice, 1.89x); the layouts that would sit below both bounds do not fit
+shared memory with room to pipeline (lane section). Lane closed without a win; nothing committed in source/.
 
 ## Status (2026-10-10 23:50 UTC)
 
@@ -203,6 +202,12 @@ Designs by that model (24 rows / 128k, unique KV 453 MB a layer):
   cycles, ~0.9 us), ~-17%. Its pieces: cta_group::2 for QK (positions as M over the pair, Q split by heads) and
   PV (latent as M over the pair, each CTA loading the partner's tokens for its 256 columns), P^T for the
   partner's 48 heads written into its shared memory (DSMEM, 12 KB a tile), the per-head max exchanged a tile.
+  Worked through, it does not fit either: a CTA needs its 128 tokens' K tile (147 KB), its half of Q (55 KB)
+  and P^T over the pair's 256 tokens (25 KB), 227 KB, so nothing is left to prefetch the next tile and its 2.3 us
+  fill serializes with QK / softmax / PV: ~2.5 us a 128 tokens against the DSL kernel's 2.0. The DSL kernel's
+  answer (a 15-stage ring of 8 KB stages, the latent loaded twice) buys exactly that pipelining. Conclusion: for
+  96 heads of 576 on GB300 the DSL kernel is at or near what this hardware allows; the lane is closed without a
+  win.
 - cta_group::2 basics verified (`work/h/umma2.cu`, an M 128 pair MMA with marked operands): alloc by the same warp
   in both CTAs, the leader issues, the commit multicasts to both; CTA r holds rows 64r..64r+63 on 128 lanes,
   lanes 0-63 columns [0, N/2) and lanes 64-127 columns [N/2, N) of the instruction's N, so N/2 TMEM columns.
