@@ -100,6 +100,25 @@ __device__ __forceinline__ unsigned f2bf(float2 f) {
   return r;
 }
 
+__device__ __forceinline__ unsigned long long b64(float2 a) { return *reinterpret_cast<unsigned long long*>(&a); }
+__device__ __forceinline__ float2 f2(unsigned long long d) { return *reinterpret_cast<float2*>(&d); }
+// two IEEE ops in one f32x2 instruction, each lane rounded as the scalar op
+__device__ __forceinline__ float2 add2f(float2 a, float2 b) {
+  unsigned long long d;
+  asm("add.rn.f32x2 %0, %1, %2;" : "=l"(d) : "l"(b64(a)), "l"(b64(b)));
+  return f2(d);
+}
+__device__ __forceinline__ float2 mul2f(float2 a, float2 b) {
+  unsigned long long d;
+  asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(d) : "l"(b64(a)), "l"(b64(b)));
+  return f2(d);
+}
+__device__ __forceinline__ float2 fma2f(float2 a, float2 b, float2 c) {
+  unsigned long long d;
+  asm("fma.rn.f32x2 %0, %1, %2, %3;" : "=l"(d) : "l"(b64(a)), "l"(b64(b)), "l"(b64(c)));
+  return f2(d);
+}
+
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
@@ -209,11 +228,11 @@ __device__ __forceinline__ void attnres_rms_row(const bf16_t* __restrict__ blk_r
     for (int o = 16; o > 0; o >>= 1) den += __shfl_xor_sync(0xffffffffu, den, o);
     const float pmine = ex / den;
 
-    float acc[RGROUPS][8];
+    float2 acc[RGROUPS][4];
 #pragma unroll
     for (int k = 0; k < RGROUPS; ++k)
 #pragma unroll
-      for (int j = 0; j < 8; ++j) acc[k][j] = 0.f;
+      for (int j = 0; j < 4; ++j) acc[k][j] = make_float2(0.f, 0.f);
 #pragma unroll
     for (int c = 0; c < KNB_MAX; ++c) {
       if (c >= nb) break;
@@ -222,24 +241,14 @@ __device__ __forceinline__ void attnres_rms_row(const bf16_t* __restrict__ blk_r
       for (int k = 0; k < RGROUPS; ++k) {
         const V8 x = ldv(blk_row + (size_t)c * KH + (t + k * RTHREADS) * 8);
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          const float2 f = bf2f(x.w[j]);
-          acc[k][2 * j] += p * f.x;
-          acc[k][2 * j + 1] += p * f.y;
-        }
+        for (int j = 0; j < 4; ++j) acc[k][j] = fma2f(make_float2(p, p), bf2f(x.w[j]), acc[k][j]);
       }
     }
     const float p = __shfl_sync(0xffffffffu, pmine, nb);
 #pragma unroll
     for (int k = 0; k < RGROUPS; ++k) {
 #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const float2 f = bf2f(pv[k].w[j]);
-        acc[k][2 * j] += p * f.x;
-        acc[k][2 * j + 1] += p * f.y;
-      }
-#pragma unroll
-      for (int j = 0; j < 4; ++j) mixed[k].w[j] = f2bf(make_float2(acc[k][2 * j], acc[k][2 * j + 1]));
+      for (int j = 0; j < 4; ++j) mixed[k].w[j] = f2bf(fma2f(make_float2(p, p), bf2f(pv[k].w[j]), acc[k][j]));
     }
   }
 
@@ -265,12 +274,8 @@ __device__ __forceinline__ void attnres_rms_row(const bf16_t* __restrict__ blk_r
     const V8 g = ldv(gamma + v * 8);
     V8 o;
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      float2 f = bf2f(mixed[k].w[j]);
-      f.x *= r;
-      f.y *= r;
-      o.w[j] = from_bf162(__hmul2(__float22bfloat162_rn(f), as_bf162(g.w[j])));
-    }
+    for (int j = 0; j < 4; ++j)
+      o.w[j] = from_bf162(__hmul2(as_bf162(f2bf(mul2f(bf2f(mixed[k].w[j]), make_float2(r, r)))), as_bf162(g.w[j])));
     stv(normed_row + v * 8, o);
   }
 }
@@ -384,9 +389,7 @@ extern "C" __global__ void __launch_bounds__(RTHREADS, 3) kern_k3g_land_add_attn
     } else {
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
-        const float2 rf = bf2f(pv[k].w[j]);
-        const float2 lf = bf2f(f2bf(bf2f(lp[k].w[j])));
-        pv[k].w[j] = f2bf(make_float2(rf.x + lf.x, rf.y + lf.y));
+        pv[k].w[j] = f2bf(add2f(bf2f(pv[k].w[j]), bf2f(f2bf(bf2f(lp[k].w[j])))));
       }
     }
     stv(prefix2 + (size_t)b * KH + (t + k * RTHREADS) * 8, pv[k]);
@@ -401,14 +404,8 @@ __device__ __forceinline__ V8 add2v(const V8& a, const V8& c, const V8& pr, int 
   V8 o;
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
-    const float2 rf = bf2f(pr.w[j]), l1 = bf2f(a.w[j]);
-    float x = rf.x + l1.x, y = rf.y + l1.y;
-    if (two) {
-      const float2 l2 = bf2f(c.w[j]);
-      x += l2.x;
-      y += l2.y;
-    }
-    o.w[j] = f2bf(make_float2(x, y));
+    const float2 h = add2f(bf2f(pr.w[j]), bf2f(a.w[j]));
+    o.w[j] = f2bf(two ? add2f(h, bf2f(c.w[j])) : h);
   }
   return o;
 }
