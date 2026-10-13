@@ -18,6 +18,7 @@ tools that check them.
 | [`scripts/gen_stage.py`](scripts/gen_stage.py) | the generator of every K3 manifest here, on kern's `tools/` |
 | [`scripts/deploy.sh`](scripts/deploy.sh) | the P stages and the D manifest of a deployment, verified |
 | [`scripts/k3_vllm.py`](scripts/k3_vllm.py) | a D manifest as vLLM's model forward, on [`k3_hosted.py`](scripts/k3_hosted.py)'s program boundary |
+| [`scripts/k3_sglang.py`](scripts/k3_sglang.py) | the same D as SGLang's model forward |
 | [`kernels.toml`](kernels.toml) | every module the manifests pin: SHA-256, source and defines, or prebuilt path and upstream |
 | [`source/`](source/) | the handwritten CUDA (Apache-2.0, [`source/LICENSE`](source/LICENSE)), vendored FlashKDA (MIT) and FlashInfer MoE routing (Apache-2.0), each with its `LICENSE` and `PROVENANCE.md` |
 | [`prebuilt/`](prebuilt/) | the cubins with no source recipe here; origins and licenses in [`prebuilt/README.md`](prebuilt/README.md) |
@@ -178,6 +179,35 @@ Verifying a hosted manifest and running it under vLLM need kern
 [#54](https://github.com/pegainfer-project/kern/pull/54)), past the
 `3eeec90` the rest of this repository is pinned to. That PR's
 `docs/vllm.md` has the 4-layer TP8 / DCP8 run on two 4-GPU GB300 nodes.
+
+## D inside SGLang
+
+kern's SGLang plugin (`python/kern_sglang`) runs the same D as the model
+forward of an unmodified SGLang, again one kern rank per tensor-parallel
+rank; SGLang keeps scheduling, its KV and mamba pools, CUDA graphs and
+sampling.
+
+```sh
+python3 scripts/k3_sglang.py --input d.json --output d-sglang.json
+kern verify d-sglang.json
+```
+
+- [`k3_sglang.py`](scripts/k3_sglang.py) takes `k3_hosted.py`'s boundary
+  and puts every state on SGLang's pools: an MLA layer's latent rows as
+  the 64-row pages `k3_vllm.py` binds, a KDA layer's recurrent state as
+  SGLang's `[slot][head][v][k]` f32 (`ssm.l<L>`, the line's rec byte for
+  byte) and its conv window as SGLang's `[slot][tap][q | k | v]` bf16
+  (`conv.l<L>`), each indexed by its own table of the same slot ids.
+- `kda_core` is the only kernel that changes: its `CONV_TAP_MAJOR`
+  build reads the window from a state of its own in that layout, and
+  `LINE_GUARD` skips SGLang's padded rows (slot -1). Without the two
+  defines it builds to the pinned bytes; `harness/run.sh conv` checks the
+  variant against the D build bit for bit.
+- Run it as SGLang's decode instance with `--tp-size 8 --dcp-size 8`,
+  `--kv-cache-dtype bf16`, `--mamba-ssm-dtype float32`, and
+  `--max-running-requests` / `--cuda-graph-max-bs-decode` at most the
+  manifest's 64. Prompts reach the cache through SGLang's P/D (the
+  manifest has no prefill); a unified server takes one-token prompts only.
 
 ## Check
 
