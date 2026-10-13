@@ -12,16 +12,6 @@ upstream = "flashinfer-cubin 0.6.18, cubins/8ec29a98612c3670f9f28825d1ed19f09496
 sha256 = "9de645ab4053412ee0832c633510308f4cd3c3fa5d25812924d9a799689f5fc9"
 source = "source/copy_rows.cu"
 
-[kernels."embedding"]
-sha256 = "e60b9fe71d5fed7a7fdbaa40cc12924ed30533741327b45980c1e4571ce408de"
-source = "source/embedding.cu"
-
-[kernels."flash_kda_d128"]
-sha256 = "34b83d875a418f63d14daf73984c1b8de0d1616250915a7d7e4810f327ce3617"
-prebuilt = "prebuilt/flash_kda_d128.cubin"
-source = "source/flash-kda/kern_flash_kda.cu"
-build = "source/flash-kda/build.sh"
-
 [kernels."flash_kda_d128_varlen"]
 sha256 = "751d1f12b73863328877fa69595a8ac4436b985905460f374ab34d6a672c5575"
 prebuilt = "prebuilt/flash_kda_d128_varlen.cubin"
@@ -49,23 +39,10 @@ sha256 = "42fc31d9c4300caaace896def74f0804bf527adc58aabaf70b96c2012f8620ca"
 source = "source/k3_kda_core.cu"
 defines = { HEADS = 12 }
 
-[kernels."k3_kda_rec"]
-sha256 = "d56a2af0ee63103dd1431f0318d9a15ea1f331a1bc62e851a3f8a6dd5a85d13d"
-source = "source/k3_kda_rec.cu"
-
-[kernels."k3_kda_out_gate"]
-sha256 = "837b8261348b9b238eb9cedfce4e176142c62e91be99cc33ad8ac476a6a5f54c"
-source = "source/k3_kda_out_gate.cu"
-
 [kernels."k3_kda_out_gate+HEADS=12"]
 sha256 = "0f8596191a55cefabafdd79b283a8ad8a68dea39256502570bd1ea901d963de2"
 source = "source/k3_kda_out_gate.cu"
 defines = { HEADS = 12 }
-
-[kernels."k3_kda_out_gate+PARTIAL_BF16=1"]
-sha256 = "663f5bb6b841d32049e549d801611132a3c157bdcabfcf20edd5aa0028200da8"
-source = "source/k3_kda_out_gate.cu"
-defines = { PARTIAL_BF16 = 1 }
 
 [kernels."k3_land"]
 sha256 = "2cd68c79bf3243f37d2f1406880060f610b4028f9e843bb356ea8ef0a0352fcc"
@@ -79,10 +56,6 @@ source = "source/k3_mla_prep.cu"
 sha256 = "8847e422800c072d15483389f867db81c0f91a44ecaa3c97066b24528b0e1b04"
 source = "source/k3_mla_prep.cu"
 defines = { INNER = 1536, MLA_FUSED = 3648 }
-
-[kernels."k3_mla_v2"]
-sha256 = "436c9ebb766141276fd52d431f238f3f5d92ed1d9359d39372208c2c72503a16"
-source = "source/k3_mla_v2.cu"
 
 [kernels."k3_mla_vup_gate+HEADS=12"]
 sha256 = "a6b673b9fa7595089c49b403cdf23c8d0224bab53b0b9224fc6392afe87c09c6"
@@ -106,10 +79,6 @@ sha256 = "267766a767f7bf308df84f4eaa11efd029a2e166143aeb26b3376ef0b42b3342"
 source = "source/k3_prefill_glue.cu"
 defines = { EXPERTS = 896 }
 
-[kernels."k3_residual"]
-sha256 = "d5d5d1fb3dda907822d99520b611fa77cab05bf11f165a1aa0d5e43d07cca8c8"
-source = "source/k3_residual.cu"
-
 [kernels."k3_residual+LAND_BF16=1"]
 sha256 = "1bb60d2f33b04d70d6866b50d12a67340e33cf0f1c555c9da92494dd5c98f254"
 source = "source/k3_residual.cu"
@@ -124,26 +93,9 @@ sha256 = "d7f650788bec1a15b13004a9ef0d1bb8dc109866b3189d0b0658ff1bd9dfad29"
 source = "source/k3_router_argmax.cu"
 defines = { EXPERTS = 896 }
 
-[kernels."k3_span_gather"]
-sha256 = "161d55e650acf861b296879beb93752e3d9e0c6026e78ed0e719a6370e4365c9"
-source = "source/k3_span_gather.cu"
-
-[kernels."k3_span_gather+PARTIAL_BF16=1"]
-sha256 = "613f03bea6f16a02991832b12bd84ee52f94ee32a758e46fd3e93d687c8d92ba"
-source = "source/k3_span_gather.cu"
-defines = { PARTIAL_BF16 = 1 }
-
-[kernels."k3_span_state"]
-sha256 = "a1b9e40e420f4bcd4cd542006dd171dbcde299d6912b3a1b9ff5b04d8c171ffd"
-source = "source/k3_span_state.cu"
-
 [kernels."k3_weight_prep"]
 sha256 = "a874bd671bfeb90103a3a5330876e062b5583c752b88e1eadb4e84050c18bf02"
 source = "source/k3_weight_prep.cu"
-
-[kernels."sigmoid_mul"]
-sha256 = "2b0745de4fc623437cce41fee177d7980239326796dca33d4faa7046f6f10ffa"
-source = "source/sigmoid_mul.cu"
 
 [kernels."trtllm_fmha_ctx_h192_v128"]
 sha256 = "240811d976c01e4a9bee00041d98343f6f9254fefae598df46a97ff07c7df508"
@@ -158,21 +110,6 @@ source = "source/weight_prep.cu"
 sha256 = "bfc0eef4b7c6a71d59fbb0a0bf4a8b3241a6fdb5bbd1d3ae116f18fd056944f3"
 source = "source/peer_allreduce_bf16.cu"
 defines = { NRANKS = 8 }
-
-[kernels."k3_mla_absorb+GROUPS=1"]
-sha256 = "9c1aef3502974d3a14a5614d172f3e7e3596163faedf637e99ffe0a226703813"
-source = "source/k3_mla_absorb.cu"
-defines = { GROUPS = 1 }
-
-[kernels."k3_kda_core+HEADS=12+LDS=6400+WSM_FA=12+WSM_LDS=6400"]
-sha256 = "6e0ef3d6b86268d40efaef4a2ba8d3c4686f4f09b0b6d23f4739211e295d4d90"
-source = "source/k3_kda_core.cu"
-defines = { HEADS = 12, LDS = 6400, WSM_FA = 12, WSM_LDS = 6400 }
-
-[kernels."k3_conv_silu+HEADS=12+LDS=6400"]
-sha256 = "13de5ccb7c287ab9fbd8abd23aeaa84bc3eb4c61f1479a26652f6d8aae00b59f"
-source = "source/k3_conv_silu.cu"
-defines = { HEADS = 12, LDS = 6400 }
 
 [kernels."k3_mla_absorb_mma"]
 sha256 = "d32425ed89d772e25970c9a648873dca2a7060edb1ba1f3e6b508ddc581982b1"
