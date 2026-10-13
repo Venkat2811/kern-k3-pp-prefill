@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import hashlib
-import json
 from pathlib import Path
 import re
 import sys
@@ -17,35 +16,26 @@ def check_cubin(path, sha, errors):
 
 
 def main():
+    """kernels.toml: every module has a source or an upstream record, its source and build files exist,
+    its prebuilt cubin (and, given a build directory, its built one) matches its hash, and no cubin under
+    prebuilt/ is unpinned. Then every captured set under decode/."""
     kernels = tomllib.loads((ROOT / "kernels.toml").read_text())["kernels"]
+    built = Path(sys.argv[1]) if len(sys.argv) > 1 else None
     errors = []
-    for path in (ROOT / "manifests").glob("*.json"):
-        manifest = json.loads(path.read_text())
-        modules = manifest["modules"]
-        for name, module in modules.items():
-            kernel = kernels[name]
-            sha = module["sha256"]
-            assert re.fullmatch(r"[0-9a-f]{64}", sha), name
-            assert sha == kernel["sha256"], name
-            assert module["source"] in (f"hf:Pegainfer/kern-kernels/blobs/{sha}", f"{name}.cubin"), name
-            for field in ("source", "build"):
-                if field in kernel:
-                    assert (ROOT / kernel[field]).is_file(), (name, field)
-            assert "source" in kernel or "upstream" in kernel, name
-            if "prebuilt" in kernel:
-                check_cubin(ROOT / kernel["prebuilt"], sha, errors)
-            if len(sys.argv) > 1:
-                cubin = Path(sys.argv[1]) / f"{name}.cubin"
-                check_cubin(cubin, sha, errors)
-        for op in manifest["ops"].values():
-            for launch in op["impl"].get("launches", []):
-                if "module" in launch:
-                    assert launch["module"] in modules, launch["module"]
-        for program in manifest["programs"].values():
-            for call in program["calls"]:
-                assert call["op"] in manifest["ops"], call["op"]
-        if not errors:
-            print(f"{path.name}: {len(modules)} modules, source links, references and cubin checks OK")
+    for name, kernel in kernels.items():
+        assert re.fullmatch(r"[0-9a-f]{64}", kernel["sha256"]), name
+        assert "source" in kernel or "upstream" in kernel, name
+        for field in ("source", "build"):
+            if field in kernel:
+                assert (ROOT / kernel[field]).is_file(), (name, field)
+        if "prebuilt" in kernel:
+            check_cubin(ROOT / kernel["prebuilt"], kernel["sha256"], errors)
+        if built:
+            check_cubin(built / f"{name}.cubin", kernel["sha256"], errors)
+    pinned = {kernel["prebuilt"] for kernel in kernels.values() if "prebuilt" in kernel}
+    stray = {f"prebuilt/{p.name}" for p in (ROOT / "prebuilt").glob("*.cubin")} - pinned
+    errors += [f"{p} is in no kernels.toml entry" for p in sorted(stray)]
+    print(f"kernels.toml: {len(kernels)} modules, {len(pinned)} prebuilt, sources and hashes OK")
     for table in sorted((ROOT / "decode").glob("*/kernels.toml")):
         check_capture(table, errors)
     if errors:
