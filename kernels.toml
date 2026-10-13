@@ -166,3 +166,8 @@ defines = { K9_LD = 49408, PARTIAL_BF16 = 1 }
 sha256 = "663253f41bd8eaaa4d586ddcedf826d7b3d06defc77f3b95c4cf235a830e81ad"
 source = "source/k3_kda_rec.cu"
 defines = { K12_LD = 49408 }
+
+[kernels."k3_kda_core+CONV_TAP_MAJOR=1+HEADS=12+KDA_CONV=1+LDS=6400+LINE_GUARD=1+WSM_FA=12+WSM_LDS=6400"]
+sha256 = "3bf9ee3f04807b0130f3e05dadc1ffcb787f6091bb2e3bbbd0591d42e53543c9"
+source = "source/k3_kda_core.cu"
+defines = { CONV_TAP_MAJOR = 1, HEADS = 12, KDA_CONV = 1, LDS = 6400, LINE_GUARD = 1, WSM_FA = 12, WSM_LDS = 6400 }

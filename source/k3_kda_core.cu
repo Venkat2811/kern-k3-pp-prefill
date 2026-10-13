@@ -81,6 +81,19 @@
 //       void* kda_base, const int* line_index, long long line_bytes,
 //       bf16* out, int B, const int* span_at, int span);
 //
+// -DCONV_TAP_MAJOR=1 (with KDA_CONV) keeps the conv window in a state of its
+// own, laid out the way an engine's per-slot conv pool is: the row's three taps
+// oldest first, each tap q | k | v (element (s, t, c) at t * 3 * INNER +
+// s * INNER + c), at `conv_base + conv_index[b] * conv_bytes`.  The recurrent
+// state stays at `kda_base + line_index[b] * line_bytes`, so the line holds rec
+// only.  The signature gains the three after `line_bytes`:
+//
+//       void* kda_base, const int* line_index, long long line_bytes,
+//       void* conv_base, const int* conv_index, long long conv_bytes,
+//
+// -DLINE_GUARD=1: a row whose line is negative (an engine's padded row, which
+// owns no state) writes a zero output and touches no state.
+//
 //   nvcc -cubin -arch=sm_103a -O3 -Xptxas -v \
 //        -o target/cubins/k3_kda_core.cubin tools/kernels-src/k3_kda_core.cu
 #include <cuda_bf16.h>
@@ -124,6 +137,23 @@
 #endif
 #ifndef KDA_STREAM
 #define KDA_STREAM 1
+#endif
+#ifndef CONV_TAP_MAJOR
+#define CONV_TAP_MAJOR 0
+#endif
+#ifndef LINE_GUARD
+#define LINE_GUARD 0
+#endif
+#if CONV_TAP_MAJOR && !KDA_CONV
+#error "CONV_TAP_MAJOR addresses the conv window KDA_CONV keeps"
+#endif
+// The conv window's element (stream s, tap t, column c) is at s * CONV_STREAM + t * CONV_TAP + c.
+#if CONV_TAP_MAJOR
+#define CONV_STREAM INNER
+#define CONV_TAP (3 * INNER)
+#else
+#define CONV_STREAM (3 * INNER)
+#define CONV_TAP INNER
 #endif
 
 typedef __nv_bfloat16 bf16;
@@ -174,6 +204,9 @@ extern "C" __global__ __launch_bounds__(128) void kern_k3_kda_core(
     const float* __restrict__ a_log,
     const float* __restrict__ gamma_o,
     void* kda_base, const int* __restrict__ line_index, long long line_bytes,
+#if CONV_TAP_MAJOR
+    void* conv_base, const int* __restrict__ conv_index, long long conv_bytes,
+#endif
     bf16* __restrict__ out,
     int B, const int* __restrict__ span_at, int span) {
 #if KDA_SWIZZLE
@@ -194,6 +227,12 @@ extern "C" __global__ __launch_bounds__(128) void kern_k3_kda_core(
   if ((unsigned)(b - span_at[0]) < (unsigned)span) return;
   const int d = threadIdx.x;
   const int base = h * KD;
+#if LINE_GUARD
+  if (line_index[b] < 0) {
+    out[(size_t)b * INNER + base + d] = __float2bfloat16(0.0f);
+    return;
+  }
+#endif
 
   __shared__ float sh_qs[KD];
   __shared__ float sh_kn[KD];
@@ -209,16 +248,20 @@ extern "C" __global__ __launch_bounds__(128) void kern_k3_kda_core(
   bf16 qkv[3];
   {
     const int c = base + d;
+#if CONV_TAP_MAJOR
+    bf16* win = reinterpret_cast<bf16*>(reinterpret_cast<char*>(conv_base) + (long long)conv_index[b] * conv_bytes) + c;
+#else
     bf16* win = reinterpret_cast<bf16*>(reinterpret_cast<char*>(kda_base) + (long long)line_index[b] * line_bytes +
                                         (long long)HEADS * KD * KD * 4) + c;
+#endif
 #pragma unroll
-    for (int s = 0; s < 3; ++s, win += 3 * INNER) {
-      const bf16 w0 = win[0], w1 = win[INNER], w2 = win[2 * INNER];
+    for (int s = 0; s < 3; ++s, win += CONV_STREAM) {
+      const bf16 w0 = win[0], w1 = win[CONV_TAP], w2 = win[2 * CONV_TAP];
       const bf16 x = __float2bfloat16_rn(gate_partial[(size_t)b * LDS + s * INNER + c]);
       const float* k = cw + (size_t)s * 4 * INNER + c;
       win[0] = w1;
-      win[INNER] = w2;
-      win[2 * INNER] = x;
+      win[CONV_TAP] = w2;
+      win[2 * CONV_TAP] = x;
       float y = __bfloat162float(w0) * k[0];
       y = fmaf(__bfloat162float(w1), k[INNER], y);
       y = fmaf(__bfloat162float(w2), k[2 * INNER], y);
