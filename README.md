@@ -1,213 +1,153 @@
 # kern-k3-pp-prefill
 
-Kimi-K3 prefill as pipeline-parallel stages for the
-[kern runtime](https://github.com/pegainfer-project/kern): one manifest per PP
-rank, its kernel sources, and the build recipes. This repository follows the
-layout of [kern-k3](https://github.com/xiaguan/kern-k3), which holds the
-TP4/EP4 tray prefill.
+Full-size Kimi-K3 (896 experts, 93 layers) served disaggregated on the
+[kern runtime](https://github.com/pegainfer-project/kern) and its
+`kern-serve`:
 
-- [`manifests/`](manifests/): the four stages of the **pruned-75pct** K3 (224
-  experts, 93 layers) at PP4. The split is 23, 23, 23, 24 layers, the same as
-  `SGLANG_PP_LAYER_PARTITION=23,23,23,24`. Each stage is TP1 / EP1 and takes an
-  8192-token chunk with a maximum context of 16,384.
-- [`kernels.toml`](kernels.toml): every module the manifests pin, with its
-  SHA-256 and where it comes from. Handwritten kernels have a `source` and
-  compile-time `defines`; vendored builds have a `source` plus a `build`
-  script; extracted cubins have a `prebuilt` path and their `upstream`.
-- [`source/`](source/): kern's handwritten CUDA (Apache-2.0, `source/LICENSE`),
-  vendored FlashKDA (MIT) and vendored FlashInfer MoE routing (Apache-2.0).
-  Each vendored tree has its own `LICENSE` and `PROVENANCE.md`.
-- [`prebuilt/`](prebuilt/): the cubins with no source recipe here (TRT-LLM gen
-  batched GEMM and FMHA), FlashKDA, and the routing build. Licenses and
-  origins are in [`prebuilt/README.md`](prebuilt/README.md).
-- [`scripts/gen_stage.py`](scripts/gen_stage.py): the generator of the
-  manifests. With `k3_moe_bmm.py`, `flashinfer_moe_routing_abi.py` and
-  `pinned.py` it is the only code that changes kern's generation; see
-  [Provenance](#provenance).
-- [`stage/`](stage/): `k3_stage`, which runs one stage on the kern runtime.
-  kern is a git dependency pinned to the same commit.
-- [`validation/`](validation/): the scripts that checked the stages against
-  SGLang PP4.
-- [`decode/sglang-tp8-dcp8-ep8/`](decode/sglang-tp8-dcp8-ep8/): SGLang's full-K3
-  decode CUDA graphs at TP8 / DCP8 / EP8 (1, 8 and 48 sequences), captured
-  launch by launch, with the modules, their origins and licenses.
+- **P**: the packed prefill (up to 16 sequences in a chunk of 8192 rows,
+  262144 context) as eight pipeline stages, one GPU each, cut every 12
+  layers.
+- **D**: the decode step at TP8 / EP8 / DCP8, eight GPUs.
 
-## A stage
+kern contains no model. This repository is what makes it K3: the manifest
+generator, the kernels with their sources and pinned hashes, and the
+tools that check them.
 
-PP does not change any layer's shapes. A stage is the prefill manifest cut
-to the layers in `[A, B)`, plus the stream that crosses the boundary:
+| Path | What it is |
+|---|---|
+| [`scripts/gen_stage.py`](scripts/gen_stage.py) | the generator of every K3 manifest here, on kern's `tools/` |
+| [`scripts/deploy.sh`](scripts/deploy.sh) | the P stages and the D manifest of a deployment, verified |
+| [`kernels.toml`](kernels.toml) | every module the manifests pin: SHA-256, source and defines, or prebuilt path and upstream |
+| [`source/`](source/) | the handwritten CUDA (Apache-2.0, [`source/LICENSE`](source/LICENSE)), vendored FlashKDA (MIT) and FlashInfer MoE routing (Apache-2.0), each with its `LICENSE` and `PROVENANCE.md` |
+| [`prebuilt/`](prebuilt/) | the cubins with no source recipe here; origins and licenses in [`prebuilt/README.md`](prebuilt/README.md) |
+| [`step/`](step/) | `k3_step`: a decode manifest teacher-forced, one process per rank |
+| [`harness/`](harness/) | kernel acceptance runs and the error-budget study |
+| [`decode/sglang-tp8-dcp8-ep8/`](decode/sglang-tp8-dcp8-ep8/) | SGLang's full-K3 decode CUDA graphs at TP8 / DCP8 / EP8, captured launch by launch: the reference D's layout follows |
+| [`loop/`](loop/) | the overnight kernel loop that optimizes P and D, its rounds and results |
 
-| | Stage not starting at layer 0 | Stage not ending at the last layer |
-|---|---|---|
-| hidden stream | input `hidden_in` [T, 7168] | output `hidden` [T, 7168] |
-| attention-residual bank | input `blocks_in` [T, 8, 7168], the first ceil(A / 12) snapshots valid | output `blocks` [T, 8, 7168], ceil(B / 12) valid |
+## Deploy
 
-These are SGLang's PP proxy tensors: `hidden_states` (the stream head with the
-delayed MLP add folded in) and `residual` (the bank, unpadded). The first stage
-takes token ids, and the last one ends in the head (`next_token`, and the last
-row's logits). The KV and KDA states hold the stage's own layers only.
+Everything is pinned to kern
+[`3eeec90`](https://github.com/pegainfer-project/kern/tree/3eeec9044ba437e2818052a17895b8670a552cee)
+(`step/Cargo.toml` pins the same commit). On GB300 (sm_103a):
 
-At EP1 a stage holds all of its layers' experts. The routed MoE runs
-TRT-LLM gen's batched mxfp8 × mxfp4 GEMMs (FC1 with the fused SiTU gate, then
-FC2). FlashInfer's routing kernels build their routing tables from kern's
-router top-k, and kern's combine finishes the layer. This is the path SGLang's
-`flashinfer_mxfp4` backend takes.
+1. **kern.** Check out that commit and build `kern` and `kern-serve`
+   (`cargo build --release -p kern-run -p kern-serve`; kern-serve needs
+   protoc and libssl-dev).
+2. **Manifests.**
 
-### Other splits
+   ```sh
+   scripts/deploy.sh <kern checkout> <kern-kernels>/index <out>
+   ```
 
-The manifests are generator output; any split (PP8, PP16, uneven) comes from
-the same command. It needs a kern checkout at the pinned commit and the
-kern-kernels index:
+   writes `<out>/p/stage0..7.json` and `<out>/d.json`, each verified by
+   `kern`. The generator reads modules this repository pins from
+   `kernels.toml`, everything else from the kern-kernels index.
+3. **Kernels.** CUDA 13.0 nvcc (V13.0.88) reproduces the pinned cubins:
 
-```sh
-KERN=<kern checkout @ b43bb5a> KERN_INDEX_DIR=<kern-kernels>/index \
-  python3 scripts/gen_stage.py --layers 23:46 --ranks 1 --chunk 8192 --max-ctx 16384 \
-  > manifests/k3-pruned-pp4-l23-46.json
-```
+   ```sh
+   NVCC=<cuda-13.0>/bin/nvcc python3 scripts/build.py
+   ```
 
-Add `--experts 896` for the full checkpoint. The four manifests are this
-command's output (`--layers` 0:23, 23:46, 46:69 and 69:93). The generator
-emits the `derive` program, so its output needs a kern with
-[#43](https://github.com/pegainfer-project/kern/pull/43).
+   `build.py` copies the prebuilt cubins into `build/`, compiles the rest
+   with `nvcc -cubin -arch=sm_103a` and the `defines` in `kernels.toml`,
+   and checks every SHA-256. P loads them with `--kernels build`; modules
+   from the index come through kern's cache (`KERN_CACHE_DIR`).
+4. **D** first, eight processes over two 4-GPU hosts, rank 0 on host A:
 
-### Packed prefill and `kern cut`
+   ```sh
+   kern-serve --manifest d.json --weights <kimi-k3> --capacity 2000000 --max-seqs 64 --gpu 0 \
+       --decode-listen 0.0.0.0:<pd port> --listen 0.0.0.0:<ranks port>
+   kern-serve --manifest d.json --weights <kimi-k3> --capacity 2000000 --max-seqs 64 --gpu <g> \
+       --head <A>:<ranks port> --rank <r>          # r = 1..7, g = r mod 4
+   ```
 
-- `--state-per-layer` gives every layer its own KV or KDA state, so
-  `kern cut` can split one whole-model prefill manifest into stages that
-  carry only their own layers' states.
-- `--pack N` makes the prefill ragged: up to N sequences per call, back to
-  back, split by `cu_seqlens`. The KDA layers use FlashKDA's varlen build
-  with per-sequence conv windows and states. The MLA layers run the TRT-LLM
-  gen context FMHA batched over the sequences. The head reads each
+5. **P**, eight processes, the head (stage 0) serving HTTP and holding the
+   host tier:
+
+   ```sh
+   kern-serve --manifest p/stage0.json --kernels build --weights <kimi-k3> --chunk 8192 --max-seqs 128 \
+       --gpu 0 --port <http port> --listen 0.0.0.0:<pipe port> --decode <A>:<pd port> \
+       --host-gib 128 --host-turn 8192
+   kern-serve --manifest p/stage<s>.json --kernels build --weights <kimi-k3> --chunk 8192 --max-seqs 128 \
+       --gpu <g> --head <P head>:<pipe port>      # s = 1..7
+   ```
+
+   More decode tiers are more `--decode` endpoints on the head.
+
+Every process needs NCCL 2.30.7 (with its unversioned `libnccl.so`) on
+`LD_LIBRARY_PATH`, and `NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1` across
+hosts. The head serves the OpenAI completions and chat API.
+
+## Results (GB300)
+
+**1P2D on AgentX (2026-10-11).** P PP8 and two D tiers, 24 GPUs; aiperf
+`inferencex-agentx-mvp`, 256k, 900 s a point. At c64: 2.03 req/s,
+183k input tok/s, 103.5 output tok/s a GPU, ITL p50 / p99 23.4 / 30.0 ms,
+92.8% cache hit; gsm8k 0.968 over the chat endpoint, RULER 16k and 64k
+needle tasks 1.00. Details and the c96 point:
+[`loop/rounds/r1/E2E.md`](loop/rounds/r1/E2E.md).
+
+**Prefill against SGLang PP4 (2026-10-06).** The pruned checkpoint (224
+experts) at PP4, one chunk of 3999 tokens. Each stage fed SGLang's proxy
+tensors stays within the band two SGLang runs span when only their KV
+dtype differs, the head picks SGLang's token and top-5 order, and two runs
+are byte-identical. The stages, the SGLang capture plugin and the
+comparison are at commit
+[`3baa6ef`](https://github.com/pegainfer-project/kern-k3-pp-prefill/tree/3baa6ef)
+(`manifests/`, `stage/`, `validation/`), for kern
+[`b43bb5a`](https://github.com/pegainfer-project/kern/tree/b43bb5a680d6fc92f969a7881e1ceca98c301607).
+
+## P: the packed prefill
+
+- `--pack N` (16) makes the prefill ragged: up to N sequences a call, back to
+  back, split by `cu_seqlens`. The KDA layers run FlashKDA's varlen build
+  with per-sequence conv windows and states; the MLA layers run TRT-LLM
+  gen's context FMHA batched over the sequences; the head reads each
   sequence's last row.
+- Every layer has its own KV or KDA state, so `kern cut` splits the
+  whole-model manifest into stages that carry only their own layers'
+  states. A stage hands the next one the hidden stream and the
+  attention-residual bank (`blocks`, one snapshot every 12 layers).
+- At EP1 a stage holds all of its layers' experts. One launch
+  (`k3_moe_route`) takes a chunk from the router to the routing tables of
+  TRT-LLM gen's batched mxfp8 × mxfp4 GEMMs (FC1 with the fused SiTU gate,
+  then FC2). A stage's raw experts are bound as `source` tensors and
+  shuffled by the `derive` program while the weights load, so the
+  checkpoint and its shuffled copy never share a GPU.
+- The pruned checkpoint (224 experts) generates too, routed by FlashInfer's
+  routing kernels, for runs on fewer GPUs.
 
-Serving the cut stages, packed or not, needs kern's pipeline server
-([pegainfer-project/kern#44](https://github.com/pegainfer-project/kern/pull/44)).
+## D: TP8 / EP8 / DCP8
 
-### Running a stage
-
-`stage/` runs one stage over one chunk. The boundary tensors come from files
-and go back to files:
-
-```sh
-cargo build --release --manifest-path stage/Cargo.toml
-stage/target/release/k3_stage --manifest manifests/k3-pruned-pp4-l23-46.json --weights <kimi-k3-pruned-75pct> \
-    --hidden-in hidden.bf16 --blocks-in blocks.bf16 --out <dir> [--gpu 0] [--iters 3]
-```
-
-The first stage takes `--tokens ids.i64`. A middle stage writes
-`hidden.bf16` and `blocks.bf16` for the next one; the last writes
-`next_token.i64` and `logits.f32`.
-
-## Results (2026-10-06, GB300)
-
-Setup: one chunk of 3999 tokens (English prose) over an empty cache, one GPU
-per stage.
-
-**Isolation.** Each stage was fed SGLang PP4's received proxy tensors.
-- Copied bank rows and the layer-0 snapshot are bit-identical.
-- Inside a stage, the difference from SGLang grows about 1% per layer and is
-  smallest at row 0, as accumulated precision noise does.
-- The head gives SGLang's token and top-5 order, with |Δlogprob| ≤ 0.11.
-
-**Chained.** kern's four stages fed each other. They were judged against the
-band two SGLang runs span when they differ only in the KV cache dtype (rel L2,
-hidden / bank):
-
-| Boundary | SGLang fp8 ↔ bf16 KV | kern ↔ SGLang fp8 | kern ↔ SGLang bf16 |
-|---|---|---|---|
-| after l0-23 | 0.159 / 0.071 | 0.169 / 0.080 | 0.167 / 0.079 |
-| after l23-46 | 0.196 / 0.100 | 0.201 / 0.107 | 0.199 / 0.105 |
-| after l46-69 | 0.290 / 0.201 | 0.288 / 0.206 | 0.289 / 0.206 |
-| head, max \|Δlogprob\| over SGLang's top-5 | 0.382 | 0.534 | 0.367 |
-
-- All three runs pick token 2469 at the head.
-- The second and third candidates, 603 and 1101, are 0.07 apart in kern and
-  swap places.
-- Over 4k tokens K3's stream is sensitive enough that the KV dtype alone moves
-  the hidden by 16–29%.
-
-**Determinism.** Two runs of every stage wrote byte-identical outputs,
-although the routing tables' row order varies between runs.
-
-**Time.** kern per stage, warm, median of 3: 135.8 / 134.9 / 136.9 /
-141.4 ms, 549 ms in sum. SGLang PP4 takes 0.605 s end to end for one request,
-including hand-offs and scheduling.
-
-## Full K3
-
-The stage form and every kernel cover the full checkpoint (896 experts),
-including the 896-expert router top-k (`k3_router_argmax+EXPERTS=896`).
-`gen_k3.py --experts 896` generates its stages.
-
-They are not published here yet. A PP8 stage holds about 188 GB of mxfp4
-experts, too much to keep the checkpoint's tensors and their shuffled copy
-in the 288 GB of one GB300 at once. The generator therefore binds the raw
-experts as `source` tensors and shuffles them in a `derive` program, which
-kern runs while the weights load
-([pegainfer-project/kern#43](https://github.com/pegainfer-project/kern/pull/43)).
-
-## Decode at TP8 / EP8 / DCP8
-
-The kernels a full-K3 decode needs in SGLang's layout
-([`decode/sglang-tp8-dcp8-ep8/`](decode/sglang-tp8-dcp8-ep8/)): the hidden
-replicated on 8 GPUs, KDA and the MLA o side split by head (12 per rank),
-the MLA KV dealt by position (`p % 8`), 112 of the 896 experts per rank.
+SGLang's layout: the hidden replicated on 8 GPUs, KDA and the MLA o side
+split by head (12 a rank), the MLA KV dealt by position (`p % 8`), 112 of
+the 896 experts a rank (`rank, rank + 8, …`).
 
 | Module | What it is |
 |---|---|
-| `k3_conv_silu+HEADS=12`, `k3_kda_core+HEADS=12`, `k3_kda_out_gate+HEADS=12` | the KDA kernels over a rank's 12 heads |
-| `k3_mla_prep+INNER=1536+MLA_FUSED=3648` | the MLA prep with the gate of the rank's 12 heads |
-| `k3_mla_vup_gate+HEADS=12` | W_UV and the gate over the rank's 12 heads |
-| `k3_dcp` | the DCP exchange around one all-to-all: `kern_k3_dcp_fixup` (rows a rank holds no position of), `kern_k3_dcp_pack` (partials into per-peer chunks), `kern_k3_dcp_combine` (the LSE merge of 8 partials into the rank's 12 heads); the chunk layout is in the source's header |
-| `k3_router_argmax+EXPERTS=896` | the router top-k over 896 experts |
-| `flashinfer_moe_routing` | unchanged; `scripts/flashinfer_moe_routing_abi.py` takes `local`, the slice's first expert as an i32 param (`mLocalExpertsStartIdx`) and its stride (`mLocalExpertsStrideLog2`): a rank holds experts `rank, rank + 8, ...`, so the first expert is the rank itself |
+| `k3_kda_core+HEADS=12+KDA_CONV=1+…` | the KDA step over a rank's 12 heads, the conv fused in |
+| `k3_mla_prep+INNER=1536+MLA_FUSED=3648`, `k3_mla_absorb_mma` | the MLA q side and the absorb on tensor cores, every head over the rank's own positions |
+| `k3_dcp` | the DCP exchange around one all-to-all: fixup, pack, and the LSE merge of 8 partials into the rank's 12 heads |
+| `k3_ar_fused`, `peer_allreduce_bf16+NRANKS=8` | the step's all-reduces as a Lamport one-shot over peer memory (`--peer-ar`; NCCL without), with the work on either side fused |
+| `k3_moe_front+EXPERTS=896+…` | everything between the front GEMM and the batched GEMMs: router top-k, the latent in mxfp8, the rank's routing tables, the shared expert's activation |
+| `k3_head+NRANKS=8` | the vocab-parallel head: every rank's slice of the logits to one token a row |
 
 The routed MoE runs the same TRT-LLM gen batched-GEMM families at decode
-tiles (`t128x8x256`, `t128x8x512`, `t128x16x256`), the variants SGLang picks
-at 1, 8 and 48 sequences. They are in the kern-kernels index already
-(flashinfer-cubin 0.6.18; SGLang loads the same-named 0.7.0.post1 builds).
-`scripts/check_decode_bmm.py` replays kern's port of their parameter block
-against every `bmm_*` launch of the captured graphs.
+tiles, the variants SGLang picks; `scripts/check_decode_bmm.py` replays
+kern's port of their parameter block against every `bmm_*` launch of the
+captured graphs.
 
-[`harness/run.sh`](harness/run.sh) is the acceptance run: the SASS check
-(no stack, no local memory, no `.MULTICAST`), kern's `tools/k3-harness` built
-with a TP8 rank's constants over the 12-head and 896-expert variants, and
-[`harness/d1.cu`](harness/d1.cu) over `vup_gate`, the DCP kernels (8 members
-simulated on one GPU, checked against the merge of their partials and
-against unsharded attention) and the routing of a 112-expert slice with
-kern's finalize.
-
-`gen_stage.py --dcp` generates the decode step in this layout (schema 7:
-`kv.<l>` shards by position over `tp`, `kda.<l>` by heads), and the same
-flags at `--tp 1 --ranks 1` its one-GPU oracle with every expert:
-
-```sh
-python3 scripts/gen_stage.py --tp 8 --ranks 8 --dcp --experts 896 --state-per-layer \
-    --max-ctx 327680 --seqs 64 --layers 93 > dcp-l93-tp8.json
-python3 scripts/check_binds.py dcp-l93-tp8.json <checkpoint>   # every rank's slices, no GPU
-python3 scripts/rank_memory.py dcp-l93-tp8.json                # weights, slots, KV tokens per rank
-```
-
-[`step/`](step/) (`k3_step`) runs such a manifest teacher-forced, one
-process per rank, the ranks meeting through an NCCL id file on a shared
-disk; `scripts/compare_steps.py` judges a group's run against the oracle's
-(top-1 flips by the oracle's margin, logits' relative RMS, every rank's
-tokens identical).
-
-## Build the kernels
-
-Python 3.11+ and CUDA 13.0 nvcc (V13.0.88, `cuda_13.0.r13.0/compiler.36424714_0`)
-reproduce the pinned cubins:
-
-```sh
-NVCC=/path/to/cuda-13.0/bin/nvcc python3 scripts/build.py
-```
-
-`build.py` copies the prebuilt cubins, compiles the handwritten ones with
-`nvcc -cubin -arch=sm_103a` and the `defines` in `kernels.toml`, and compares
-every result with its pinned SHA-256. The two vendored trees build with their
-own `build.sh`; see each directory's `PROVENANCE.md`.
+The same flags at `--tp 1` give the one-GPU oracle with every
+expert and head. `scripts/check_binds.py <manifest> <checkpoint>` checks
+every rank's weight slices without a GPU, `scripts/rank_memory.py` prints
+weights, slots and KV tokens a rank, and `scripts/compare_steps.py` judges
+a `k3_step` group against the oracle (top-1 flips by the oracle's margin,
+logits' relative RMS, every rank's tokens identical).
+[`harness/run.sh`](harness/run.sh) is the kernels' acceptance run: the SASS
+check (no stack, no local memory), the K3 harness over the 12-head and
+896-expert variants, and [`harness/d1.cu`](harness/d1.cu) over the DCP
+kernels with 8 members simulated on one GPU.
 
 ## Check
 
@@ -215,69 +155,25 @@ own `build.sh`; see each directory's `PROVENANCE.md`.
 python3 scripts/check.py [build]
 ```
 
-The check verifies that:
-- every module a manifest names is pinned in `kernels.toml` with the same hash;
-- each module has a source or upstream record;
-- every op and launch references something that exists;
-- the bundled cubins (and, given a directory, the built ones) match their
-  hashes.
-
-CI runs it on every push.
+checks that every module in `kernels.toml` has a well-formed hash and a
+source or upstream, that its source and build files exist, that the
+bundled cubins (and, given a directory, the built ones) match their
+hashes, and the same for the captured decode graphs' modules. CI runs it on
+every push.
 
 ## Provenance
 
-The four manifests and `stage/` use kern as published, at commit
-[`b43bb5a680d6fc92f969a7881e1ceca98c301607`](https://github.com/pegainfer-project/kern/tree/b43bb5a680d6fc92f969a7881e1ceca98c301607):
-the runtime (through `stage/`) and the generator's helpers (through `KERN`).
-The generator's current output needs the derive program
-([#43](https://github.com/pegainfer-project/kern/pull/43)).
+The handwritten kernels started as kern's `tools/kernels-src/` and the
+generator as kern's `tools/gen_k3.py`, at kern
+[`b5c7d14`](https://github.com/pegainfer-project/kern/tree/b5c7d14), the
+last commit before kern moved the K3 line here. Also from that commit:
+`scripts/flash_kda_abi.py` (verbatim), `harness/k3/` (kern's
+`tools/k3-harness`), and the load-time ops `scripts/k3_once.py` registers
+back into kern's `once` (`k3_weight_prep`, `k3_moe_prefill`). Everything
+since is this repository's history.
 
-The files this repository forks from that commit:
-
-| Here | kern | Change |
-|---|---|---|
-| `scripts/gen_stage.py` | `tools/gen_k3.py` | `--layers A:B` stages; the EP1 prefill MoE on the batched GEMMs; `--experts 896`; modules pinned here are taken from `kernels.toml`; a chunk's projections land in bf16 straight from cuBLASLt |
-| `scripts/k3_moe_bmm.py` | `tools/k3_moe_bmm.py` | the expert count; FlashInfer routing when one rank holds every expert |
-| `stage/src/main.rs` | (new) | |
-| `source/k3_router_argmax.cu` | `tools/kernels-src/k3_router_argmax.cu` | `-DEXPERTS` (default 224; the 224 build is byte-identical to kern's) |
-| `source/k3_span_state.cu`, `k3_mla_v2.cu`, `k3_prefill.cu`, `copy_rows.cu` | `tools/kernels-src/` | varlen kernels for `--pack` appended; the existing kernels are unchanged |
-| `source/k3_span_gather.cu` | `tools/kernels-src/` | the varlen kernels; a block issues all its rows' loads before the first is used (same values); `-DPARTIAL_BF16` reads projections landed in bf16 |
-| `source/k3_kda_out_gate.cu` | `tools/kernels-src/` | a warp per head, the same reduction tree (same values); `-DPARTIAL_BF16` reads the gate landed in bf16 |
-| `source/k3_prefill_glue.cu` | (new) | the residual stream, router top-k, MoE combine with the latent norm and SiTU laid out for a chunk's rows; the closing landing add fused into the next layer's mix |
-| `source/k3_mla_vup_gate.cu` | `tools/kernels-src/` | `-DHEADS` (default 96; the 96 build is byte-identical to kern's) |
-| `source/k3_dcp.cu` | (new) | the DCP fixup, pack and combine |
-| `source/flash-kda/` | `tools/flash-kda/` | the `-DKERN_VARLEN` instantiation (see its `PROVENANCE.md`) |
-| `scripts/varlen_abi.py` | (new) | the varlen FlashKDA and batched FMHA launches |
-
-The other files in `source/` are copied unchanged from `tools/kernels-src/` and
-`tools/flash-kda/` at that commit. kern's sources keep their
-[Apache-2.0 license](source/LICENSE). FlashKDA keeps its
-[MIT license](source/flash-kda/LICENSE), and FlashInfer its
-[Apache-2.0 license](source/flashinfer-moe-routing/LICENSE). Kernel hashes are
-cross-checked against the private
-[kern-kernels](https://github.com/xiaguan/kern-kernels) index.
-
-The cubins that are not in that index or in the HF blob store are all
-built from this repository:
-- `flashinfer_moe_routing`;
-- `k3_router_argmax+EXPERTS=896`;
-- `k3_prefill_glue` and `k3_prefill_glue+EXPERTS=896`;
-- `k3_span_gather`, `k3_kda_out_gate` and their `+PARTIAL_BF16=1` builds;
-- the TP8 decode's `+HEADS=12` builds of `k3_conv_silu`, `k3_kda_core`,
-  `k3_kda_out_gate` and `k3_mla_vup_gate`,
-  `k3_mla_prep+INNER=1536+MLA_FUSED=3648` and `k3_dcp`.
-
-`scripts/build.py` makes them. Use `build/` as the kern cache, or upload the
-blobs, to run the manifests.
-
-## Validation scripts
-
-- `validation/kcap/` is an SGLang plugin (`SGLANG_PLUGINS=kcap`, the
-  directory on `PYTHONPATH`). For the forward of exactly `KCAP_TOKENS` tokens,
-  it dumps each PP rank's received and sent proxy tensors.
-- `sglang_pp4.sh` starts SGLang at TP1 / PP4 with the plugin.
-- `prompt.py` and `request.py` make the prompt and send it.
-- `run_iso.sh` and `run_chain.sh` run kern's stages.
-- `compare.py`, `blocks.py` and `band.py` do the comparison.
-
-Paths come from the environment: `MODEL`, `OUT`, `DATA`, `WEIGHTS`, and `K3_STAGE` (the binary `stage/` builds).
+kern's sources keep their [Apache-2.0 license](source/LICENSE), FlashKDA
+its [MIT license](source/flash-kda/LICENSE), FlashInfer its
+[Apache-2.0 license](source/flashinfer-moe-routing/LICENSE). The cubins not
+in the kern-kernels index are all built from this repository by
+`scripts/build.py`.
