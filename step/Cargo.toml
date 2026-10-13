@@ -10,15 +10,10 @@ publish = false
 name = "k3_step"
 path = "src/main.rs"
 
-# kern's `pd-agentx` line (schema 7 with state shards, NCCL all-to-all). Until
-# that rev is public, build with the checkout patched in:
-#   cargo build --release --manifest-path step/Cargo.toml \
-#     --config 'patch."https://github.com/pegainfer-project/kern".kern-runtime.path="<kern>/crates/kern-runtime"' \
-#     --config 'patch."https://github.com/pegainfer-project/kern".kern-manifest.path="<kern>/crates/kern-manifest"' \
-#     --config 'patch."https://github.com/pegainfer-project/kern".kern-pool.path="<kern>/crates/kern-pool"'
+# kern pinned by commit; the generator's KERN checkout is the same commit.
 [dependencies]
 anyhow = "1"
 cudarc = { version = "=0.19.7", features = ["cuda-13000", "f16", "nccl"] }
-kern-manifest = { git = "https://github.com/pegainfer-project/kern", branch = "master" }
-kern-pool = { git = "https://github.com/pegainfer-project/kern", branch = "master" }
-kern-runtime = { git = "https://github.com/pegainfer-project/kern", branch = "master" }
+kern-manifest = { git = "https://github.com/pegainfer-project/kern", rev = "3eeec9044ba437e2818052a17895b8670a552cee" }
+kern-pool = { git = "https://github.com/pegainfer-project/kern", rev = "3eeec9044ba437e2818052a17895b8670a552cee" }
+kern-runtime = { git = "https://github.com/pegainfer-project/kern", rev = "3eeec9044ba437e2818052a17895b8670a552cee" }

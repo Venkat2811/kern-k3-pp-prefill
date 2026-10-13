@@ -1,4 +1,4 @@
-//! Run a Kimi-K3 decode manifest (`scripts/gen_stage.py --dcp`) teacher-forced
+//! Run a Kimi-K3 decode manifest (`scripts/gen_stage.py` without `--chunk`) teacher-forced
 //! on one rank: B sequences fed their given tokens one decode step at a
 //! time, every step's logits kept. One process per rank; a group's ranks
 //! meet through an NCCL id in a file on a shared disk, so they may sit on
@@ -222,7 +222,7 @@ fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
     let topo = Topology::one("tp", a.rank, a.world);
     // every row's local positions, plus the pad's page
-    let capacity = Capacity { tokens: Some(((local + 64) * (b + 1)) as u64), seqs: (b + 1) as u64 };
+    let capacity = Capacity { tokens: Some(((local + 64) * (b + 1)) as u64), seqs: (b + 1) as u64, landings: 0 };
     let mut rt = Runtime::load(&m, None, a.gpu, Some(capacity), Some(&topo))?;
     rt.set_eager(!a.graph && !benching);
     rt.load_weights(&kern_runtime::Safetensors::open(&[&a.weights])?)?;
