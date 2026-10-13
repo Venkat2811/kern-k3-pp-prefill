@@ -2,14 +2,14 @@
 # The D1 acceptance run: every kernel a full-K3 decode at TP8 / EP8 / DCP8
 # adds, against CPU references, at the decode batches, plus the SASS check.
 #
-#   KERN=<kern checkout> CUDA_VISIBLE_DEVICES=<one free GPU> harness/run.sh [sass|tp8|d1 ...]
+#   CUDA_VISIBLE_DEVICES=<one free GPU> harness/run.sh [sass|tp8|d1 ...]
 #
 # Needs build/ from scripts/build.py (the pinned cubins, hashes checked) and
 # nvcc/cuobjdump (NVCC_BIN, default /usr/local/cuda-13.1/bin). Three parts:
 #   sass  every D1 cubin: no stack, no local memory, no .MULTICAST in its SASS
-#   tp8   kern's tools/k3-harness built with the TP8 rank's model constants
-#         (HEADS 12, EXPERTS 896; its sources untouched, the copy's ref.h
-#         patched) over the HEADS=12 / EXPERTS=896 / INNER=1536 variants
+#   tp8   harness/k3 (kern's K3 kernel harness, copied from its tools/k3-harness)
+#         built with the TP8 rank's model constants (HEADS 12, EXPERTS 896; the
+#         build copy's ref.h patched) over the HEADS=12 / EXPERTS=896 / INNER=1536 variants
 #   d1    harness/d1.cu: vup_gate at 12 heads, the DCP fixup / pack / combine
 #         over 8 simulated members, FlashInfer routing of a 112-expert slice (contiguous and every 8th)
 #         with kern's finalize
@@ -21,7 +21,6 @@ bin="${NVCC_BIN:-/usr/local/cuda-13.1/bin}"
 out="${OUT:-$here/out}"
 build="$root/build"
 reps="${REPS:-20}"
-: "${KERN:?set KERN to a kern checkout (for tools/k3-harness)}"
 parts=("$@")
 [ ${#parts[@]} -eq 0 ] && parts=(sass tp8 d1)
 mkdir -p "$out"
@@ -71,10 +70,10 @@ sass() {
 tp8() {
   local h="$out/k3-harness-tp8"
   mkdir -p "$h"
-  cp "$KERN/tools/k3-harness/harness.cu" "$h/"
+  cp "$here/k3/harness.cu" "$h/"
   sed -e 's/^  HEADS = 96,/  HEADS = 12,/' -e 's/^  EXPERTS = 224,/  EXPERTS = 896,/' \
       -e 's/^static const long long REC_BYTES = 6291456LL;/static const long long REC_BYTES = (long long)HEADS * 128 * 128 * 4;/' \
-      "$KERN/tools/k3-harness/ref.h" > "$h/ref.h"
+      "$here/k3/ref.h" > "$h/ref.h"
   [ "$(grep -c '^  HEADS = 12,\|^  EXPERTS = 896,\|REC_BYTES = (long long)HEADS' "$h/ref.h")" -eq 3 ] \
     || { echo "ref.h no longer has the constants this patch rewrites" >&2; exit 2; }
   build "$h/harness.cu" "$h/harness"

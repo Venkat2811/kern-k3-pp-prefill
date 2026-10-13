@@ -1,5 +1,5 @@
 // d1.cu: acceptance harness for the kernels a full-K3 decode at TP8 / EP8 /
-// DCP8 adds beside kern's K3 set (kern tools/k3-harness covers the
+// DCP8 adds beside kern's K3 set (harness/k3 covers the
 // HEADS / EXPERTS variants of the existing families, see run.sh). Same
 // contract as that harness: random inputs from --seed, a CPU reference in
 // the kernel's own buffer layout, every output poisoned before the launch,
