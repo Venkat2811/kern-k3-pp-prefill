@@ -269,7 +269,6 @@ fn main() -> anyhow::Result<()> {
         }
         rt.write_input(&name, &le(&t, i32::to_le_bytes))?;
     }
-    rt.write_input("span_at", &le(&[0i32], i32::to_le_bytes))?;
     if benching {
         return bench(&mut rt, &a, &leases, &pad, il, paged);
     }

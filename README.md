@@ -17,6 +17,7 @@ tools that check them.
 |---|---|
 | [`scripts/gen_stage.py`](scripts/gen_stage.py) | the generator of every K3 manifest here, on kern's `tools/` |
 | [`scripts/deploy.sh`](scripts/deploy.sh) | the P stages and the D manifest of a deployment, verified |
+| [`scripts/k3_vllm.py`](scripts/k3_vllm.py) | a D manifest as vLLM's model forward, on [`k3_hosted.py`](scripts/k3_hosted.py)'s program boundary |
 | [`kernels.toml`](kernels.toml) | every module the manifests pin: SHA-256, source and defines, or prebuilt path and upstream |
 | [`source/`](source/) | the handwritten CUDA (Apache-2.0, [`source/LICENSE`](source/LICENSE)), vendored FlashKDA (MIT) and FlashInfer MoE routing (Apache-2.0), each with its `LICENSE` and `PROVENANCE.md` |
 | [`prebuilt/`](prebuilt/) | the cubins with no source recipe here; origins and licenses in [`prebuilt/README.md`](prebuilt/README.md) |
@@ -148,6 +149,35 @@ logits' relative RMS, every rank's tokens identical).
 check (no stack, no local memory), the K3 harness over the 12-head and
 896-expert variants, and [`harness/d1.cu`](harness/d1.cu) over the DCP
 kernels with 8 members simulated on one GPU.
+
+## D inside vLLM
+
+kern's vLLM plugin (`python/kern_vllm`) can run the D step as the model
+forward of an unmodified vLLM, one kern rank per tensor-parallel rank;
+vLLM keeps scheduling, the KV pages, CUDA graphs and sampling.
+
+```sh
+python3 scripts/k3_vllm.py --input d.json --output d-vllm.json
+kern verify d-vllm.json
+```
+
+- [`k3_hosted.py`](scripts/k3_hosted.py) is the engine-neutral program
+  boundary: `decode_batch` stops at the final norm's `hidden`, and `head`
+  turns `head_in` into this rank's contiguous `[seqs, 20480]` f32 slice
+  of the vocab, which the engine gathers. The in-graph argmax is gone.
+- [`k3_vllm.py`](scripts/k3_vllm.py) puts every state on vLLM's hybrid
+  pages: 768-token blocks, a KDA line at the start of a 884,736 B page,
+  an MLA page as 12 kernel blocks of 64 tokens (`kda_core`'s line
+  stride is the only launch it changes).
+- Run it with `-tp 8 -dcp 8`, bf16 KV and `--max-num-seqs` /
+  `--max-num-batched-tokens` at most the manifest's 64. The manifest has
+  no prefill, so prompts longer than one token need a KV connector.
+
+Verifying a hosted manifest and running it under vLLM need kern
+[#55](https://github.com/pegainfer-project/kern/pull/55) (on
+[#54](https://github.com/pegainfer-project/kern/pull/54)), past the
+`3eeec90` the rest of this repository is pinned to. That PR's
+`docs/vllm.md` has the 4-layer TP8 / DCP8 run on two 4-GPU GB300 nodes.
 
 ## Check
 
