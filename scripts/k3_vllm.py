@@ -34,6 +34,9 @@ KV_LORA, ROPE = 512, 64
 TOKEN_BYTES = (KV_LORA + ROPE) * 2
 KERNEL_BLOCK = 64
 BLOCK_ALIGN = 128
+# An MLA layer's latent as 64-token kernel blocks: [blocks][1 head][64][576] bf16.
+MLA_HOST = {"dtype": "bf16", "shape": [0, 1, KERNEL_BLOCK, TOKEN_BYTES // 2],
+            "strides": [KERNEL_BLOCK * TOKEN_BYTES // 2, TOKEN_BYTES // 2, TOKEN_BYTES // 2, 1]}
 
 
 def page_bytes(line: int) -> int:
@@ -50,13 +53,10 @@ def renamed(state: str) -> str:
 
 
 def host_states(m: dict, page: int) -> dict:
-    mla = {"dtype": "bf16", "shape": [0, 1, KERNEL_BLOCK, TOKEN_BYTES // 2],
-           "strides": [KERNEL_BLOCK * TOKEN_BYTES // 2, TOKEN_BYTES // 2, TOKEN_BYTES // 2, 1]}
-
     def host(name, s):
         if name.startswith("kv."):
             assert s["bytes_per_token"] == TOKEN_BYTES, f"`{name}` is {s['bytes_per_token']} B a token"
-            return {"host": mla}
+            return {"host": MLA_HOST}
         return {"host": {"dtype": "u8", "shape": [0, s["bytes_per_seq"]], "strides": [page, 1]}}
 
     return {renamed(n): host(n, s) for n, s in m["states"].items()}
@@ -66,20 +66,26 @@ def rebind(call: dict) -> dict:
     return {**call, "args": [{**a, "state": renamed(a["state"])} if "state" in a else a for a in call["args"]]}
 
 
-def restride(name: str, op: dict, line: int, page: int) -> dict:
-    """`kda_core`'s line stride onto vLLM's page; the MLA kernels' page strides are vLLM's already."""
-    launches = op["impl"]["launches"]
-    args = [a for l in launches for a in l.get("args", [])]
-    if name == "kda_core":
-        assert args.count({"i64": line}) == 1, f"`kda_core` bakes no line stride {line}"
-        launches = [{**l, "args": [{"i64": page} if a == {"i64": line} else a for a in l["args"]]} for l in launches]
+def check_mla(name: str, op: dict) -> None:
+    """The MLA kernels already read `MLA_HOST`'s kernel blocks."""
+    args = [a for l in op["impl"]["launches"] for a in l.get("args", [])]
     if name == "mla_prep":
-        assert {"i64": KERNEL_BLOCK * TOKEN_BYTES // 2} in args, "`mla_prep` page stride is not vLLM's"
+        assert {"i64": KERNEL_BLOCK * TOKEN_BYTES // 2} in args, "`mla_prep` page stride is not `MLA_HOST`'s"
     if name == "mla_attn":
         maps = [f["tensormap"] for a in args if "pack" in a for f in a["pack"]["fields"] if "tensormap" in f]
         pages = [t for t in maps if t["dims"][-1] == 0]
         assert pages and all(t["strides"] == [TOKEN_BYTES, KERNEL_BLOCK * TOKEN_BYTES] for t in pages), \
-            "`mla_attn` page tensormaps are not vLLM's kernel blocks"
+            "`mla_attn` page tensormaps are not `MLA_HOST`'s kernel blocks"
+
+
+def restride(name: str, op: dict, line: int, page: int) -> dict:
+    """`kda_core`'s line stride onto vLLM's page; the MLA kernels' page strides are vLLM's already."""
+    check_mla(name, op)
+    launches = op["impl"]["launches"]
+    if name == "kda_core":
+        args = [a for l in launches for a in l.get("args", [])]
+        assert args.count({"i64": line}) == 1, f"`kda_core` bakes no line stride {line}"
+        launches = [{**l, "args": [{"i64": page} if a == {"i64": line} else a for a in l["args"]]} for l in launches]
     return {**op, "impl": {**op["impl"], "launches": launches}}
 
 
