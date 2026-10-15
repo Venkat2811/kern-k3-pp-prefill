@@ -60,7 +60,9 @@
 #define K12_ROW 272   // a 128-column bf16 row, padded
 #define K12_MMA_WARPS 8
 #define K12_THREADS 512  // a recurrence CTA's 8 MMA warps, loader and store; a gate CTA's 16 gate warps
+#ifndef K12_GATE_CTAS
 #define K12_GATE_CTAS 56 // the GB300's 152 SMs less one sequence's 96 heads
+#endif
 #define K12_RMS_EPS 1e-5f
 #define K12_PROGRESS_STRIDE 32  // ints: each (sequence, head)'s counter on its own 128-byte line
 

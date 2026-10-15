@@ -1,0 +1,2 @@
+# Blank context lines are required syntax in the preserved diagnostic patch.
+b300/diagnostic-state-hashes.patch -whitespace

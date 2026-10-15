@@ -1,0 +1,59 @@
+--- a/crates/kern-run/src/bench/mod.rs
++++ b/crates/kern-run/src/bench/mod.rs
+@@ -325,6 +325,43 @@
+         .collect()
+ }
+ 
++
++/// Diagnostic-only exact image after one replay from Probe's restored pre-image.
++/// Never enabled in performance arms or serving. K3 stage0 layout is asserted.
++fn kda_gate_image(rt: &Runtime, scenario: &str, rank: usize) -> Result<()> {
++    let Some(dir) = std::env::var_os("KERN_BENCH_STATE_HASH_DIR") else { return Ok(()) };
++    let dir = PathBuf::from(dir);
++    std::fs::create_dir_all(&dir)?;
++    let bf16_bad = |bytes: &[u8]| bytes.chunks_exact(2)
++        .filter(|x| u16::from_le_bytes([x[0], x[1]]) & 0x7f80 == 0x7f80).count();
++    let hidden = rt.read_buffer("hidden")?;
++    let hidden_bad = bf16_bad(&hidden);
++    ensure!(hidden_bad == 0, "{scenario}: hidden has {hidden_bad} nonfinite BF16 values");
++    let mut images = vec![json!({"name":"hidden","bytes":hidden.len(),"sha256":digest(&hidden),"nonfinite":hidden_bad})];
++    for (name, state, bytes) in rt.state_sizes() {
++        let image = rt.read_state(name)?;
++        ensure!(image.len() == bytes as usize, "state read length mismatch");
++        let mut bad = 0;
++        if name.starts_with("kda.") {
++            ensure!(state.bytes_per_seq == 6_512_640, "unexpected KDA line layout");
++            ensure!(image.len() % state.bytes_per_seq as usize == 0, "partial KDA line");
++            for line in image.chunks_exact(state.bytes_per_seq as usize) {
++                bad += line[..6_291_456].chunks_exact(4)
++                    .filter(|x| u32::from_le_bytes([x[0],x[1],x[2],x[3]]) & 0x7f80_0000 == 0x7f80_0000).count();
++                bad += bf16_bad(&line[6_291_456..]);
++            }
++        } else {
++            ensure!(name.starts_with("kv."), "unexpected state {name}");
++            bad = bf16_bad(&image);
++        }
++        ensure!(bad == 0, "{scenario}: state {name} has {bad} nonfinite values");
++        images.push(json!({"name":name,"bytes":image.len(),"sha256":digest(&image),"nonfinite":bad}));
++    }
++    std::fs::write(dir.join(format!("{scenario}-rank{rank}.json")),
++        serde_json::to_vec_pretty(&json!({"scenario":scenario,"rank":rank,"images":images}))?)?;
++    Ok(())
++}
++
+ /// One real prefix of `length` tokens of prose, built by running the chunk
+ /// program over it: the source every scenario's sequences copy their
+ /// context from. Copying keeps each sequence on its own pages, so a batch
+@@ -531,6 +568,12 @@
+             (cases, of_call, walked, Some(at.elapsed().as_secs_f64()))
+         }
+     };
++    if std::env::var_os("KERN_BENCH_STATE_HASH_DIR").is_some() {
++        ensure!(!isolate && !ablating, "state-image gate excludes isolate/ablate");
++        if !r.rt.is_captured(&s.program, &vars) { r.rt.capture(&s.program, &vars)?; }
++        r.rt.run_captured(&s.program, &vars)?;
++        kda_gate_image(&r.rt, &s.id, r.rank)?;
++    }
+     Ok(Measured { vars, program, cases, of_call, outputs, free, telemetry: (before, telemetry(r.gpu)), isolate_s })
+ }
+ 

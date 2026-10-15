@@ -1,5 +1,9 @@
 # kern-k3-pp-prefill
 
+**HGX B300 reproduction branch:** [build, manifest adaptations, optional KDA
+experiment and validation](b300/README.md). This branch retains the exact
+tested base; the original GB300 recipe below remains the default.
+
 Full-size Kimi-K3 (896 experts, 93 layers) served disaggregated on the
 [kern runtime](https://github.com/pegainfer-project/kern) and its
 `kern-serve`:
