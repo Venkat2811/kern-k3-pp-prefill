@@ -26,8 +26,8 @@
 // fixed, so a result never depends on the schedule.
 //
 // -DQ_FP8: q_abs is the fp8 query of SGLang's fp8 cache, one e4m3 byte an
-// element: each bf16 above goes on through f32 to e4m3 by cvt.rn without
-// saturation, the aten cast SGLang applies to its bf16 query.
+// element: each bf16 above goes on through f32 to e4m3 by round-to-nearest with finite saturation. Finite overflow clamps to +/-448;
+// NaN inputs remain NaN.
 //
 //   nvcc -cubin -arch=sm_103a -O3 source/k3_mla_absorb_mma.cu
 #include <cuda_bf16.h>
@@ -38,7 +38,7 @@ using namespace nvcuda;
 #include <cuda_fp8.h>
 typedef unsigned char q_t;
 __device__ __forceinline__ void put2(q_t* p, __nv_bfloat162 v) {
-  *reinterpret_cast<unsigned short*>(p) = __nv_cvt_float2_to_fp8x2(__bfloat1622float2(v), __NV_NOSAT, __NV_E4M3);
+  *reinterpret_cast<unsigned short*>(p) = __nv_cvt_float2_to_fp8x2(__bfloat1622float2(v), __NV_SATFINITE, __NV_E4M3);
 }
 #define PUT2(p, i, v) put2((p) + 2 * (i), v)
 #else

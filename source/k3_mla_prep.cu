@@ -56,8 +56,8 @@
 // round trip is not stranded behind the block reduction.
 //
 // -DKV_FP8: the slab is SGLang's fp8 cache, one e4m3 byte an element: each
-// landed bf16 goes through f32 to e4m3 by cvt.rn without saturation, aten's
-// cast (overflow is NaN), so a row is the bytes SGLang's own decode writes.
+// landed bf16 goes through f32 to e4m3 by round-to-nearest with finite saturation. Finite overflow clamps to +/-448;
+// NaN inputs remain NaN. In-range finite values retain the original bytes.
 //
 // Slab addressing (elements, `slab` is the state base):
 //   row = (slot / 64) * page_stride + layer_off + (slot % 64) * 576
@@ -125,7 +125,7 @@ __device__ __forceinline__ unsigned mul2(unsigned a, unsigned g) {
 #include <cuda_fp8.h>
 typedef unsigned char kv_t;
 __device__ __forceinline__ unsigned fp8x2(unsigned w) {
-  return __nv_cvt_float2_to_fp8x2(__bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w)), __NV_NOSAT, __NV_E4M3);
+  return __nv_cvt_float2_to_fp8x2(__bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w)), __NV_SATFINITE, __NV_E4M3);
 }
 __device__ __forceinline__ void put4(kv_t* p, uint2 v) {
   *reinterpret_cast<unsigned*>(p) = fp8x2(v.x) | fp8x2(v.y) << 16;
