@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+// Modified in kern-k3-pp-prefill (2026): clear unused shared-memory K/KR and
+// V rows of partial pages before MMA. See PROVENANCE.md for the local repair,
+// tested source and cubin hashes, and the scope of its validation.
+
 typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -329,6 +333,64 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
     unsigned int u;
     asm("mov.b32 %0, %1;" : "=r"(u) : "r"(v));
     return u;
+}
+
+
+// All 32 lanes of CTA0's MMA warp call this only after the existing cluster
+// TMA-completion wait. Zero complete rows: the 128B/64B swizzle permutes bytes
+// inside a row, never across these row boundaries. Valid operands are untouched.
+__device__ __forceinline__ void cake_zero_invalid_smem_rows(
+        int local_base, int target_cta, int valid_rows, int row_bytes, int lane) {
+    int remote_base;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
+                 : "=r"(remote_base) : "r"(local_base), "r"(target_cta));
+    // Row starts and widths are at least 64 B aligned, so every 16 B vector is
+    // entirely invalid. Vector stores reduce the row clear's instruction cost.
+    for (int vec = valid_rows * (row_bytes / 16) + lane;
+         vec < 64 * (row_bytes / 16); vec += 32) {
+        int addr = remote_base + vec * 16;
+        asm volatile("st.shared::cluster.v4.u32 [%0], {%1, %1, %1, %1};"
+                     :: "r"(addr), "r"(0) : "memory");
+    }
+}
+
+// Only a partial 128-token tile, or a dummy tile in an empty split with fewer
+// than 128 valid tokens, reaches the clear. K/KR clearing is defense in depth:
+// softmax already selects -CAKE_INF for invalid QK columns. Clearing V is what
+// prevents zero times an unused NaN from contaminating the valid PV result.
+__device__ __forceinline__ void cake_mask_invalid_kv_stage(
+        int kv_base, int kr_base, int abs_tile, int kv_len, bool value_layout,
+        int lane) {
+    if (abs_tile * 128 + 128 <= kv_len) return;
+    #pragma unroll
+    for (int page = 0; page < 2; ++page) {
+        int valid = kv_len - (abs_tile * 128 + page * 64);
+        valid = valid < 0 ? 0 : (valid > 64 ? 64 : valid);
+        if (valid < 64) {
+            if (value_layout) {
+                // After V reload, slot parity selects the logical page in both
+                // CTAs; CTA rank selects the latent channel halves.
+                #pragma unroll
+                for (int rank = 0; rank < 2; ++rank) {
+                    cake_zero_invalid_smem_rows(kv_base + page * 8192,
+                                                rank, valid, 128, lane);
+                    cake_zero_invalid_smem_rows(kv_base + (page + 2) * 8192,
+                                                rank, valid, 128, lane);
+                }
+            } else {
+                // Before QK, CTA rank selects the logical page, all channels.
+                #pragma unroll
+                for (int slot = 0; slot < 4; ++slot)
+                    cake_zero_invalid_smem_rows(kv_base + slot * 8192,
+                                                page, valid, 128, lane);
+                cake_zero_invalid_smem_rows(kr_base, page, valid, 64, lane);
+            }
+        }
+    }
+    // Publish generic-proxy stores in both CTAs to the async MMA proxy.
+    // Every writing lane fences; the warp joins before its elected MMA issuer.
+    asm volatile("fence.proxy.async.shared::cluster;" ::: "memory");
+    __syncwarp();
 }
 
 extern "C" {
@@ -3620,6 +3682,10 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_ea17187e76fd47ab2653(const __grid_co
                     }
                     if (cta_rank == 0) {
                         mbarrier_wait(k_full_addr + (mma_k_stage) * 8, _phase_k_full);
+                        cake_mask_invalid_kv_stage(
+                            smem_k_addr + mma_k_stage * 32768,
+                            smem_kr_addr + mma_kr_stage * 4096,
+                            my_start_block_2 + tile_2, kv_len_2, false, lane);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         {
                             int _mma_a_lo_0 = (((smem_q_addr) >> 4) & 0x3FFF) + (0) * 2048;
@@ -3820,6 +3886,9 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_ea17187e76fd47ab2653(const __grid_co
                         }
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         mbarrier_wait(pv_full_addr + (mma_pv_stage) * 8, _phase_pv_full);
+                        cake_mask_invalid_kv_stage(
+                            smem_kv_addr + mma_pv_stage * 32768, 0,
+                            my_start_block_2 + prev_tile, kv_len_2, true, lane);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int _mma_a_lo_9 = (((smem_p_addr) >> 4) & 0x3FFF) + (prev_phase) * 512;
                         int _mma_b_lo_9 = ((((smem_kv_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_pv_stage) * 2048;
@@ -3950,6 +4019,9 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_ea17187e76fd47ab2653(const __grid_co
                 }
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 mbarrier_wait(pv_full_addr + (mma_pv_stage) * 8, _phase_pv_full);
+                cake_mask_invalid_kv_stage(
+                    smem_kv_addr + mma_pv_stage * 32768, 0,
+                    my_start_block_2 + last_tile, kv_len_2, true, lane);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int _mma_a_lo_13 = (((smem_p_addr) >> 4) & 0x3FFF) + (last_phase) * 512;
                 int _mma_b_lo_13 = ((((smem_kv_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_pv_stage) * 2048;
