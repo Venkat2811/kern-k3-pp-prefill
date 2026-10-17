@@ -26,7 +26,8 @@ blocks' weight loads); with the spread only below 33 rows, 3.404-3.405 (-0.2%).
 - embed_rms_plan's plan in block B: 3.282-3.284 (vs 3.284-3.285)
 - push spread over every block in the one-shot only: 3.273-3.274
 - ar_finalize's routed latent before the wait: 3.270-3.271
-= main d85613c 3.373 -> 3.270 (-3.0%). **Offer: the branch at its head** (14 commits on d85613c).
+- the closing add's prefetch after the wait: -0.17% (3.275-3.277 -> 3.270-3.271 on another lease)
+= main d85613c 3.373 -> 3.270 (-3.0%). **Offer: the branch at its head** (15 commits on d85613c).
 All bit-identical vs main (loop/d/check x3; two-shot paths in the harness).
 
 Each exchange's own time in the step (work/ar/own.py: per call, end minus the previous kernel's end, the minimum
@@ -198,20 +199,30 @@ window's, not the row's.
 | push spread (runs over all 152 blocks) below 14 rows only, i.e. one-shot only / at every row count / AR_GRACE_NS 250 | 3.290-3.293 -> 3.283 / 3.292-3.294 / 3.291 | one-shot only |
 | L2_INFLIGHT 6 / 10 MB, AR_GRACE_NS 0 (with 8 MB) | 3.273-3.275 -> 3.278 / 3.281-3.291 / 3.276-3.279 | no |
 | ar_finalize's routed latent summed before griddepcontrol.wait (fc2 is two kernels back) | 3.272-3.275 -> 3.270-3.271 | yes |
+| the closing add's prefetch blocks pass griddepcontrol.wait before their hints | 3.275-3.277 -> 3.270-3.271 | yes |
 | no push spread at all / PUSH_RUN 64 / 256 (one-shot) | 3.276-3.277 -> 3.278-3.279 (8 rows +10 us) / 3.278-3.280 / 3.278 | no: noise |
 | embed_rms_plan's split plan in block B (was: warp 0 of every row block, before the row's norm) | embed alone 4.37-5.14 -> 2.97-3.64 us, the same outputs and splits; step 3.284 -> 3.282 | yes |
 | land's mix norm from the candidates' pairwise dots (one cluster reduction after the wait instead of two) | | not retried: -0.09% in round 3's first session, and the only change here that would move outputs (0.1-0.4% by 1-2 ulp) |
 
-## Runtime proposal: multicast for the exchanges
+## Multicast for the exchanges: measured, not worth a runtime feature now
 
-`multimem.st` to a multicast alias of `tp_ar_lamport` makes a one-shot push one copy of the partial out of each rank
-(the switch fans it out) instead of 8 unicast copies, and the two-shot's gather one store. Round 2 (agent/x-mcast,
-f07e2f9) measured it with k3_step creating the object (rank 0 cuMulticastCreate, its fabric handle shared beside the
-NCCL id, every rank cuMulticastAddDevice, binds its own mapping by address, maps the alias, writes the alias into a
-`tp_ar_lamport_mc` u64 buffer): one-shot 7168 wide 8.06 / 8.36 / 9.16 / 10.25 -> 6.92 / 8.05 / 9.31 / 10.53 us at
-8 / 16 / 24 / 32 rows, two-shot 8.07-8.31 flat; in the step -0.25% (3.484 -> 3.475). What the runtime would need: a
-buffer kind `multicast_of: <peer buffer>` that kern creates after the peers' handles are imported and whose value is
-the alias, so a manifest can pass it to a launch. Not shipped (the manifest must run on today's kern).
+Round 2 (agent/x-mcast, f07e2f9) measured `multimem.st` pushes in the step at -0.25%, against a push that left a
+row from its one SM. Measured again here, against today's push (work/ar/arh.cu `mc*` variants: rank 0
+cuMulticastCreate, its fabric handle through the run directory, every rank cuMulticastAddDevice +
+cuMulticastBindMem of its Lamport stages, the alias mapped; the one-shot push one `multimem.st.weak.global.v4.bf16x2`
+instead of 8 stores; ar_attnres_rms nb 1, us per call, outputs bit-identical):
+
+| rows | 1 | 4 | 8 | 10 | 12 | 13 | 16 | 24 | 32 | 48 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| ours (one-shot < 14, two-shot from 14) | 8.87 | 8.87 | 9.29 | 9.56 | 9.83 | 9.97 | 9.65 | 9.79 | 9.92 | 10.20 | 10.78 |
+| multicast one-shot (< 14 rows) | 8.87 | 8.87 | 9.15 | 9.42 | 9.80 | 9.83 | | | | | |
+| unicast one-shot at every row count | | | 9.10 | | | | 10.31 | 11.61 | 12.79 | 15.38 | 18.23 |
+| multicast one-shot at every row count | | | 9.15 | | | | 10.20 | 11.56 | 12.79 | 15.51 | 18.16 |
+
+With the push spread over every SM, the one-shot is bound by each rank's ingress (7 partials in), which multicast
+does not change; it only saves egress. So a runtime multicast object is worth ~0.1 us below 14 rows and nothing
+above. What could move the large-row floor is a switch reduction (`multimem.ld_reduce`, 1x ingress), which needs a
+barrier before the pull (2.5-4.4 us each, the orchestrator's measurement): not better than the two-shot's 10-11 us.
 
 Note on checking: loop/d/check runs 4 rows, i.e. only the one-shot path. Every two-shot change was checked in the
 harness instead: outputs at 8-64 rows bit-for-bit equal to the variant before on every rank (no DIFF in any rank's
