@@ -158,3 +158,10 @@ check's 4 rows tiled to 20 and to 36 rows, teacher-forced 640 steps on TP8,
 main's d-l4-tp8 against this branch's (after f8bd7e6): top-1 1.0000, relRMS
 max 0.00000 over every kept row-step, 8 ranks agreeing, at both. (Run
 loop/d/ranks with an absolute OUT: the ranks run on other hosts.)
+- **kda_core KDA_SPLIT** (a (b, h) item on a 2-CTA cluster, each CTA half the
+  state by bulk copy and half the dv rows, attn halves exchanged by DSMEM,
+  the window shift deferred past the cluster barrier; bit-identical): the
+  S build jumps 6.26 → 7.34 µs from 12 to 13 rows (SMs with two items), but
+  the split is slower everywhere (8 rows 5.74 → 7.17, 16 rows 7.74 → 9.06):
+  both CTAs pay the whole prologue (32 KB tile, window, scalars) and the
+  cluster barriers. Dropped.
