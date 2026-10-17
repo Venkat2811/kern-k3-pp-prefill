@@ -14,8 +14,8 @@ them in the TP8 / EP8 / DCP8 decode step. Main at the start: 3.486 ms/step weigh
   (bitonic sort32 + merge tree, r-attn) is what this branch had as its first step (`956fdd7`); the branch
   replaces it with the threshold top-k (tau from the warp maxima, the candidates compacted and merged 32 at
   a time by sort32 / merge32, exact for any candidate count: no O(n^2) ranking, so tie-heavy rows cost one
-  more chunk, not 24 us) and the rest below. r-attn's harness numbers for f285eb9 (4.90-5.28 us) match
-  this branch's measurements of the same step.
+  more chunk, not 24 us) and the rest below. On this branch the threshold step measured 5.9 -> 5.1-5.4 us
+  in the harness and 6.5 -> 5.6 in the step against the bitonic one (below).
 - **For r-gemm:** the shared expert's down projection now runs inside moe_front (before FC1), so
   800c859's L2 pin of `sh_down` for after the MoE finds no `.sh_down` GEMM and stays off; nothing to do.
 
