@@ -172,6 +172,13 @@ the flags carry that ordering (noted in the commit and the kernel).
   11 MB of weight loads contend with its L2 round trips). Still ahead of the old 3.7 us tail after FC2
   at every row count. Tried, not better: four warps x 32 rows x alternate tiles for every row count
   (harness 8.2 vs 7.6 us at 36 rows).
+- In-step stamps at 36 rows (HEAD): flags stored by moe_front 1.6-1.9 us, seen by sh_down 3.3-4.6 (its
+  polls queue behind the CTA's 6144 weight cp.async), act +0.8, the 8-warp GEMM +2.5, end 7.5-7.9.
+  Tried, A/B in one lease (3 rounds): weight cp.async only from the warps of sub-partitions 2-3 (polls on
+  0-1 then see the flags ~0.6 us earlier) 3.4430 -> 3.4463, worse; plus four warps x 32 rows x alternate
+  tiles above 24 rows 3.4717, worse. FC1 waits for every grid launched before it (the transitive wait
+  above), so sh_down's end, not moe_front's, now sets FC1's start at every row count: moe_front's own
+  tail (hand-off, tables) only pays once sh_down is shorter.
 - Verification caveat: main itself gave different logits at 24 rows teacher-forced across two leases
   once (48 rows reproducible); compare a candidate against main run in the same batch.
 
