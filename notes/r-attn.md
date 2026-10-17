@@ -188,3 +188,34 @@ loop/d/ranks with an absolute OUT: the ranks run on other hosts.)
   without stores 16 rows drops 1.44 µs vs 0.55 at 8 rows, ~46 B/clk of
   STG.128 an SM.
 - One-GPU harnesses are in `harness/attn/` (`run.sh kda|absorb OUT ARGS`).
+
+## Bytes (ncu, one GPU, cold, after f8bd7e6)
+
+| kernel | rows | DRAM read | model (state + window + inputs + weights) |
+|---|---|---|---|
+| kda_core S | 8 | 7.21 MB | 6.29 + 0.22 + 0.20 + 0.47 = 7.2 MB |
+| kda_core S | 24 | 20.64 MB | 18.9 + 0.66 + 0.61 + 0.47 = 20.6 MB |
+| kda_core R | 36 | 30.71 MB | 28.3 + 1.0 + 0.9 + 0.47 = 30.7 MB |
+| kda_core R | 48 | 40.78 MB | 37.7 + 1.3 + 1.2 + 0.47 = 40.7 MB |
+| absorb | 8 | 13.19 MB | 12.58 W_UK + 0.59 q |
+| absorb | 48 | 16.13 MB | 12.58 + 3.54 |
+
+DRAM writes ~0: the state lands in L2 and is written back under the next
+kernels. Every byte is read once; what is left over the floors above is
+latency (kda's chain, absorb's one round trip) and kda's prologue not
+overlapping its stream (register build), as the done table says.
+
+## Runtime proposals
+
+1. **Choose a launch by a device-written scalar** (CUDA conditional graph
+   nodes, IF / SWITCH on a value a kernel wrote): the MLA plan knows the
+   batch's largest split count; a switch on it would launch the DSL
+   attention with exactly that many slots. Measured value: the uniform
+   bench's -0.37% (16 → 4 slots from 16 rows) without the skewed batches'
+   +30-195 µs a 16-layer step (both measured above).
+2. **`shared_mem` as a launch expression**, or `when` launches counted once
+   by loop/count: kda_core's two builds (S up to 25 rows, R above) are one
+   op with two `when` launches today, +0.8 counted launches a layer for
+   none executed. With an expression a single cubin could take both paths
+   (branching on %dynamic_smem_size). kern verify rejects any expression in
+   `shared_mem` (an untagged-enum mismatch).
