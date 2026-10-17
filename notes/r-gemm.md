@@ -17,26 +17,29 @@ loop/count reads 20.4 a layer against main's 13.7 (it counts the four `when` buc
 of which one runs; a single bucket loses the whole gain, see below; three buckets (16 / 24 / 32, loop/count 18.8)
 cost +0.15%, 3.3657 vs 3.3607, the 8-row steps +10-15 us).
 
-## The table (rank 0, nsys critical path, us a call, main d85613c -> this branch 499159d, ratio to decode.md's HBM floor)
+## The table (rank 0, nsys critical path, us a call, main 21a9174 -> this branch, ratio to decode.md's HBM floor)
 
 A ratio under 1 means the weight came from L2 (a predecessor loaded it during its own wait): the call's floor is then
-L2's, and the HBM bytes moved earlier. main d85613c already carries the L2 loads / hints / o_proj pin (95bc0b0); the
-columns differ by the own GEMM (qkvg / front at 1-32 rows), the sh_down pin and the rows rounded up to 8. 16-layer
-step, same lease (prof11). Step p50, main -> branch: 1 x 8k 1.95 -> 1.92 ms, 8 x 8k 2.40 -> 2.37, 32 x 8k 3.65 ->
-3.57, 64 x 8k 4.62 -> 4.60, 32 x 32k 3.68 -> 3.65.
+L2's, and the HBM bytes moved earlier. main 21a9174 carries the L2 loads / hints / o_proj pin (95bc0b0) under r-ar's
+shorter load window (0.5 us past the first row, 8 MB in flight, closing-add hints 16 MB), so front and qkvg read
+more from HBM than under this run's 2.5 us window: against GEMM.md's practical read floor (a plain read of these
+sizes, 6.2-6.3 TB/s: front 13.8 us, qkvg 14.0) front is 0.80-1.17x at 1-32 rows, qkvg 1.01-1.09x. The columns
+differ by the own GEMM (qkvg / front at 1-32 rows), the sh_down pin and the rows rounded up to 8. 16-layer step,
+same lease (prof13). Step p50, main -> branch: 1 x 8k 1.84 -> 1.77 ms, 8 x 8k 2.33 -> 2.30, 32 x 8k 3.52 -> 3.47,
+64 x 8k 4.54 -> 4.53, 32 x 32k 3.58 -> 3.54.
 
 | call | n x k | 1 x 8k | 8 x 8k | 32 x 8k | 64 x 8k | 32 x 32k |
 |---|---|---:|---:|---:|---:|---:|
-| `qkvg` | 6400 x 7168 f32 | 15.4 -> **12.2** (0.98x) | 14.2 -> **12.4** (0.99x) | 14.9 -> **14.5** (1.15x) | 14.5 -> **14.5** (1.12x) | 14.9 -> **14.6** (1.15x) |
-| `front` | 6016 x 7168 f32 | 12.9 -> **10.8** (0.91x) | 11.3 -> **10.9** (0.92x) | 14.2 -> **13.8** (1.16x) | 17.4 -> **16.8** (1.39x) | 14.2 -> **13.9** (1.16x) |
-| `lat_up` | 7168 x 3584 | 7.5 -> **5.5** (0.79x) | 5.3 -> **5.6** (0.80x) | 5.9 -> **6.1** (0.87x) | 6.5 -> **6.6** (0.92x) | 5.9 -> **6.1** (0.87x) |
-| `o_proj` | 7168 x 1536 | 4.2 -> **4.2** (1.39x) | 4.3 -> **4.4** (1.45x) | 4.4 -> **4.4** (1.41x) | 4.5 -> **4.5** (1.40x) | 4.6 -> **4.6** (1.48x) |
-| `sh_down` | 7168 x 768 | 3.6 -> **2.7** (1.79x) | 3.7 -> **2.7** (1.80x) | 4.0 -> **3.0** (1.92x) | 4.0 -> **4.0** (2.48x) | 4.0 -> **3.0** (1.94x) |
-| `wfu` | 3648 x 7168 f32 | 9.9 -> **9.5** (1.34x) | 9.7 -> **9.8** (1.37x) | 10.9 -> **10.8** (1.49x) | 10.6 -> **10.4** (1.41x) | 10.8 -> **10.9** (1.51x) |
-| `q_b` | 18432 x 1536 f32 | 10.7 -> **10.2** (1.33x) | 10.6 -> **10.7** (1.37x) | 11.2 -> **11.2** (1.39x) | 11.6 -> **11.6** (1.38x) | 11.4 -> **11.1** (1.38x) |
-| `lm_head` | 20480 x 7168 f32 | 46.1 -> **46.6** (1.16x) | 48.5 -> **48.3** (1.20x) | 45.5 -> **45.1** (1.11x) | 44.9 -> **44.5** (1.09x) | 45.3 -> **44.5** (1.10x) |
-| `wgu` | 8448 x 7168 | 15.6 -> **14.6** (0.88x) | 16.3 -> **15.6** (0.95x) | 19.9 -> **19.6** (1.17x) | 24.4 -> **23.9** (1.41x) | 19.9 -> **19.4** (1.16x) |
-| `w_dn` | 7168 x 4224 | 11.6 -> **11.3** (1.36x) | 11.5 -> **11.9** (1.43x) | 12.9 -> **13.0** (1.54x) | 13.8 -> **14.4** (1.68x) | 13.0 -> **12.9** (1.53x) |
+| `qkvg` | 6400 x 7168 f32 | 16.2 -> **14.2** (1.13x) | 15.9 -> **14.2** (1.13x) | 16.3 -> **15.3** (1.20x) | 16.0 -> **15.9** (1.23x) | 16.3 -> **15.3** (1.20x) |
+| `front` | 6016 x 7168 f32 | 13.8 -> **11.1** (0.94x) | 13.1 -> **12.1** (1.02x) | 17.0 -> **16.1** (1.35x) | 18.2 -> **18.3** (1.51x) | 17.1 -> **16.1** (1.34x) |
+| `lat_up` | 7168 x 3584 | 8.6 -> **5.5** (0.79x) | 5.6 -> **5.6** (0.80x) | 5.9 -> **6.0** (0.84x) | 6.4 -> **6.4** (0.89x) | 5.9 -> **6.0** (0.84x) |
+| `o_proj` | 7168 x 1536 | 4.9 -> **4.1** (1.37x) | 4.4 -> **4.4** (1.46x) | 4.6 -> **4.6** (1.48x) | 4.6 -> **4.5** (1.42x) | 4.6 -> **4.5** (1.46x) |
+| `sh_down` | 7168 x 768 | 3.7 -> **2.7** (1.79x) | 3.7 -> **2.7** (1.78x) | 4.0 -> **2.9** (1.90x) | 4.0 -> **4.0** (2.48x) | 4.0 -> **3.0** (1.94x) |
+| `wfu` | 3648 x 7168 f32 | 10.5 -> **10.5** (1.49x) | 10.3 -> **10.6** (1.48x) | 10.8 -> **10.5** (1.45x) | 11.4 -> **11.5** (1.56x) | 10.7 -> **10.6** (1.46x) |
+| `q_b` | 18432 x 1536 f32 | 10.6 -> **10.7** (1.38x) | 10.7 -> **10.6** (1.37x) | 11.1 -> **11.0** (1.36x) | 11.6 -> **11.6** (1.38x) | 11.3 -> **11.4** (1.42x) |
+| `lm_head` | 20480 x 7168 f32 | 47.6 -> **48.3** (1.20x) | 50.5 -> **50.4** (1.25x) | 46.6 -> **46.0** (1.14x) | 47.2 -> **46.8** (1.14x) | 45.6 -> **45.7** (1.13x) |
+| `wgu` | 8448 x 7168 | 17.8 -> **16.2** (0.98x) | 17.7 -> **17.2** (1.04x) | 22.1 -> **22.0** (1.31x) | 24.4 -> **25.2** (1.49x) | 22.3 -> **21.9** (1.31x) |
+| `w_dn` | 7168 x 4224 | 11.0 -> **11.3** (1.36x) | 11.9 -> **11.6** (1.40x) | 13.2 -> **13.0** (1.53x) | 14.3 -> **14.5** (1.68x) | 13.4 -> **13.4** (1.58x) |
 
 Against main 01d6dc5 (before any of this run's work; prof8, rank 0): qkvg 17.6-19.2 -> 12.2-14.6 us, front 13.4-18.4
 -> 10.0-16.7, lat_up 8.1-8.6 -> 5.5-6.6, o_proj 5.0-5.8 -> 4.2-4.6, sh_down 3.7-4.0 -> 2.7-4.0, wfu 11.6-13.3 ->
