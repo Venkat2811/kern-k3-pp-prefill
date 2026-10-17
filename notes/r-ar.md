@@ -220,6 +220,7 @@ window's, not the row's.
 | ar_finalize's routed latent summed before griddepcontrol.wait (fc2 is two kernels back) | 3.272-3.275 -> 3.270-3.271 | yes |
 | the closing add's prefetch blocks pass griddepcontrol.wait before their hints | 3.275-3.277 -> 3.270-3.271 | yes |
 | the closing add's prefetch cap again, now after the wait: 8 / 16 / 24 / 32 MB | 3.268-3.269 / 3.267-3.273 / 3.269-3.274 / 3.270-3.271 | 16 MB (flat) |
+| on main fd5c92c (r-gemm's L2 pins merged; 3.242 / 3.246): AR_GRACE_NS 0 / 1500, L2_INFLIGHT 12 / 6 MB, LAND_PF_MAX 32 MB | 3.245-3.246 / 3.253-3.254, 3.254 / 3.248, 3.249-3.250 | the settings stay |
 | no push spread at all / PUSH_RUN 64 / 256 (one-shot) | 3.276-3.277 -> 3.278-3.279 (8 rows +10 us) / 3.278-3.280 / 3.278 | no: noise |
 | embed_rms_plan's split plan in block B (was: warp 0 of every row block, before the row's norm) | embed alone 4.37-5.14 -> 2.97-3.64 us, the same outputs and splits; step 3.284 -> 3.282 | yes |
 | the mix's norm from the candidates' pairwise dots (MIX_GRAM: the snapshots' scores and pair dots in one reduction before the row is in, the row's score and dots with the snapshots in one after: one reduction after the data instead of two), attention all-reduce | nb 1 / 2, 1-64 rows: -0.1..-0.4 us (nb 2 at 1-8 rows +0.1); 0.17-0.46% of outputs move, max rel 0.014 (1-2 bf16 ulp: the norm of the f32 mix, not of its bf16 rounding) | 3.267 / 3.266 -> 3.266 / 3.271 | no: flat, and it moves outputs |
