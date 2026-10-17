@@ -14,18 +14,21 @@
 // block sums it as the one-shot does and gathers the sum to the others. The
 // blocks past B load the next GEMM's weight `pf` (`pf_bytes`) into L2 while a
 // row block still waits (k3_l2_prefetch.cuh; state[1] stamps a row's data in,
-// state[3] counts the blocks done, state[7] is the loads' sink).
+// state[3] counts the blocks done, state[7] is the loads' sink);
+// kern_k3_ar_finalize_rms's then the next layer's o_proj weight `pf2` at
+// evict_last, which the kern_k3_ar_attnres_rms after that o_proj puts back to
+// evict_normal (`dm`).
 //
 //   kern_k3_ar_attnres_rms(const bf16* x, u8* lamport, const u64* lamport_peers, i32* state,
 //       i32* err, int rank, const bf16* prefix, const bf16* blocks, const f32* sw,
 //       const bf16* gamma, bf16* prefix2, bf16* normed, int nb, int snapshot, int B,
-//       i64 stage_bytes, i64 timeout_ns, const u8* pf, i64 pf_bytes)
+//       i64 stage_bytes, i64 timeout_ns, const u8* pf, i64 pf_bytes, const u8* dm, i64 dm_bytes)
 //     o_proj's partials x [B, H] summed, then k3_residual.cu's K1b (-DLAND_BF16) on the sum.
 //
 //   kern_k3_ar_finalize_rms(const bf16* fc2, const i32* exp2perm, const f32* wts,
 //       const bf16* shared, u8* lamport, const u64* lamport_peers, i32* state, i32* err,
 //       int rank, const bf16* gamma, bf16* latent_norm, bf16* shared_sum, int B,
-//       i64 stage_bytes, i64 timeout_ns, const u8* pf, i64 pf_bytes)
+//       i64 stage_bytes, i64 timeout_ns, const u8* pf, i64 pf_bytes, const u8* pf2, i64 pf2_bytes)
 //     A row's routed latent partial (k3_moe_prefill.cu's kern_k3_moe_finalize over this
 //     rank's experts, bf16) and its shared expert's down partial `shared` [B, H], summed;
 //     latent_norm = k3_land.cu's kern_k3_rms(latent sum, gamma), shared_sum the shared sum.
@@ -442,7 +445,8 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_attnres_rms
     const uint4* __restrict__ x, uint8_t* lamport, const unsigned long long* lamport_peers, int* state, int* err,
     int rank, const bf16_t* __restrict__ prefix, const bf16_t* __restrict__ blocks, const float* __restrict__ sw,
     const bf16_t* __restrict__ gamma, bf16_t* __restrict__ prefix2, bf16_t* __restrict__ normed, int nb, int snapshot,
-    int B, long long stage_bytes, long long timeout_ns, const uint8_t* __restrict__ pf, long long pf_bytes) {
+    int B, long long stage_bytes, long long timeout_ns, const uint8_t* __restrict__ pf, long long pf_bytes,
+    const uint8_t* __restrict__ dm, long long dm_bytes) {
   extern __shared__ uint4 cand[];
   __shared__ RowSmem s;
   const int t = threadIdx.x, b = blockIdx.x;
@@ -467,6 +471,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_attnres_rms
   }
   lamport_clear(l);
   l2_load_while(pf, pf_bytes, B, (unsigned*)state + 1, AR_GRACE_NS, state + 7);
+  l2_demote(dm, dm_bytes, B);
 
   int fail = 0;
   if (row) {
@@ -568,7 +573,8 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
     const bf16_t* __restrict__ fc2, const int* __restrict__ exp2perm, const float* __restrict__ wts,
     const uint4* __restrict__ shared, uint8_t* lamport, const unsigned long long* lamport_peers, int* state, int* err,
     int rank, const bf16_t* __restrict__ gamma, bf16_t* __restrict__ latent_norm, uint4* __restrict__ shared_sum, int B,
-    long long stage_bytes, long long timeout_ns, const uint8_t* __restrict__ pf, long long pf_bytes) {
+    long long stage_bytes, long long timeout_ns, const uint8_t* __restrict__ pf, long long pf_bytes,
+    const uint8_t* __restrict__ pf2, long long pf2_bytes) {
   __shared__ float sm[33];
   const int t = threadIdx.x, b = blockIdx.x;
   const long long tot = (long long)B * ROWV;
@@ -586,6 +592,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
   }
   lamport_clear(l);
   l2_load_while(pf, pf_bytes, B, (unsigned*)state + 1, FIN_GRACE_NS, state + 7);
+  l2_load_while<true>(pf2, pf2_bytes, B, (unsigned*)state + 1, FIN_GRACE_NS, state + 7);
 
   int fail = 0;
   if (b < B) {

@@ -150,6 +150,8 @@ CAND_SMEM = NB_MAX * H * 2  # k3_ar_fused.cu: a row's snapshots prefetched into 
 PF_PARAMS = ["in buffer<bf16>", "i64"]  # k3_ar_fused.cu: the next GEMM's weight, prefetched into L2
 PF_OPS = {"ar_attnres_rms", "ar_finalize_rms", "land_add2_attnres_rms_snap"}
 PF_MAX = 96 << 20  # of the GB300's 129 MB L2
+# ar_finalize_rms also loads the next o_proj's weight at evict_last; ar_attnres_rms after that o_proj demotes it
+PF_LAST = ".o_proj"
 
 # Launch geometry per entry, as the kernel headers document it
 # (docs/k3-kernel-abi.md §1). grid.x is always the batch.
@@ -672,13 +674,14 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         ops["ar_attnres_rms"] = {
             "params": ["in buffer<bf16>", *lamport_params, "in buffer<bf16>", "in buffer<bf16>", "in buffer<f32>",
                        "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32", "i64", "i64",
-                       *PF_PARAMS],
+                       *PF_PARAMS, *PF_PARAMS],
             "impl": {"launches": [launch("k3_ar_fused", "kern_k3_ar_attnres_rms", defines={"NRANKS": tp},
                                          grid=[TP_AR_GRID, 1, 1], block=[1024, 1, 1], smem=CAND_SMEM)]},
         }
         ops["ar_finalize_rms"] = {
             "params": ["in buffer<bf16>", "in buffer<i32>", "in buffer<f32>", "in buffer<bf16>", *lamport_params,
-                       "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "i32", "i64", "i64", *PF_PARAMS],
+                       "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "i32", "i64", "i64", *PF_PARAMS,
+                       *PF_PARAMS],
             "impl": {"launches": [launch("k3_ar_fused", "kern_k3_ar_finalize_rms", defines={"NRANKS": tp},
                                          grid=[TP_AR_GRID, 1, 1], block=[1024, 1, 1])]},
         }
@@ -1344,14 +1347,25 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             moe_weights(once, i, n + "moe.")
 
     def prefetch_next(prog):
-        """Every PF_OPS call names the weight of the GEMM after it (up to PF_MAX bytes) for L2."""
+        """Every PF_OPS call names the weight of the GEMM after it (up to PF_MAX bytes) for L2; ar_finalize_rms
+        also the next PF_LAST GEMM's, at evict_last, and the ar_attnres_rms after that GEMM the same range to
+        put back to evict_normal."""
         gemms = [(k, c) for k, c in enumerate(prog) if c["op"] in ("gemm_f32", "gemm_bf16")]
+        size = lambda w: math.prod(buffers[w["buf"]]["shape"]) * {"bf16": 2, "f32": 4, "u8": 1}[
+            buffers[w["buf"]]["dtype"]] - w.get("offset", 0)
+        last = {}
         for k, c in enumerate(prog):
             if c["op"] in PF_OPS:
                 w = next(g["args"][1] for j, g in gemms if j > k)
-                d = buffers[w["buf"]]
-                size = math.prod(d["shape"]) * {"bf16": 2, "f32": 4, "u8": 1}[d["dtype"]] - w.get("offset", 0)
-                c["args"] += [w, i64(min(size, PF_MAX))]
+                c["args"] += [w, i64(min(size(w), PF_MAX))]
+            if c["op"] == "ar_finalize_rms":
+                j, g = next(((j, g) for j, g in gemms if j > k and g["label"].endswith(PF_LAST)), (None, None))
+                c["args"] += [g["args"][1], i64(size(g["args"][1]))] if g else [w, i64(0)]
+                if g:
+                    last[j] = g["args"][1]
+            if c["op"] == "ar_attnres_rms":
+                j = max(j for j, _ in gemms if j < k)
+                c["args"] += [last[j], i64(size(last[j]))] if j in last else [w, i64(0)]
         return prog
 
     if chunk:

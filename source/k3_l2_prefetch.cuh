@@ -31,6 +31,9 @@ __device__ __forceinline__ unsigned l2_now() {
   return t | 1u;
 }
 
+// `last`: the lines go in at evict_last, so a weight read a few kernels later outlives the traffic between
+// (l2_demote puts them back once their GEMM has run; an evict_last line nobody demotes holds L2 for good).
+template <bool last = false>
 __device__ __forceinline__ void l2_load_while(const uint8_t* w, long long bytes, int B,
                                               const unsigned* arrived, int grace_ns, int* sink) {
   if ((int)blockIdx.x < B) return;
@@ -38,6 +41,8 @@ __device__ __forceinline__ void l2_load_while(const uint8_t* w, long long bytes,
   const int warps = min((int)(blockDim.x >> 5), (L2_INFLIGHT / (32 * 128) + nb - 1) / nb);
   if ((int)(threadIdx.x >> 5) >= warps) return;
   const long long lines = bytes >> 7, round = (long long)nb * warps * 32;
+  unsigned long long pol = 0;
+  if (last) asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
   unsigned acc = 0;
   for (long long l = ((long long)(blockIdx.x - B) * warps + (threadIdx.x >> 5)) * 32 + lane; l < lines; l += round) {
     int done = 0;
@@ -47,10 +52,20 @@ __device__ __forceinline__ void l2_load_while(const uint8_t* w, long long bytes,
     }
     if (__shfl_sync(0xffffffffu, done, 0)) break;
     unsigned v;
-    asm volatile("ld.global.L2::128B.b32 %0, [%1];" : "=r"(v) : "l"(w + (l << 7)));
+    if (last)
+      asm volatile("ld.global.L2::cache_hint.L2::128B.b32 %0, [%1], %2;" : "=r"(v) : "l"(w + (l << 7)), "l"(pol));
+    else
+      asm volatile("ld.global.L2::128B.b32 %0, [%1];" : "=r"(v) : "l"(w + (l << 7)));
     acc ^= v;
   }
   if (acc == 0x5f3759dfu) *sink = (int)acc;
+}
+
+__device__ __forceinline__ void l2_demote(const uint8_t* w, long long bytes, int B) {
+  if ((int)blockIdx.x < B) return;
+  const long long step = (long long)(gridDim.x - B) * blockDim.x * 128;
+  for (long long o = ((long long)(blockIdx.x - B) * blockDim.x + threadIdx.x) * 128; o < bytes; o += step)
+    asm volatile("applypriority.global.L2::evict_normal [%0], 128;" ::"l"(w + o));
 }
 
 __device__ __forceinline__ void l2_arrive(unsigned* arrived) {
