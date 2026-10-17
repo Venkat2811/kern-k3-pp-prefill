@@ -8,12 +8,14 @@
 //   grid (T, 1, 1)   block (1024, 1, 1)   T <= 64
 //
 // Row b's block:
-//   * the router top-k of columns [0, EXPERTS): k3_router_argmax.cu's
-//     kern_k3_router_topk's picks, by a sorting network (below);
-//   * meanwhile warps QUANT_WARP0.. land the latent (columns EXPERTS + [0, LATENT)) to
-//     bf16 and quantise it to mxfp8 as k3_moe_prefill.cu's kern_k3_moe_quant
-//     (four threads per 32-element group), and warps SITU_WARP0.. run k3_land.cu's
-//     land_situ on the shared expert's gate | up (the SH columns after it);
+//   * the router top-k of columns [0, EXPERTS) (k3_router_argmax.cu's picks and
+//     order): warp w < EXPERTS / 32 sorts its 32 biased scores by a bitonic
+//     network, then warps 0..13 merge the warps' top 16 pairwise (below);
+//   * meanwhile warps 28..31 run k3_land.cu's land_situ on the shared expert's
+//     gate | up (the SH columns after the latent), and once the sorts are done
+//     warps 14..27 land the latent (columns EXPERTS + [0, LATENT)) to bf16 and
+//     quantise it to mxfp8 as k3_moe_prefill.cu's kern_k3_moe_quant (four
+//     threads per 32-element group);
 // then the last block to finish (`done`, a zeroed carry it re-zeroes) builds
 // the routing tables of this rank's experts `first + j * STRIDE` (j < LOCAL)
 // over all T rows: what FlashInfer's routing writes for the batched GEMMs'
@@ -43,17 +45,9 @@
 #define TILE 16
 #define LOCAL (EXPERTS / STRIDE)
 #define THREADS 1024
-#define WARPS (THREADS / 32)
-#define SORT_WARPS (EXPERTS / 32)
-#define LISTS 32                 // the sorted warps' top-16 lists, padded to a power of two
-#define QUANT_WARP0 16
 #define QUANT_THREADS (LATENT / 8)
-#define SITU_WARP0 8             // free after the first merge level
 #define SITU_THREADS (SH / 4)
-static_assert(EXPERTS % 32 == 0 && SORT_WARPS <= LISTS && EXPERTS <= THREADS, "a warp of experts a list");
 static_assert(QUANT_THREADS % 32 == 0 && SH % 4 == 0, "whole warps");
-static_assert(QUANT_WARP0 * 32 + QUANT_THREADS <= THREADS && SITU_WARP0 * 32 + SITU_THREADS <= QUANT_WARP0 * 32 &&
-              QUANT_WARP0 >= LISTS / 2, "the side work fits the block beside the merges");
 static_assert(LOCAL <= THREADS && TOPK * 64 <= THREADS, "one expanded id per thread");
 
 typedef unsigned int u32;
@@ -76,33 +70,6 @@ __device__ __forceinline__ float situ_f(float pg, float pu) {
   float s = __frcp_rn(1.0f + __expf(-g));
   float c = 25.0f * tanh_approx(u * 0.04f);
   return (a * s) * c;
-}
-
-// k3_router_argmax.cu's picks: the sixteen largest biased scores, ties to the smallest expert, in that order. As
-// one u64 key a pick (ord(score) | ~expert) is a total order, so a bitonic network gives the same picks in the same
-// order: each warp sorts its 32 experts (descending, lane 0 first), then a tree of merges halves 32 lists of 16
-// (the last LISTS - SORT_WARPS empty) down to one.
-typedef unsigned long long u64;
-
-__device__ __forceinline__ u64 cas(u64 v, int j, bool keep_max) {
-  const u64 o = __shfl_xor_sync(0xffffffffu, v, j);
-  return keep_max == (v > o) ? v : o;
-}
-
-// a descending sort of the warp's 32 keys
-__device__ __forceinline__ u64 sort32(u64 v, int lane) {
-#pragma unroll
-  for (int k = 2; k <= 32; k <<= 1)
-#pragma unroll
-    for (int j = k >> 1; j > 0; j >>= 1) v = cas(v, j, ((lane & j) == 0) == ((lane & k) == 0 || k == 32));
-  return v;
-}
-
-// lanes 0-15 a descending list, lanes 16-31 another one reversed: the 16 largest, descending, in lanes 0-15
-__device__ __forceinline__ u64 merge32(u64 v, int lane) {
-#pragma unroll
-  for (int j = 16; j > 0; j >>= 1) v = cas(v, j, (lane & j) == 0);
-  return v;
 }
 
 // Eight latent columns of a 32-column group (its four threads are adjacent lanes):
@@ -194,6 +161,35 @@ __device__ __forceinline__ void route(const int* __restrict__ idx, int first, in
   }
 }
 
+// The 896 scores as 64-bit keys (biased score's order bits, then the expert complemented: larger
+// key = larger score, ties to the smaller expert, k3_router_argmax.cu's order), a warp's 32 sorted
+// descending by a bitonic network.
+__device__ __forceinline__ unsigned long long sort32(unsigned long long v, int lane) {
+#pragma unroll
+  for (int k = 2; k <= 32; k <<= 1)
+#pragma unroll
+    for (int j = k >> 1; j > 0; j >>= 1) {
+      const unsigned long long o = __shfl_xor_sync(0xffffffffu, v, j);
+      v = (((lane & j) == 0) == ((lane & k) == 0)) ? max(v, o) : min(v, o);
+    }
+  return v;
+}
+
+// Two descending lists of 16 (a in lanes 0-15, b reversed in 16-31: a bitonic sequence) merged
+// descending: lanes 0-15 hold the top 16 of both.
+__device__ __forceinline__ unsigned long long merge32(unsigned long long v, int lane) {
+#pragma unroll
+  for (int j = 16; j > 0; j >>= 1) {
+    const unsigned long long o = __shfl_xor_sync(0xffffffffu, v, j);
+    v = (lane & j) == 0 ? max(v, o) : min(v, o);
+  }
+  return v;
+}
+
+#define SORT_WARPS (EXPERTS / 32)
+#define MERGE_WARPS (SORT_WARPS / 2)
+static_assert(EXPERTS % 32 == 0 && SORT_WARPS % 2 == 0 && SORT_WARPS <= 31, "a warp of experts each, merged pairwise");
+
 extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
     const float* __restrict__ S, const float* __restrict__ bias, const __nv_bfloat16* __restrict__ rs,
     int* __restrict__ idx, float* __restrict__ wts, uint8_t* __restrict__ q, uint8_t* __restrict__ sf,
@@ -201,7 +197,7 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
     int* __restrict__ cta_limit, int* __restrict__ num_non_exiting, int* __restrict__ total_padded,
     int* __restrict__ route_map, int* __restrict__ exp2perm, int first, int T) {
   __shared__ float s_sig[EXPERTS];
-  __shared__ u64 s_list[2][LISTS][TOPK];
+  __shared__ unsigned long long s_list[2][SORT_WARPS][TOPK];
   __shared__ int s_last;
 
   const int b = blockIdx.x, t = threadIdx.x, warp = t / 32, lane = t % 32;
@@ -210,23 +206,33 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
   if (warp < SORT_WARPS) {
     const float sg = 1.0f / (1.0f + expf(-row[t]));
     s_sig[t] = sg;
-    const u64 v = sort32((u64)ord_f32(sg + bias[t]) << 32 | (u32)~t, lane);
+    const unsigned long long v = sort32((unsigned long long)ord_f32(sg + bias[t]) << 32 | (u32)~t, lane);
     if (lane < TOPK) s_list[0][warp][lane] = v;
-  } else if (warp < LISTS && lane < TOPK) {
-    s_list[0][warp][lane] = 0;
+  } else {
+    for (int k = t - SORT_WARPS * 32; k < SITU_THREADS; k += THREADS - SORT_WARPS * 32) {
+      const float4 g = reinterpret_cast<const float4*>(row + EXPERTS + LATENT)[k];
+      const float4 u = reinterpret_cast<const float4*>(row + EXPERTS + LATENT + SH)[k];
+      __nv_bfloat162 o[2];
+      o[0] = __floats2bfloat162_rn(situ_f(g.x, u.x), situ_f(g.y, u.y));
+      o[1] = __floats2bfloat162_rn(situ_f(g.z, u.z), situ_f(g.w, u.w));
+      reinterpret_cast<uint2*>(act + (long long)b * SH)[k] = *reinterpret_cast<const uint2*>(o);
+    }
   }
-  // level l: warps < LISTS >> l merge lists 2w, 2w + 1 of the last level, after the warps that wrote them
-#pragma unroll
-  for (int l = 1, n = LISTS / 2; n >= 1; ++l, n >>= 1) {
-    if (warp >= 2 * n) break;
-    asm volatile("bar.sync %0, %1;" ::"r"(l), "r"(64 * n) : "memory");
-    if (warp >= n) break;
-    const u64* in = s_list[(l - 1) & 1][2 * warp];
-    u64 v = merge32(lane < TOPK ? in[lane] : in[TOPK + 31 - lane], lane);
-    if (n > 1) {
-      if (lane < TOPK) s_list[l & 1][warp][lane] = v;
-    } else if (lane < TOPK) {
-      const int e = (int)~(u32)v;
+  __syncthreads();
+  if (warp < MERGE_WARPS) {
+    // the warps' lists merged pairwise, 28 -> 14 -> 7 -> 4 -> 2 -> 1 (an odd one out merges with nothing)
+    int n = SORT_WARPS, from = 0;
+    for (; n > 1; n = (n + 1) / 2, from ^= 1) {
+      if (warp < (n + 1) / 2) {
+        const int a = 2 * warp, c = 2 * warp + 1;
+        unsigned long long v = lane < TOPK ? s_list[from][a][lane] : c < n ? s_list[from][c][31 - lane] : 0ull;
+        v = merge32(v, lane);
+        if (lane < TOPK) s_list[from ^ 1][warp][lane] = v;
+      }
+      asm volatile("bar.sync 1, %0;" ::"n"(MERGE_WARPS * 32));
+    }
+    if (warp == 0 && lane < TOPK) {
+      const int e = (int)~(u32)s_list[from][0][lane];
       const float sg = s_sig[e];
       float den = sg;
 #pragma unroll
@@ -234,17 +240,8 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
       wts[b * TOPK + lane] = (sg / (den + 1e-20f)) * __bfloat162float(rs[0]);
       idx[b * TOPK + lane] = e;
     }
-  }
-  if (warp >= QUANT_WARP0 && warp < QUANT_WARP0 + QUANT_THREADS / 32)
-    quant8(row + EXPERTS, q + (long long)b * LATENT, sf + (long long)b * (LATENT / 32), t - QUANT_WARP0 * 32);
-  if (t >= SITU_WARP0 * 32 && t < SITU_WARP0 * 32 + SITU_THREADS) {
-    const int k = t - SITU_WARP0 * 32;
-    const float4 g = reinterpret_cast<const float4*>(row + EXPERTS + LATENT)[k];
-    const float4 u = reinterpret_cast<const float4*>(row + EXPERTS + LATENT + SH)[k];
-    __nv_bfloat162 o[2];
-    o[0] = __floats2bfloat162_rn(situ_f(g.x, u.x), situ_f(g.y, u.y));
-    o[1] = __floats2bfloat162_rn(situ_f(g.z, u.z), situ_f(g.w, u.w));
-    reinterpret_cast<uint2*>(act + (long long)b * SH)[k] = *reinterpret_cast<const uint2*>(o);
+  } else if (warp < MERGE_WARPS + QUANT_THREADS / 32) {
+    quant8(row + EXPERTS, q + (long long)b * LATENT, sf + (long long)b * (LATENT / 32), t - MERGE_WARPS * 32);
   }
 
   __syncthreads();
