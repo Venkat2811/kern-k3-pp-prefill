@@ -35,7 +35,7 @@
 //
 // The residual rows around them, a row per 1024 threads with the same row routine:
 //   kern_k3_land_add2_attnres_rms   a layer's closing add, then the next layer's mix and norm
-//                                   (dynamic smem KCAND_BYTES)
+//                                   (dynamic smem KCAND_BYTES; its blocks past B prefetch `pf`)
 //   kern_k3_embed_rms(_plan)        the step's embedding gather and its first layer's norm
 //                                   (_plan: and the MLA split plan)
 // Every kernel here triggers its dependents at entry (griddepcontrol.launch_dependents): the
@@ -496,12 +496,13 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_attnres_rms
 extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_land_add2_attnres_rms(
     const bf16_t* __restrict__ p1, const bf16_t* __restrict__ p2, const bf16_t* __restrict__ prefix2,
     bf16_t* __restrict__ hidden, int two, bf16_t* __restrict__ blocks, const float* __restrict__ sw,
-    const bf16_t* __restrict__ gamma, bf16_t* __restrict__ normed, int nb, int snapshot, int B) {
+    const bf16_t* __restrict__ gamma, bf16_t* __restrict__ normed, int nb, int snapshot, int B,
+    const uint8_t* __restrict__ pf, long long pf_bytes) {
   extern __shared__ uint4 cand[];
   __shared__ RowSmem s;
   const int b = blockIdx.x, t = threadIdx.x;
   asm volatile("griddepcontrol.launch_dependents;");
-  if (b >= B) return;
+  if (b >= B) return l2_prefetch(pf, pf_bytes, B);
   const RowRegs r = row_prefetch(blocks + (size_t)b * KNB_MAX * KH, sw, gamma, cand, nb, t);
   V8 pv;
   pv.w[0] = 0u, pv.w[1] = 0u, pv.w[2] = 0u, pv.w[3] = 0u;

@@ -148,7 +148,7 @@ TP_TIMEOUT_NS = 30_000_000_000  # a deadline that passes traps: long enough for 
 DCP_GRID = 256  # two exchange blocks fit an SM: every block resident with room to spare
 CAND_SMEM = NB_MAX * H * 2  # k3_ar_fused.cu: a row's snapshots prefetched into shared memory
 PF_PARAMS = ["in buffer<bf16>", "i64"]  # k3_ar_fused.cu: the next GEMM's weight, prefetched into L2
-PF_OPS = {"ar_attnres_rms", "ar_finalize_rms"}
+PF_OPS = {"ar_attnres_rms", "ar_finalize_rms", "land_add2_attnres_rms_snap"}
 PF_MAX = 96 << 20  # of the GB300's 129 MB L2
 
 # Launch geometry per entry, as the kernel headers document it
@@ -438,9 +438,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         **({"land_add2_attnres_rms_snap": {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32",
                        "inout buffer<bf16>", "in buffer<f32>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32",
-                       "i32"],
-            "impl": {"launches": [launch("k3_ar_fused", "kern_k3_land_add2_attnres_rms", grid=[T, 1, 1], block=[1024, 1, 1],
-                                         smem=CAND_SMEM)]},
+                       "i32", *PF_PARAMS],
+            "impl": {"launches": [launch("k3_ar_fused", "kern_k3_land_add2_attnres_rms", grid=[TP_AR_GRID, 1, 1],
+                                         block=[1024, 1, 1], smem=CAND_SMEM)]},
         }} if decode else {}),
         # P's closing add on its own, before a snapshot layer.
         **({"land_add2": {
