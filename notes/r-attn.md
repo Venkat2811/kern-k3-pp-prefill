@@ -313,3 +313,22 @@ A member's view: 96 heads (every head, a DCP member's positions), latent 512
   rows. A from-scratch tcgen05 split-KV kernel (paged TMA gather, TMEM,
   cross-lane softmax, the DSL's partial layout for k3_dcp) is days of work,
   not this session's remaining hours: not started.
+- Where a new kernel would win, per SM: the DSL's 1.70 µs a 128-position
+  tile a 2-SM cluster is 37.6 positions/µs/SM against HBM's fair share of
+  41.9 (7.33 TB/s / 1152 B / 152 SMs): the 96 → 128 padding costs ~10% in
+  the steady state. The larger part of the gap is fixed: ~7-10 µs a launch
+  (each split loads its row's 110 KB of q from L2 and writes a 196 KB f32
+  partial; 8 x 8k is 64 splits of one tile... 8 tiles, 21.9 µs) and
+  clusters left idle (72 of 76 at 24-36 rows, uniform splits). A kernel
+  that merged its splits on chip (a persistent cluster per row group, bf16
+  or in-cluster partials) and fed every cluster would target those first.
+
+- **kda_core S at 3 blocks an SM, ablated** (36 rows, one GPU): 11.81 µs;
+  without the state stores 10.51; without the smem state reads 11.65. Even
+  storeless it does not reach the register build with its stores (10.96).
+  The persistent pipeline of the orchestrator's task 2 meets the same wall:
+  at 26-48 rows the items (312-576) are about the resident slots (608 at 4
+  an SM), so a persistent block has no next item whose prologue could hide
+  under this one's stream; overlapping inside one item needs its state on
+  chip during the prologue (register file full at 4 an SM; smem staging
+  measured slower at 2 and 3).
