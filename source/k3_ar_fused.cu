@@ -953,11 +953,12 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
 // kern_k3_embed_rms_plan also writes row b's MLA split count: kern's k3_mla_split_plan.cu sizes
 // splits to fill one wave of clusters; here the batch fills the 1 to MLA_WAVES waves of the least
 // modelled time (one wave of 48 rows held one split a row on 96 of 152 SMs). The plan needs only
-// every row's tile count: each block works it out itself.
+// every row's tile count: block B works it out for every row while the row blocks gather and norm.
 //   kern_k3_embed_rms(const i64* ids, const bf16* table, bf16* hidden, bf16* blocks,
-//       const bf16* gamma, bf16* normed, int B)
+//       const bf16* gamma, bf16* normed, int B)   grid (B, 1, 1)
 //   kern_k3_embed_rms_plan(..., const i32* seq_lens, i32* block_split_kvs, int split_max, int B)
-//   grid (B, 1, 1)   block (1024, 1, 1)
+//       grid (B + 1, 1, 1)
+//   block (1024, 1, 1)
 #define MLA_TILE 128
 // A wave of n 2-CTA clusters runs a tile in ~1.46 us a cluster up to ~53 clusters; past that the GPU runs ~36
 // tiles a us (96 heads, bf16 MMA padded to 128 rows: the tensor pipes and HBM both near their limit); a
@@ -1021,9 +1022,8 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_embed_rms_plan
     const int* __restrict__ seq_lens, int* __restrict__ block_split_kvs, int split_max, int B) {
   asm volatile("griddepcontrol.launch_dependents;");
   const int b = blockIdx.x, t = threadIdx.x;
-  if (b >= B) return;
-  const V8 pv = embed_row(ids, table, b, t);
-  if (t < 32) {  // the plan of row b, every row's tile count read once (B <= 64: two a lane)
+  if (b < B) return embed_rms(embed_row(ids, table, b, t), hidden, blocks, gamma, normed, b, t);
+  if (t < 32) {  // block B: every row's plan, its tile count read once (B <= 64: two a lane)
     int tiles[2];
 #pragma unroll
     for (int k = 0; k < 2; ++k) tiles[k] = t + 32 * k < B ? (seq_lens[t + 32 * k] + MLA_TILE - 1) / MLA_TILE : 0;
@@ -1050,7 +1050,8 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_embed_rms_plan
       for (int n = splits; n > 0; n -= clusters) cost += (long long)(longest + MLA_SPLIT_TILES) * max(MLA_SATURATE, min(n, clusters));
       if (w == 1 || cost < best_cost) best = per, best_cost = cost;
     }
-    if (t == 0) block_split_kvs[b] = row_splits((seq_lens[b] + MLA_TILE - 1) / MLA_TILE, best, split_max);
+#pragma unroll
+    for (int k = 0; k < 2; ++k)
+      if (t + 32 * k < B) block_split_kvs[t + 32 * k] = row_splits(tiles[k], best, split_max);
   }
-  embed_rms(pv, hidden, blocks, gamma, normed, b, t);
 }

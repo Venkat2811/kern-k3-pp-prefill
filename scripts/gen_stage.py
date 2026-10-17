@@ -426,7 +426,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         **({"embed_rms_plan": {
             "params": ["in buffer<i64>", "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "in buffer<bf16>",
                        "out buffer<bf16>", "in buffer<i32>", "out buffer<i32>", "i32", "i32"],
-            "impl": {"launches": [launch("k3_ar_fused", "kern_k3_embed_rms_plan", grid=[T, 1, 1], block=[1024, 1, 1])]},
+            "impl": {"launches": [launch("k3_ar_fused", "kern_k3_embed_rms_plan", grid=[{"add": [T, 1]}, 1, 1],
+                                                 block=[1024, 1, 1])]},
         }} if decode and mla else {}),
         # The attention's landing is o_proj's bf16 output, the value the f32 form rounds to first.
         "land_add_attnres_rms_bf16": {
