@@ -18,8 +18,8 @@
 // CTA b takes W's rows [64 b, 64 b + 64): they land in shared memory by cp.async at entry, the T
 // activation rows once published (pitch PITCH: an odd number of 16-byte units, so ldmatrix's eight rows
 // fall on distinct banks). Up to 24 rows warp w < 2 multiplies rows 64 b + 32 w + [0, 32) by every row
-// tile (each fragment read from shared memory once); from 25 rows warp w = 4 p + g multiplies rows
-// 64 b + 16 g + [0, 16) by the row tiles p, p + 2, ... (eight warps issue the mma). Both on the tensor
+// tile (each fragment read from shared memory once); from 25 rows, where two warps cannot issue the mma
+// fast enough, warp w < 4 multiplies rows 64 b + 16 w + [0, 16) by every row tile. Both on the tensor
 // cores (mma.sync m16n8k16 bf16, f32 accumulators), each output one
 // chain over k = 0, 16, 32, ... in order: the order and the instruction cuBLASLt's kernels for this shape
 // sum in (nvjet tst 64 x 8..48 tiles, no split-K), so the result is cuBLASLt's bit for bit (a harness
@@ -54,35 +54,35 @@ __device__ __forceinline__ void mma(float (&c)[4], uint32_t a0, uint32_t a1, uin
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-template <int TILES>
+template <int TILES, int STEP>
 __device__ __forceinline__ void frags16(uint32_t a_at, uint32_t b_at, int p, int tiles, int k, uint32_t (&a)[4],
                                       uint32_t (&b)[TILES][2]) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
                : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(a_at + k * 2));
 #pragma unroll
   for (int j = 0; j < TILES; ++j)
-    if (p + 2 * j < tiles)
+    if (p + STEP * j < tiles)
       asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
-                   : "=r"(b[j][0]), "=r"(b[j][1]) : "r"(b_at + (p + 2 * j) * 8 * PITCH + k * 2));
+                   : "=r"(b[j][0]), "=r"(b[j][1]) : "r"(b_at + (p + STEP * j) * 8 * PITCH + k * 2));
 }
 
 // Warp (g, p)'s 16 rows times its row tiles j = p, p + 2, ... below `tiles`: one mma chain an output,
 // k ascending; the fragments of the next DEPTH steps are in flight while a step multiplies.
-template <int TILES>
+template <int TILES, int STEP>
 __device__ __forceinline__ void rows16(uint32_t a_at, uint32_t b_at, int p, int tiles, float (&acc)[TILES][4]) {
   constexpr int DEPTH = 3, STEPS = K / 16;
 #pragma unroll
   for (int j = 0; j < TILES; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
   uint32_t a[DEPTH][4], b[DEPTH][TILES][2];
 #pragma unroll
-  for (int d = 0; d < DEPTH; ++d) frags16<TILES>(a_at, b_at, p, tiles, 16 * d, a[d], b[d]);
+  for (int d = 0; d < DEPTH; ++d) frags16<TILES, STEP>(a_at, b_at, p, tiles, 16 * d, a[d], b[d]);
 #pragma unroll
   for (int s = 0; s < STEPS; ++s) {
     const int d = s % DEPTH;
 #pragma unroll
     for (int j = 0; j < TILES; ++j)
-      if (p + 2 * j < tiles) mma(acc[j], a[d][0], a[d][1], a[d][2], a[d][3], b[d][j][0], b[d][j][1]);
-    if (s + DEPTH < STEPS) frags16<TILES>(a_at, b_at, p, tiles, 16 * (s + DEPTH), a[d], b[d]);
+      if (p + STEP * j < tiles) mma(acc[j], a[d][0], a[d][1], a[d][2], a[d][3], b[d][j][0], b[d][j][1]);
+    if (s + DEPTH < STEPS) frags16<TILES, STEP>(a_at, b_at, p, tiles, 16 * (s + DEPTH), a[d], b[d]);
   }
 }
 
@@ -170,17 +170,19 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1)
   // up to 24 rows warps 0-1 multiply (32 rows each: every fragment read from shared memory once); from 25
   // rows, where two warps cannot issue the mma fast enough, warp 4 p + g takes rows 16 g + [0, 16), tiles p, p + 2, ...
   if (T > 24) {
-    const int gr = warp % 4, p = warp / 4, tiles = (T + 7) / 8;
-    const uint32_t a_at = smem(sw + (16 * gr + lane % 16) * PITCH + (lane / 16) * 16);
-    const uint32_t b_at = smem(sa + (lane % 8) * PITCH + ((lane / 8) % 2) * 16);
-    float acc[TMAX / 16][4];
-    rows16<TMAX / 16>(a_at, b_at, p, tiles, acc);
+    if (warp < 4) {
+      const int tiles = (T + 7) / 8;
+      const uint32_t a_at = smem(sw + (16 * warp + lane % 16) * PITCH + (lane / 16) * 16);
+      const uint32_t b_at = smem(sa + (lane % 8) * PITCH + ((lane / 8) % 2) * 16);
+      float acc[TMAX / 8][4];
+      rows16<TMAX / 8, 1>(a_at, b_at, 0, tiles, acc);
 #pragma unroll
-    for (int j = 0; j < TMAX / 16; ++j)
-      if (p + 2 * j < tiles)
+      for (int j = 0; j < TMAX / 8; ++j)
+        if (j < tiles)
 #pragma unroll
-        for (int i = 0; i < 4; ++i)
-          tile[((p + 2 * j) * 8 + 2 * q + i % 2) * ROWS + 16 * gr + g + (i / 2) * 8] = __float2bfloat16(acc[j][i]);
+          for (int i = 0; i < 4; ++i)
+            tile[(j * 8 + 2 * q + i % 2) * ROWS + 16 * warp + g + (i / 2) * 8] = __float2bfloat16(acc[j][i]);
+    }
   } else if (warp < 2) {
     // ldmatrix rows: A (16 W rows) lane l -> row l % 16, column half l / 16; B (8 act rows) lane l -> row l % 8, half (l / 8) % 2
     const uint32_t a_at = smem(sw + (32 * warp + lane % 16) * PITCH + (lane / 16) * 16);
