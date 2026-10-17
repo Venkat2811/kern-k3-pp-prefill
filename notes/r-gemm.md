@@ -6,8 +6,9 @@ Target: `qkvg`, `front`, `wfu`, `q_b`, `lm_head` (f32 out, `cublas_bf16_tn_f32`)
 
 ## State (rebased on main d85613c)
 
-Offered on this branch: dbedd6a (own split-K GEMM, -0.54% vs main) and 2603ca7 (bf16 projections over the rows
-rounded up to 8: the bench even, 1 row -1.3%, 4 rows -0.3%; bit-identical).
+Offered on this branch, each bit-identical: dbedd6a (own split-K GEMM for qkvg / front at 1-32 rows, -0.54% vs
+main), 2603ca7 (bf16 projections over the rows rounded up to 8: the bench even, 1 row -1.3%, 4 rows -0.3%),
+499159d (our front GEMM pins sh_down in L2 for after the MoE: -0.11%).
 
 
 Merged on main (95bc0b0): the closing add's hints, the all-reduces' loads, the o_proj evict_last pin (3.488 ->
@@ -20,35 +21,42 @@ of which one runs; a single bucket loses the whole gain, see below).
 Step p50 at the round's A/B shapes, main 01d6dc5 -> this branch before the rebase (prof8, same lease): 1 x 8k
 2.02 -> 1.95 ms, 8 x 8k 2.52 -> 2.43, 32 x 8k 3.70 -> 3.61, 64 x 8k 4.76 -> 4.65, 32 x 32k 3.78 -> 3.72.
 
-## The table (rank 0, nsys critical path, us a call, main -> head, ratio to the HBM floor of decode.md)
+## The table (rank 0, nsys critical path, us a call, main d85613c -> this branch 499159d, ratio to decode.md's HBM floor)
 
-A ratio under 1 means the predecessor pulled the weight into L2 during its own wait: the call's floor is then
-L2's, and the HBM bytes moved earlier. 16-layer step, ctx as named.
+A ratio under 1 means the weight came from L2 (a predecessor loaded it during its own wait): the call's floor is then
+L2's, and the HBM bytes moved earlier. main d85613c already carries the L2 loads / hints / o_proj pin (95bc0b0); the
+columns differ by the own GEMM (qkvg / front at 1-32 rows), the sh_down pin and the rows rounded up to 8. 16-layer
+step, same lease (prof11). Step p50, main -> branch: 1 x 8k 1.95 -> 1.92 ms, 8 x 8k 2.40 -> 2.37, 32 x 8k 3.65 ->
+3.57, 64 x 8k 4.62 -> 4.60, 32 x 32k 3.68 -> 3.65.
 
 | call | n x k | 1 x 8k | 8 x 8k | 32 x 8k | 64 x 8k | 32 x 32k |
 |---|---|---:|---:|---:|---:|---:|
-| `qkvg` | 6400 x 7168 f32 | 17.9 -> **12.2** (0.98x) | 17.6 -> **12.4** (0.99x) | 18.9 -> **14.7** (1.16x) | 18.0 -> **14.5** (1.12x) | 19.2 -> **14.6** (1.15x) |
-| `front` | 6016 x 7168 f32 | 14.9 -> **10.0** (0.85x) | 13.4 -> **10.5** (0.89x) | 15.8 -> **13.0** (1.08x) | 18.4 -> **16.7** (1.38x) | 15.9 -> **13.5** (1.13x) |
-| `lat_up` | 7168 x 3584 | 8.3 -> **8.6** (1.23x) | 8.4 -> **5.6** (0.80x) | 8.5 -> **6.0** (0.85x) | 8.1 -> **6.6** (0.92x) | 8.6 -> **6.0** (0.85x) |
-| `o_proj` | 7168 x 1536 | 5.1 -> **4.3** (1.43x) | 5.0 -> **4.4** (1.45x) | 5.8 -> **4.4** (1.40x) | 5.6 -> **4.5** (1.41x) | 5.7 -> **4.5** (1.47x) |
-| `sh_down` | 7168 x 768 | 3.7 -> **3.7** (2.50x) | 3.7 -> **3.6** (2.41x) | 4.0 -> **4.0** (2.56x) | 4.0 -> **4.0** (2.48x) | 4.0 -> **4.0** (2.58x) |
-| `wfu` | 3648 x 7168 f32 | 11.6 -> **10.3** (1.45x) | 11.9 -> **9.7** (1.36x) | 13.0 -> **10.9** (1.50x) | 13.3 -> **10.4** (1.41x) | 12.9 -> **10.9** (1.51x) |
-| `q_b` | 18432 x 1536 f32 | 10.6 -> **10.6** (1.38x) | 10.4 -> **10.4** (1.34x) | 11.1 -> **11.0** (1.36x) | 11.2 -> **11.3** (1.35x) | 11.1 -> **11.0** (1.37x) |
-| `lm_head` | 20480 x 7168 f32 | 48.8 -> **46.3** (1.15x) | 50.6 -> **47.8** (1.19x) | 48.3 -> **45.3** (1.12x) | 48.7 -> **44.6** (1.09x) | 47.6 -> **44.8** (1.11x) |
-| `wgu` | 8448 x 7168 | 18.7 -> **17.3** (1.05x) | 17.2 -> **15.9** (0.96x) | 20.3 -> **19.5** (1.16x) | 22.9 -> **23.1** (1.36x) | 20.5 -> **19.8** (1.18x) |
-| `w_dn` | 7168 x 4224 | 11.5 -> **11.3** (1.36x) | 11.7 -> **11.8** (1.41x) | 13.6 -> **12.9** (1.53x) | 13.8 -> **14.0** (1.63x) | 13.2 -> **13.1** (1.55x) |
+| `qkvg` | 6400 x 7168 f32 | 15.4 -> **12.2** (0.98x) | 14.2 -> **12.4** (0.99x) | 14.9 -> **14.5** (1.15x) | 14.5 -> **14.5** (1.12x) | 14.9 -> **14.6** (1.15x) |
+| `front` | 6016 x 7168 f32 | 12.9 -> **10.8** (0.91x) | 11.3 -> **10.9** (0.92x) | 14.2 -> **13.8** (1.16x) | 17.4 -> **16.8** (1.39x) | 14.2 -> **13.9** (1.16x) |
+| `lat_up` | 7168 x 3584 | 7.5 -> **5.5** (0.79x) | 5.3 -> **5.6** (0.80x) | 5.9 -> **6.1** (0.87x) | 6.5 -> **6.6** (0.92x) | 5.9 -> **6.1** (0.87x) |
+| `o_proj` | 7168 x 1536 | 4.2 -> **4.2** (1.39x) | 4.3 -> **4.4** (1.45x) | 4.4 -> **4.4** (1.41x) | 4.5 -> **4.5** (1.40x) | 4.6 -> **4.6** (1.48x) |
+| `sh_down` | 7168 x 768 | 3.6 -> **2.7** (1.79x) | 3.7 -> **2.7** (1.80x) | 4.0 -> **3.0** (1.92x) | 4.0 -> **4.0** (2.48x) | 4.0 -> **3.0** (1.94x) |
+| `wfu` | 3648 x 7168 f32 | 9.9 -> **9.5** (1.34x) | 9.7 -> **9.8** (1.37x) | 10.9 -> **10.8** (1.49x) | 10.6 -> **10.4** (1.41x) | 10.8 -> **10.9** (1.51x) |
+| `q_b` | 18432 x 1536 f32 | 10.7 -> **10.2** (1.33x) | 10.6 -> **10.7** (1.37x) | 11.2 -> **11.2** (1.39x) | 11.6 -> **11.6** (1.38x) | 11.4 -> **11.1** (1.38x) |
+| `lm_head` | 20480 x 7168 f32 | 46.1 -> **46.6** (1.16x) | 48.5 -> **48.3** (1.20x) | 45.5 -> **45.1** (1.11x) | 44.9 -> **44.5** (1.09x) | 45.3 -> **44.5** (1.10x) |
+| `wgu` | 8448 x 7168 | 15.6 -> **14.6** (0.88x) | 16.3 -> **15.6** (0.95x) | 19.9 -> **19.6** (1.17x) | 24.4 -> **23.9** (1.41x) | 19.9 -> **19.4** (1.16x) |
+| `w_dn` | 7168 x 4224 | 11.6 -> **11.3** (1.36x) | 11.5 -> **11.9** (1.43x) | 12.9 -> **13.0** (1.54x) | 13.8 -> **14.4** (1.68x) | 13.0 -> **12.9** (1.53x) |
 
-Paid elsewhere for it (same profile): the closing add +27..+48 us a step (its hint blocks, 1.7-3 us a call), the
-attention all-reduce +40..+58 at 1-8 rows (the loads' grace), within +-20 at 32-64.
+Against main 01d6dc5 (before any of this run's work; prof8, rank 0): qkvg 17.6-19.2 -> 12.2-14.6 us, front 13.4-18.4
+-> 10.0-16.7, lat_up 8.1-8.6 -> 5.5-6.6, o_proj 5.0-5.8 -> 4.2-4.6, sh_down 3.7-4.0 -> 2.7-4.0, wfu 11.6-13.3 ->
+9.5-10.9.
+
+Paid elsewhere for the L2 loads (now on main; prof8 against 01d6dc5): the closing add +27..+48 us a step (its hint
+blocks, 1.7-3 us a call), the attention all-reduce +40..+58 at 1-8 rows (the loads' grace), within +-20 at 32-64.
+r-ar has since reworked both (their branch: the closing add's hints capped at 16 MB, the loads' window).
 
 The named limits of what is not within ~1.15x:
-- `sh_down` (10.5 MB): it runs right after FC2, whose experts stream 100s of MB through L2, and nothing before FC2
-  can hold it: pinned at evict_last from the attention all-reduce it costs more than it saves (3.4185 vs 3.4025);
-  normal loads do not survive the stream (work/h/el_gemm.cu). Cold, cuBLAS's 112-CTA 64x8 tile reaches 2.8-3.0
-  TB/s; no split-K-1 cuBLASLt config is faster at 1-16 rows (19202 tried), 0.7-0.9 us at 17-48 alone but nothing
-  in the step. What would move it: computing it inside ar_finalize_rms (its A, shared_act, is ready before FC1;
-  a K-ascending mma chain is bit-identical to cuBLAS's split-K 1, g-small): -1 launch a layer and its 3.7 us,
-  but that kernel is r-ar's and being rewritten: a proposal for r-ar.
+- `sh_down` (10.5 MB): pinned at evict_last by our front GEMM (1-32 rows) it reads from L2 at 2.7-3.0 us (1.8-1.9x;
+  cuBLAS's hot time for it alone is 2.3-2.9): the 112-CTA 64 x 8 tile cuBLAS keeps at every row count (no
+  split-K-1 cuBLASLt config is faster at 1-16 rows, 19202 tried; 0.7-0.9 us at 17-48 alone, nothing in the step).
+  At 64 rows cuBLAS runs front and nothing pins it (4.0 us, 2.5x). What would move it further: computing it inside
+  ar_finalize_rms (its A, shared_act, is ready before FC1; a K-ascending mma chain is bit-identical to cuBLAS's
+  split-K 1, g-small): -1 launch a layer and its 2.7-4 us, but that kernel is r-ar's: a proposal for r-ar.
 - `o_proj` (21 MB): read from L2 (pinned by the MoE all-reduce one layer earlier), it is at cuBLAS's own L2 time
   (3.2-4.3 us alone, hot): 112 CTAs (n / 64, one K chain an output, no split to add without changing the bits).
 - `wfu` / `q_b` (4 calls a step each): wfu gets only the closing add's hints; our split-K kernel at 2 splits is
