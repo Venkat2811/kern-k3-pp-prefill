@@ -103,6 +103,12 @@ front GEMM, r-gemm's own kernel up to 32 rows, cuBLAS + split-K reduce above):
 | front end -> FC2 end | 46.49 / 46.47 | 83.51 / 84.20 | 106.87 | 128.57 |
 | sh_down after FC2 (main only) | 4.2 | 6.0 | | |
 
+Real text (teacher-forced, `work/mkrows.py` rows, 16 layers, `work/dprof2.sh` + `work/span.py`: rank 0's
+median GPU span a step over 161 steps), main e343e79 -> branch: 8 rows 2178.8 -> 2135.6 us (-2.0%), 24 rows
+3079.6 -> 3028.3 (-1.7%), 36 rows 3667.4 -> 3593.2 (-2.0%); the MoE section (`work/sect.py`) as in the
+bench: moe_front 5.80 / 5.86 / 5.85 -> 7.25 / 8.55 / 7.60 us, FC1 after it 28.19 / 59.08 / 75.92 -> 26.73 /
+57.17 / 73.07, FC2 unchanged, and main's sh_down after FC2 gone.
+
 The branch's moe_front includes ~1-2 us of waiting for its FC1 prefetches to land (a grid retires once
 they have), which FC1 gets back; main's separate sh_down after FC2 is what the step saves. Without the
 prefetch (warp 31 exits) the branch measures 3.1643 -> 3.1810 ms/step: the prefetch is -0.5% here.
@@ -315,10 +321,15 @@ measured against its predecessor in one lease (3 rounds):
 - `9e77304`: each row sends its lowest local pick as the flag value (relaxed), so the prefetcher reads no
   ids from L2 and the SiTU warps no longer release: -0.18%.
 - `0cf0afa`: the two lowest (two picks a row in the flag): -0.15%.
-Tried, worse: half or a quarter of one expert (the flag machinery costs more than the bytes it saves),
+Tried, worse or equal: half or a quarter of one expert (the flag machinery costs more than the bytes it saves),
 three or four experts (3.4113 two -> 3.4187 / 3.4197), the touched set as a 128-bit mask (slower to
 build than a min-reduction, so the prefetch starts later).
-Together 3.4317 (9399a42) -> ~3.411-3.417 ms/step depending on the lease.
+Together 3.4317 (9399a42) -> ~3.411-3.417 ms/step depending on the lease. On main e343e79's front
+(r-gemm's own GEMM up to 32 rows) the prefetch is worth more: without it 3.1643 -> 3.1810 ms/step.
+After the rebase, also tried: a speculative prefetch (each expert below j0 = 2 x 112 / E(T), E the
+expected touched experts, issued as soon as any row reports it, the two least once all rows are in):
+3.1573 -> 3.1587, nothing gained; moe_front without PDL at <= 32 rows (behind r-gemm's front kernel):
+3.1643 -> 3.1813, worse (the early launch pays).
 
 ## Proposals
 
