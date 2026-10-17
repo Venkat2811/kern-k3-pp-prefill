@@ -648,13 +648,10 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
 // kern_k3_embed_rms_plan also writes row b's MLA split count: kern's k3_mla_split_plan.cu sizes
 // splits to fill one wave of clusters; here the batch fills the 1 to MLA_WAVES waves of the least
 // modelled time (one wave of 48 rows held one split a row on 96 of 152 SMs). The plan needs only
-// every row's tile count: each block works it out itself. A row's splits are at most its batch's
-// split slots: byte k of slot_rows is the first batch of slot range k, byte k of slot_counts its slots
-// (gen_stage.py's MLA_SLOTS; the attention launches that many clusters a row).
+// every row's tile count: each block works it out itself.
 //   kern_k3_embed_rms(const i64* ids, const bf16* table, bf16* hidden, bf16* blocks,
 //       const bf16* gamma, bf16* normed, int B)
-//   kern_k3_embed_rms_plan(..., const i32* seq_lens, i32* block_split_kvs, int split_max,
-//       int slot_rows, int slot_counts, int B)
+//   kern_k3_embed_rms_plan(..., const i32* seq_lens, i32* block_split_kvs, int split_max, int B)
 //   grid (B, 1, 1)   block (1024, 1, 1)
 #define MLA_TILE 128
 // A wave of n 2-CTA clusters runs a tile in ~1.46 us a cluster up to ~53 clusters; past that the GPU runs ~36
@@ -684,16 +681,6 @@ __device__ __forceinline__ long long row_splits(long long tiles, long long per, 
   return min(max((tiles + per - 1) / per, 1ll), (long long)split_max);
 }
 
-__device__ __forceinline__ int batch_slots(int B, int split_max, unsigned slot_rows, unsigned slot_counts) {
-  int slots = split_max;
-#pragma unroll
-  for (int k = 0; k < 4; ++k) {
-    const int first = (slot_rows >> 8 * k) & 0xff, n = (slot_counts >> 8 * k) & 0xff;
-    if (n && B >= first) slots = min(n, split_max);
-  }
-  return slots;
-}
-
 __device__ __forceinline__ void embed_rms(const long long* __restrict__ ids, const bf16_t* __restrict__ table,
                                           bf16_t* __restrict__ hidden, bf16_t* __restrict__ blocks,
                                           const bf16_t* __restrict__ gamma, bf16_t* __restrict__ normed, int b,
@@ -721,12 +708,10 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_embed_rms(
 extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_embed_rms_plan(
     const long long* __restrict__ ids, const bf16_t* __restrict__ table, bf16_t* __restrict__ hidden,
     bf16_t* __restrict__ blocks, const bf16_t* __restrict__ gamma, bf16_t* __restrict__ normed,
-    const int* __restrict__ seq_lens, int* __restrict__ block_split_kvs, int split_max, int slot_rows,
-    int slot_counts, int B) {
+    const int* __restrict__ seq_lens, int* __restrict__ block_split_kvs, int split_max, int B) {
   asm volatile("griddepcontrol.launch_dependents;");
   const int b = blockIdx.x, t = threadIdx.x;
   if (b >= B) return;
-  split_max = batch_slots(B, split_max, slot_rows, slot_counts);
   if (t < 32) {  // the plan of row b
     long long total = 0;
     for (int q = t; q < B; q += 32) total += (seq_lens[q] + MLA_TILE - 1) / MLA_TILE;
