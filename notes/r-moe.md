@@ -276,6 +276,15 @@ Before that, as a dependent of FC2:
   `"pdl": True` on both launches in gen_stage.py. Against HEAD in one lease, 3 interleaved rounds:
   ar_finalize alone 3.4373 -> 3.4183 ms/step (-0.55%), both 3.4380 -> 3.4207 (-0.5%); loop/d/check
   bit-identical for both (run it 3 times before merging: Lamport kernels).
+- **Finalize + all-reduce against FlashInfer / TRT-LLM (direction 3).** r-ar's `kern_k3_ar_finalize_rms` is
+  already TRT-LLM's MoE finalize-allreduce fusion in structure: the combine is TRT-LLM's finalize (FC2 rows
+  gathered by expanded index -> permuted index, `exp2perm` here, `expandedIdxToPermutedIdx` in
+  FlashInfer's `trtllm/fused_moe/DevKernel.h` finalize, the 16 picks summed in order in f32 with the
+  routing weights, rounded once), then the allreduce_fusion Lamport one-shot (two-shot from 33 rows) and
+  the RMSNorm, plus the shared expert's partial in the same exchange. What FlashInfer's launch has and ours
+  does not is `mUsePdl` (cudaGridDependencySynchronize at entry): the proposal above, -0.5% measured. In
+  the step the kernel takes 17-43 us at 48 rows, most of it waiting for the busiest rank's FC2 (EP skew,
+  below); no finalize variant changes that.
 - **For r-attn: PDL on `kda_core`, `mla_prep`, `mla_absorb` drifts; on `dcp_exchange` it is clean.** With
   griddepcontrol.wait at entry (before any memory access) and `pdl: true`, loop/d/check: `kda_core` alone
   12 flips vs main (relRMS max 1.1%), `mla_prep` + `mla_absorb` 124 flips (median 1.0%), both still inside
