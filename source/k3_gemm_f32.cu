@@ -11,10 +11,11 @@
 //
 // W and A come by TMA (128-byte swizzle, 64-column boxes); the first STAGES weight boxes are requested before
 // griddepcontrol.wait (only the weight is read before it), so under PDL they stream while the kernel before
-// this one finishes.
+// this one finishes. `unpin` (a weight an earlier call pinned) goes back to evict_normal from warps 2-3 before the
+// wait; `pin` (a weight read a few kernels on) goes into L2 at evict_last, one bulk prefetch a CTA, at the end.
 //
 //   kern_k3_gemm_f32(tmap W [N, K] box 64 x BM sw128, tmap A [rows, K] box 64 x BN sw128, f32* C, int ldc,
-//       int m, int N, int K, int b1, int b2)
+//       int m, int N, int K, int b1, int b2, const u8* pin, i64 pin_bytes, const u8* unpin, i64 unpin_bytes)
 //     grid (ceil(N / BM) * SPLITS, 1, 1)   cluster (SPLITS, 1, 1)   block (128, 1, 1)   PDL
 #include <cuda.h>
 #include <cuda_bf16.h>
