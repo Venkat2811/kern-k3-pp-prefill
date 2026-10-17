@@ -328,28 +328,32 @@ __device__ __forceinline__ void sh_rows16(uint32_t a_at, uint32_t b_at, int tile
         tile[(j * 8 + 2 * q + i % 2) * SROWS + n + (i / 2) * 8] = __float2bfloat16(acc[j][i]);
 }
 
-// FC1's first CTAs take the touched expert of the lowest local index: row b publishes its lowest local pick
-// j_b (ids[c * 64 + b] = 1 + j_b, LOCAL + 1 for none; the value is the message, relaxed); warp 31 of block
-// T + c, apart from the projection from the start, takes the least over the rows (clearing the flags) and
-// pulls its share of that expert's FC1 weights and scales into L2 while HBM is otherwise idle.
+// FC1's first CTAs take the touched experts of the lowest local indices: row b publishes its two lowest
+// local picks j_b < j2_b (ids[c * 64 + b] = 1 + j_b + 256 j2_b, LOCAL for none; the value is the message,
+// relaxed); warp 31 of block T + c, apart from the projection from the start, takes the two least over the
+// rows (clearing the flags) and pulls its share of those experts' FC1 weights and scales into L2 while HBM
+// is otherwise idle.
 __device__ __forceinline__ void prefetch_first(int* __restrict__ ids, int T, int c, const uint8_t* __restrict__ w13,
                                                const uint8_t* __restrict__ w13_sf) {
   const int lane = threadIdx.x % 32;
-  int j = LOCAL;
+  int a = LOCAL, b2 = LOCAL;  // the lane's two least
   for (int r = lane; r < T; r += 32) {
     int v;
     int* flag = ids + c * 64 + r;
     asm volatile("ld.relaxed.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(flag) : "memory");
     while (v == 0) asm volatile("ld.relaxed.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(flag) : "memory");
     *flag = 0;
-    j = min(j, v - 1);
+    const int j1 = (v - 1) % 256, j2 = (v - 1) / 256;
+    if (j1 < a) { b2 = min(a, j2); a = j1; } else b2 = min(b2, j1 == a ? j2 : j1);
   }
-  j = __reduce_min_sync(0xffffffffu, j);
-  if (lane == 0 && j < LOCAL) {
+  const int j = __reduce_min_sync(0xffffffffu, a);
+  const int k = __reduce_min_sync(0xffffffffu, min(a == j ? b2 : a, b2));
+  if (lane < 2 && (lane ? k : j) < LOCAL) {
+    const int e = lane ? k : j;
     asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
-                 ::"l"(w13 + (size_t)j * FC1_W + (size_t)c * (FC1_W / READERS)), "r"(FC1_W / READERS) : "memory");
+                 ::"l"(w13 + (size_t)e * FC1_W + (size_t)c * (FC1_W / READERS)), "r"(FC1_W / READERS) : "memory");
     asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
-                 ::"l"(w13_sf + (size_t)j * FC1_SF + (size_t)c * (FC1_SF / READERS)), "r"(FC1_SF / READERS) : "memory");
+                 ::"l"(w13_sf + (size_t)e * FC1_SF + (size_t)c * (FC1_SF / READERS)), "r"(FC1_SF / READERS) : "memory");
   }
 }
 
@@ -488,9 +492,9 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
         wts[b * TOPK + lane] = (sg / (den + 1e-20f)) * __bfloat162float(rs[0]);
         idx[b * TOPK + lane] = e;
       }
-      const int d = (int)~(u32)top - first;
-      const int j = __reduce_min_sync(0xffffffffu, lane < TOPK && d >= 0 && d % STRIDE == 0 ? d / STRIDE : LOCAL);
-      if (lane == 0) s_jmin = j;
+      const int d = (int)~(u32)top - first, mine = lane < TOPK && d >= 0 && d % STRIDE == 0 ? d / STRIDE : LOCAL;
+      const int j = __reduce_min_sync(0xffffffffu, mine), j2 = __reduce_min_sync(0xffffffffu, mine == j ? LOCAL : mine);
+      if (lane == 0) s_jmin = j + 256 * j2;
       asm volatile("bar.arrive 4, %0;" ::"n"(32 + THREADS - SORT_WARPS * 32) : "memory");  // to the SiTU warps
     } else if (warp >= QUANT_WARP0) {
       quant8(row + EXPERTS, q + (long long)b * LATENT, sf + (long long)b * (LATENT / 32), t - QUANT_WARP0 * 32);
