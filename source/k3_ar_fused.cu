@@ -910,9 +910,14 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
   if (b < B) {
     const long long base = (long long)b * ROWV;
     const int owner = b % NRANKS;
+    // Two-shot, the block waits for its gather, then for the row's shared half, before any thread polls the
+    // next thing: warps that run ahead spin on slots still empty, and their polls slow everyone's (10.5 -> 9.0 us
+    // at 36 rows; one-shot the second wait costs 0.2-0.4, so not there)
     if (two && owner != rank) gather_share<ROWV>(l, rank, B, timeout_ns, fail);
+    if (two) __syncthreads();
     const auto summed = [&](long long i) { return lamport_get(l, two, owner, rank, i, timeout_ns, fail); };
     if (t < KVEC) shared_sum[(long long)b * KVEC + t] = summed(base + KLATV + t);
+    if (two) __syncthreads();
     l2_arrive(stamp);
     // kern_k3_rms at h = KLAT: vector t of the row, its squares serially, a warp
     // butterfly, then the 32 warp slots (zero past the row) by another, in every warp
