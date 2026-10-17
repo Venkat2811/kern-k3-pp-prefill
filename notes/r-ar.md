@@ -45,6 +45,9 @@ at nb 1), the closing add ~0.2 (4.4 against 3.1). The production step runs mostl
   B..KGRID - B): harness MoE +0.4..+0.8 us at 1-4 rows, -0.2..-0.8 at 8-13, flat from 16 (noise ~0.5 us: the
   untouched attention kernel moved by up to 1 us between variants); step 3 rounds 3.236-3.238 -> 3.240-3.244
   (8 rows +13-15 us, 48 rows +15-20). Reverted. Bit-identical.
+- The row epilogue's code warmed before the poll (a two-pass loop, `#pragma unroll 1`: pass 0 on a zero row with
+  no stores while the peers' data is in flight): in the step +1.2 us a call (8 x 64k, 16 calls 124 -> 143 us).
+  Dropped: whatever the epilogue's fetch costs, a second pass costs more.
 - Under nsys the ranks start a replay up to ~0.3 ms apart, and the early ones wait in the step's first exchange;
   the plain bench's rank 0 p50 matches the latest rank's span under nsys, so the score does not carry it.
 
