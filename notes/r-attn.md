@@ -705,6 +705,8 @@ tables). Quant and SiTU run beside the top-k.
   ids), which any grid-wide routing has: ~1.3 µs of the tail's 1.75 is that floor.
 - θ fast path on top of f285eb9 (the 16th largest list head bounds the picks; prefixes at or above it, when
   ≤ 32, ranked by one warp by counting; else the merge tree; `work/mf/fast_slower.cu`): exact, but slower
-  than the tree at every row count (5.66-6.37 vs 4.89-5.29 µs). Dropped.
+  than the tree at every row count (5.66-6.37 vs 4.89-5.29 µs). Publishing the fast / fallback decision before
+  warp 0's ranking (so SiTU's warps do not wait for it) and unrolling the ranking over 32 with a predicate
+  (`work/mf/fast3_slower.cu`): still +0.3 µs at every row count. Dropped.
 - Not tried: a cluster of all rows (≤ 8) with DSMEM picks and a cluster barrier instead of the counter (~1 µs
   at 8 rows only, a second `when` build).
