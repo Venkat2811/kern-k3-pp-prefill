@@ -722,8 +722,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         lamport_params = ["inout buffer<u8>", "in buffer<u64>", "inout buffer<i32>", "out buffer<i32>", "i32"]
         ops["ar_finalize_rms"] = {
             "params": ["in buffer<bf16>", "in buffer<i32>", "in buffer<f32>", "in buffer<bf16>", *lamport_params,
-                       "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "i32", "i64", "i64", *PF_PARAMS,
-                       *PF_PARAMS],
+                       "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i64", "i64",
+                       *PF_PARAMS, *PF_PARAMS],
             "impl": {"launches": [launch("k3_ar_fused", "kern_k3_ar_finalize_rms", defines={"NRANKS": tp},
                                          grid=[TP_AR_GRID, 1, 1], block=[1024, 1, 1], pdl=True)]},
         }
@@ -1279,10 +1279,14 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                     land_situ(L + "shared_situ", b("shared_partial"), b("shared_act"), sh_l)
                 proj(L + "sh_down", b("shared_act"), w("sh_down"), b("moe_flat", shared_at), H, sh_l)
                 if fused_ar:
-                    # the combine, the sum of both and the latent norm in one launch
+                    # the combine, the sum of both and the latent norm in one launch; fc2's partial read
+                    # before the grid wait unless fc2 is the kernel right before (it lets its dependents
+                    # launch before its output is out)
+                    early = b("moe.fc2_out") not in prog[-1]["args"]
                     step(L + "reduce_mlp", "ar_finalize_rms", b("moe.fc2_out"), b("moe.exp2perm"),
                          b("topk_weight"), b("moe_flat", shared_at), *lamport(), w("gamma_lat"),
-                         b("routed_latent_norm"), b("moe_sum", shared_at), B, i64(ar_stage), i64(TP_TIMEOUT_NS))
+                         b("routed_latent_norm"), b("moe_sum", shared_at), B, i32(int(early)), i64(ar_stage),
+                         i64(TP_TIMEOUT_NS))
                     moe = "moe_sum"
                 else:
                     # the routed latent's `tokens` rows, then the shared expert's

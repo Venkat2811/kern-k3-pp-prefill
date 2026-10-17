@@ -28,11 +28,13 @@
 //
 //   kern_k3_ar_finalize_rms(const bf16* fc2, const i32* exp2perm, const f32* wts,
 //       const bf16* shared, u8* lamport, const u64* lamport_peers, i32* state, i32* err,
-//       int rank, const bf16* gamma, bf16* latent_norm, bf16* shared_sum, int B,
+//       int rank, const bf16* gamma, bf16* latent_norm, bf16* shared_sum, int B, int early,
 //       i64 stage_bytes, i64 timeout_ns, const u8* pf, i64 pf_bytes, const u8* pf2, i64 pf2_bytes)
 //     A row's routed latent partial (k3_moe_prefill.cu's kern_k3_moe_finalize over this
 //     rank's experts, bf16) and its shared expert's down partial `shared` [B, H], summed;
 //     latent_norm = k3_land.cu's kern_k3_rms(latent sum, gamma), shared_sum the shared sum.
+//     `early`: fc2 is done at entry (a kernel that is no programmatic dependent ran between
+//     them), so its partial is weighted before griddepcontrol.wait; else after it.
 //
 //   grid (KGRID, 1, 1) on every call of a group   block (1024, 1, 1)
 //   kern_k3_ar_attnres_rms_nb<NB>: dynamic smem KCAND_BYTES (the row's snapshots, below)
@@ -863,7 +865,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
     const bf16_t* __restrict__ fc2, const int* __restrict__ exp2perm, const float* __restrict__ wts,
     const uint4* __restrict__ shared, uint8_t* lamport, const unsigned long long* lamport_peers, int* state, int* err,
     int rank, const bf16_t* __restrict__ gamma, bf16_t* __restrict__ latent_norm, uint4* __restrict__ shared_sum, int B,
-    long long stage_bytes, long long timeout_ns, const uint8_t* __restrict__ pf, long long pf_bytes,
+    int early, long long stage_bytes, long long timeout_ns, const uint8_t* __restrict__ pf, long long pf_bytes,
     const uint8_t* __restrict__ pf2, long long pf2_bytes) {
   __shared__ float red[32 * RED_LD];
   const int t = threadIdx.x, b = blockIdx.x;
@@ -878,10 +880,11 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
     s_w[t / TOPK][t % TOPK] = wts[(row0 + t / TOPK) * TOPK + t % TOPK];
   }
   const Lamport l = lamport_open(lamport, lamport_peers, state, err, rank, tot, stage_bytes, timeout_ns);
-  // the routed latent is fc2's, two kernels back: summed before the wait; the shared expert's partial after it
-  uint4 v = i >= 0 && c < KLATV ? finalize(fc2, s_e2p[row - row0], s_w[row - row0], c) : make_uint4(0u, 0u, 0u, 0u);
+  const auto routed = [&] { return finalize(fc2, s_e2p[row - row0], s_w[row - row0], c); };
+  uint4 v = early && i >= 0 && c < KLATV ? routed() : make_uint4(0u, 0u, 0u, 0u);
   grid_wait();
   if (i >= 0 && c >= KLATV) v = shared[(long long)row * KVEC + c - KLATV];
+  if (!early && i >= 0 && c < KLATV) v = routed();
   // From TWO_SHOT_ROWS rows the sum runs as two shots: every row goes to its owner (row % NRANKS) only, the
   // owner sums it and gathers the sum to the others (gather_share), 2 x 7/8 of a partial out of each rank
   // instead of 7.
