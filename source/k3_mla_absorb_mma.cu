@@ -29,16 +29,17 @@
 //
 // -DQ_FP8: q_abs is the fp8 query of SGLang's fp8 cache, one e4m3 byte an
 // element: each bf16 above goes on through f32 to e4m3 by cvt.rn without
-// saturation, the aten cast SGLang applies to its bf16 query.
+// saturation, the aten cast SGLang applies to its bf16 query (k3_e4m3.cuh).
 //
 //   nvcc -cubin -arch=sm_103a -O3 source/k3_mla_absorb_mma.cu
 #include <cuda_bf16.h>
 
 #ifdef Q_FP8
-#include <cuda_fp8.h>
+#include "k3_e4m3.cuh"
 typedef unsigned char q_t;
 __device__ __forceinline__ void put2(q_t* p, __nv_bfloat162 v) {
-  *reinterpret_cast<unsigned short*>(p) = __nv_cvt_float2_to_fp8x2(__bfloat1622float2(v), __NV_NOSAT, __NV_E4M3);
+  const float2 f = __bfloat1622float2(v);
+  *reinterpret_cast<unsigned short*>(p) = e4m3x2_nosat(f.x, f.y);
 }
 #define PUT2(p, i, v) put2((p) + 2 * (i), v)
 #else
