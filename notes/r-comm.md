@@ -15,6 +15,7 @@ rebased onto it and carries:
 | `5307a10` | head: the row's key after a gpu-scope fence (-0.6 to -3.9 us a call) | 3.287 / 3.289 -> 3.288 / 3.290 ms (one call a step) |
 | `c934878` | the two-shot MoE all-reduce's row block waits after its gather and its shared half | 3.245 / 3.244 -> 3.241 / 3.240 ms on `fd5c92c` (36 rows -13..-19 us) |
 | `eb1f5ab` | deadlines in SM cycles (all-reduces, head), as k3_dcp's | 3.241 / 3.240 -> 3.243 / 3.243 ms (noise; a fired deadline traps the step) |
+| `a6707bd` | dcp traps without a printf: no stack frame, `harness/run.sh sass` all PASS (k3_dcp failed it on main) | 3.242 / 3.243 -> 3.254 / 3.240 ms (noise) |
 | `0f5d1fe`, `02a2685` | `harness/xchg/` (the 8-rank harness), `abn.sh` (interleaved A/B) | |
 
 All bit-identical (`loop/d/check` x3 each; the harness compares main's kernels byte for byte).
