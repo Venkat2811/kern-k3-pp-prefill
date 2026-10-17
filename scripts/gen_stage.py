@@ -323,11 +323,11 @@ def mla_attn_op(batch_max, split_max, reduce=True, scale_log2=bf16((NOPE_DIM + R
     }
 
 
-# D's MLA decode over the DCP member's pages, its splits left for the exchange, from MLA_OURS_FROM rows:
-# k3_mla_decode.cu, the DSL split kernel's grid and output (acc_o / acc_lse, `mla_bsk` splits), a CTA pair a
-# (row, split). Below it the DSL's fixed cost a launch is the smaller (notes/r-attn.md).
+# D's MLA decode over the DCP member's pages, its splits left for the exchange, from `--mla-ours-from` rows
+# (off by default): k3_mla_decode.cu, the DSL split kernel's grid and output (acc_o / acc_lse, `mla_bsk`
+# splits), a CTA pair a (row, split). It is the faster for a batch of one wave of items from 24 rows, the
+# slower below and over several waves (a skewed batch's): notes/r-attn.md.
 MLA_DECODE_SMEM = 232320  # k3_mla_decode.cu SMEM_BYTES
-MLA_OURS_FROM = 24
 
 
 def mla_decode_launch(batch_max, split_max, scale_log2, when):
@@ -374,7 +374,7 @@ def cake_attn_op(batch_max):
 
 
 def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_variants=None, experts=224, pack=16,
-          peer_ar=False, mla_short=128, kv="bf16"):
+          peer_ar=False, mla_short=128, kv="bf16", mla_ours_from=None):
     """P with `chunk_max`, else D over a `tp` group (see the module doc), of layers [0, `end`). `experts`: the
     checkpoint's routed experts (CHECKPOINTS); `pack`: P's sequences a call; `peer_ar`: D's sums by the
     group's Lamport one-shot (source/peer_allreduce_bf16.cu) instead of NCCL; `kv`: D's MLA cache, bf16 or
@@ -535,7 +535,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                     ({"KDA_MINB": 4, "ROWS_PER_ITER": 2}, 0, {"min": kda_smem_rows + 1}, {}))]},
         },
         "mla_attn": cake_attn_op(seqs_max) if fp8 else mla_attn_op(seqs_max, mla_split_max, reduce=not xchg,
-                                                                    ours_from=MLA_OURS_FROM if xchg else None),
+                                                                    ours_from=mla_ours_from if xchg else None),
         } if decode else {}),
         "gemm_bf16": {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32", "i32"],
@@ -1562,6 +1562,8 @@ def main():
     ap.add_argument("--seqs", type=int, default=64, help="D: sequences a step (the `tokens` / `seqs` bound)")
     ap.add_argument("--mla-split-max", type=int, default=16,
                     help="D: KV splits a row's attention may run as; the workspace is tokens x this x 256 KiB")
+    ap.add_argument("--mla-ours-from", type=int, metavar="ROWS",
+                    help="D: batches of at least ROWS rows take k3_mla_decode.cu for the MLA attention (default: the DSL)")
     ap.add_argument("--peer-ar", action="store_true",
                     help="D: the sums by the Lamport one-shot over the group's peers instead of NCCL")
     ap.add_argument("--max-ctx", type=int, default=16384)
@@ -1578,7 +1580,7 @@ def main():
         ap.error("D absorbs on tensor cores for at most 64 rows (k3_mla_absorb_mma BMAX)")
     names = tuple(a.moe_variants.split(",")) if a.moe_variants else None
     json.dump(build(a.layers, a.max_ctx, a.seqs, a.tp, a.mla_split_max, a.chunk, names, a.experts, a.pack,
-                    a.peer_ar, a.mla_short, a.kv),
+                    a.peer_ar, a.mla_short, a.kv, a.mla_ours_from),
               sys.stdout, indent=1)
     print()
 
