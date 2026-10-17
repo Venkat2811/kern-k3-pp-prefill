@@ -79,6 +79,13 @@ at nb 1), the closing add ~0.2 (4.4 against 3.1). The production step runs mostl
   up to 7.3 MB a call at 64 rows x nb 8, with 100+ MB of weights through L2 between): 93-layer step 9.377 /
   11.878 / 17.179 / 22.738 -> 9.374 / 11.874 / 17.189 / 22.733 ms (1 / 8 / 32 / 64 rows), bench flat. The
   snapshot reads are not what the per-snapshot cost waits on. Dropped.
+- **ce47e6f the closing add's norm reduction by st.async** (each warp's slot to the 4 blocks with mbarrier
+  complete_tx; a block waits on its own mbarrier, armed at entry and ordered by the scores' cluster barrier):
+  one cluster barrier fewer a call, harness nb 1 -0.14..-0.28 us, nb 2 -0.13..-0.16, nb 8 flat; step
+  3.212-3.219 -> 3.205-3.206 (-0.25%), bit-identical, check x3.
+- Both reductions by st.async: the 32-value scores at nb 8 +0.8 us (a 4-byte transaction a value); the scores'
+  too only to nb 2, with the cluster barrier that orders their mbarrier's arming before the wait: step flat
+  (3.204-3.206 vs 3.205-3.206): the barrier before the wait costs what it saves. Dropped.
 - Under nsys the ranks start a replay up to ~0.3 ms apart, and the early ones wait in the step's first exchange;
   the plain bench's rank 0 p50 matches the latest rank's span under nsys, so the score does not carry it.
 
