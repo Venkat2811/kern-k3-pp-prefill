@@ -175,7 +175,7 @@ The branch on main 21a9174 at 2f5eb5f (`work/prof.sh`, 16 layers):
 | kernel | 1 | 8 | 32 | 64 | 32 × 32k | floor (1 / 8 / 32 / 64 / 32×32k) | named limit |
 |---|---|---|---|---|---|---|---|
 | kda_core | 5.79 | 6.14 | 11.15 | 19.41 | 10.90 | 0.29 / 1.87 / 7.29 / 14.52 / 7.29 | chain (≤ 25 rows), prologue beside the state (R build) |
-| mla_attn (DSL, 16 slots) | 8.68 | 10.60 | 27.37 | 48.51 | 43.82 | 0.42 / 2.48 / 7.36 / 12.99 / 22.80 | tile: shared memory bandwidth of the pair's SS MMAs (~1.5-1.7 µs a 128-position tile, = the HBM share at 76 pairs; "MLA decode kernel"); the rest per launch (~7 µs) and empty / quantized waves of uniform splits |
+| mla_attn (DSL, 16 slots) | 8.68 | 10.60 | 27.37 | 48.51 | 43.82 | 0.42 / 2.48 / 7.36 / 12.99 / 22.80 | not a hardware ceiling (ncu in the step: tensor 44%, DRAM ~60%, smem banks 20%); latency / pipelining, ~7 µs a launch, empty and quantized waves; a kernel of ours did not beat it ("MLA decode kernel") |
 | mla_absorb (tcgen05) | 5.02 | 4.84 | 5.33 | 5.79 | 5.09 | 1.72 (12.6 MB) | launch + HBM round trip + 12.6 MB (loads alone 3.7) |
 | mla_prep | 1.71 | 1.62 | 1.96 | 1.87 | 1.63 | launch | the launch |
 | moe_front (f285eb9; main 6.5 at every shape) | | 5.73 (8 x 64k) | | | | 3.26 (estimate: two dependent passes) | S row's L2 latency (~1.0 µs after entry), the top-k network's shuffle chains (~1.85), the tail's counter + ids round trips (~1.3 of 1.75) |
@@ -655,19 +655,23 @@ What each step found:
   seq_lens / bsk loads) ~1.0 µs, epilogue 1.3 µs in CTA 0 (128 KB of f32 o, a row a thread: 32 rows an
   instruction), Q and the first page ~1.5 µs, then the chain of one tile.
 
-**The named limit for mla_attn's tile rate** (done means 2): a CTA pair's SS MMAs at the shapes 96 heads allow
-(heads as M: pair M 128, 64 rows a CTA, N 128 / 256) read (64 + N/2) x 32 B a CTA an instruction, 96-128
-B/clk of the SM's 128 B/clk shared memory; with the KV landing (TMA writes, 136 KB a tile) and P the tile
-needs 360-392 KB a CTA, 1.45-1.6 µs at 128 B/clk, and the data in flight is capped by the 137 KB left after
-Q. Every variant here hits one or the other (v4: 126 B/clk measured; v3 / v5: ring capacity x latency). The
-DSL's 1.70 µs a tile is within 1.1x of the 1.53 µs HBM share a pair when all 76 pairs stream; what separates
-it from the floor at the bench shapes is per launch (~7 µs: setup, Q, the first page, the split's chain,
-the f32 partial) and the wave quantization of uniform splits (48 x 16k: 144 items on 76 pairs = 86 tiles of
-makespan vs 81). Heads as M pads 96 to 128 rows (the A reads of CTA 1's last 32 rows are 1/8 of the Q K^T
-traffic); positions as M (pair M 256, N 96) reads ~112 B/clk at Q K^T but needs a cross-lane softmax per
-head and the P exchange between CTAs: not a smaller bound.
+**Correction (05:40): shared memory does not bound the tile.** ncu, one GPU, v4 at 36 x 8k (83 µs): bank
+reads 17.9% / writes 11.6% of peak, tensor-core data stage (`l1tex__data_pipe_tc_wavefronts`) 35%, tensor
+pipe active 40% (33 µs = the tiles' 1.03 µs of MMA each), DRAM 323 MB in 83 µs (~3.9 TB/s). The DSL in the
+step (`work/ncu.sh`: ncu on rank 0, `-k regex:split_kv`, single-pass metric sets, 36 x 64k, 76-78 µs under
+ncu): tensor pipe 43-45%, data stage 38-40%, bank reads 20% / writes 13%, DRAM 57-58% of peak (349 MB). So
+neither kernel is at a hardware ceiling: both are latency / pipelining bound (the MMA warp's in-order issue
+behind each data wait and the softmax; the KV in flight capped by the ring after Q), and the DSL leaves
+~30-40% of HBM's rate. The 126 B/clk above was bytes / issue time, not a measured rate. v4's MMA warp: 1.6
+µs a tile not waiting against 1.03 µs of tensor time, so ~0.6 µs a tile is its own issue (52 MMAs, 15
+commits, 13 waits and fences) with the pipe idle.
 
-Where next (the bound is shared memory bytes a tile, ~128 B/clk):
+**What is left for mla_attn** (not a named limit, measured): the DSL at 1.7 µs a tile and ~60-70% of HBM;
+a kernel that kept the KV stream continuous (Q K^T of tile i + 2 issued before P V of tile i, three S
+buffers: 192 + 256 TMEM columns) and fewer, larger MMAs (N 256 Q K^T) could approach the HBM share
+(1.53 µs a tile at 76 pairs), ~10% of the call. Not reached here (v3-v5).
+
+Where next:
 1. Q K^T at N 256 (256-position tiles, each CTA two pages): the Q re-reads halve, -36 KB per 128 positions;
    TMEM is then exactly full (S 2 x 128 + O 256). Splits stay in 128-position tiles (a last half tile masked).
 2. P from smem by tcgen05.cp into both lane halves, then P V with A in TMEM: -16 KB.
