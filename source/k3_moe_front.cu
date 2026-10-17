@@ -100,19 +100,17 @@ __device__ __forceinline__ void quant8(const float* __restrict__ x, uint8_t* __r
 // The last block's routing tables over T rows' ids, thread i one expanded id: its slot within its
 // expert claimed by a shared-memory atomic (an expert's rows in arrival order, as FlashInfer's atomics
 // leave them; the GEMMs compute every row on its own and the combine gathers by exp2perm).
-__device__ __forceinline__ void route(const int* __restrict__ idx, int first, int T, int* __restrict__ cta_batch,
-                                      int* __restrict__ cta_limit, int* __restrict__ num_non_exiting,
-                                      int* __restrict__ total_padded, int* __restrict__ route_map,
-                                      int* __restrict__ exp2perm) {
-  __shared__ int count[LOCAL], off[LOCAL + 1];
+__device__ __forceinline__ void route(const int* __restrict__ idx, int first, int T, int* count,
+                                      int* __restrict__ cta_batch, int* __restrict__ cta_limit,
+                                      int* __restrict__ num_non_exiting, int* __restrict__ total_padded,
+                                      int* __restrict__ route_map, int* __restrict__ exp2perm) {
+  __shared__ int off[LOCAL + 1];
   const int i = threadIdx.x, lane = i % 32;
-  if (i < LOCAL) count[i] = 0;
   int j = -1;
   if (i < T * TOPK) {
     const int d = __ldcg(idx + i) - first;
     if (d >= 0 && d % STRIDE == 0) j = d / STRIDE;
   }
-  __syncthreads();
   const int slot = j >= 0 ? atomicAdd_block(count + j, 1) : 0;
   __syncthreads();
   if (i < 32) {  // off = exclusive scan of the experts' CTA counts
@@ -161,15 +159,16 @@ __device__ __forceinline__ void route(const int* __restrict__ idx, int first, in
   }
 }
 
-// The 896 scores as 64-bit keys (biased score's order bits, then the expert complemented: larger
-// key = larger score, ties to the smaller expert, k3_router_argmax.cu's order), a warp's 32 sorted
-// descending by a bitonic network.
-__device__ __forceinline__ unsigned long long sort32(unsigned long long v, int lane) {
+// A warp's 32 keys sorted descending by a bitonic network. The scores' keys are 64 bits: the biased
+// score's order bits, then the expert complemented (larger key = larger score, ties to the smaller
+// expert: k3_router_argmax.cu's order).
+template <typename K>
+__device__ __forceinline__ K sort32(K v, int lane) {
 #pragma unroll
   for (int k = 2; k <= 32; k <<= 1)
 #pragma unroll
     for (int j = k >> 1; j > 0; j >>= 1) {
-      const unsigned long long o = __shfl_xor_sync(0xffffffffu, v, j);
+      const K o = __shfl_xor_sync(0xffffffffu, v, j);
       v = (((lane & j) == 0) == ((lane & k) == 0)) ? max(v, o) : min(v, o);
     }
   return v;
@@ -198,8 +197,9 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
     int* __restrict__ cta_limit, int* __restrict__ num_non_exiting, int* __restrict__ total_padded,
     int* __restrict__ route_map, int* __restrict__ exp2perm, int first, int T) {
   __shared__ float s_sig[EXPERTS];
-  __shared__ unsigned long long s_max[32], s_cand[EXPERTS], s_tau;
-  __shared__ int s_n, s_last;
+  __shared__ unsigned long long s_cand[EXPERTS];
+  __shared__ u32 s_max[32], s_tau;
+  __shared__ int s_n, s_last, s_count[LOCAL];
 
   const int b = blockIdx.x, t = threadIdx.x, warp = t / 32, lane = t % 32;
   asm volatile("griddepcontrol.launch_dependents;");
@@ -208,19 +208,19 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
     const float sg = 1.0f / (1.0f + expf(-row[t]));
     s_sig[t] = sg;
     const unsigned long long key = (unsigned long long)ord_f32(sg + bias[t]) << 32 | (u32)~t;
-    unsigned long long m = key;
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) m = max(m, __shfl_xor_sync(0xffffffffu, m, o));
+    const u32 m = __reduce_max_sync(0xffffffffu, (u32)(key >> 32));
     if (lane == 0) s_max[warp] = m;
     if (t == 0) s_n = 0;
+    if (t < LOCAL) s_count[t] = 0;  // the tables' per-expert counts, should this block be the last
     asm volatile("bar.sync 2, %0;" ::"n"(SORT_WARPS * 32));
-    // tau, the 16th largest warp maximum: at least 16 keys are >= tau, so the top 16 are among them
+    // tau, the 16th largest warp maximum of the score bits: at least 16 keys have score bits >= tau, and
+    // the keys order by those bits first, so the top 16 are among the keys whose bits are >= tau
     if (warp == 0) {
-      const unsigned long long v = sort32(lane < SORT_WARPS ? s_max[lane] : 0ull, lane);
+      const u32 v = sort32(lane < SORT_WARPS ? s_max[lane] : 0u, lane);
       if (lane == TOPK - 1) s_tau = v;
     }
     asm volatile("bar.sync 2, %0;" ::"n"(SORT_WARPS * 32));
-    const bool in = key >= s_tau;
+    const bool in = (u32)(key >> 32) >= s_tau;
     const unsigned ballot = __ballot_sync(0xffffffffu, in);
     int at = 0;
     if (lane == 0 && ballot) at = atomicAdd(&s_n, __popc(ballot));
@@ -267,6 +267,6 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
   }
   __syncthreads();
   if (!s_last) return;
-  route(idx, first, T, cta_batch, cta_limit, num_non_exiting, total_padded, route_map, exp2perm);
+  route(idx, first, T, s_count, cta_batch, cta_limit, num_non_exiting, total_padded, route_map, exp2perm);
   if (t == 0) *done = 0;
 }
