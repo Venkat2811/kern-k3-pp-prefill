@@ -315,14 +315,19 @@ Before that, as a dependent of FC2:
   expert reachable on two ranks; the batch is replicated, so every rank can compute the same balanced
   assignment from the picks with no exchange. Memory is the cost (a second copy of a share of the
   experts).
-- **A persistent MoE kernel** (FC1 -> FC2 per expert panel, sh_down filling the drain). References:
-  DeepGEMM's `sm100_fp8_fp4_mega_moe.cuh` (fp8 x fp4 tcgen05, FC1 + SiTU + FC2 in one persistent
-  kernel, but built around EP dispatch / combine over symmetric buffers), and the kernel index's
-  `k3_mega_moe` (a K3 build of it, 224 experts only, r1-r16). Our layout (replicated batch, every rank
-  its experts over every row, then the all-reduce) would need its dispatch removed and the routing
+- **A persistent MoE kernel** (FC1 -> FC2 per expert panel, the shared projection filling the drain).
+  References: DeepGEMM's `sm100_fp8_fp4_mega_moe.cuh` (fp8 x fp4 tcgen05, FC1 + SiTU + FC2 in one
+  persistent kernel, but built around EP dispatch / combine over symmetric buffers), and the kernel
+  index's `k3_mega_moe` (a K3 build of it, 224 experts only, r1-r16). Our layout (replicated batch, every
+  rank its experts over every row, then the all-reduce) would need its dispatch removed and the routing
   tables built in it. What it could take back, from the waves above: FC1's and FC2's last-wave
-  quantization (half a wave each, 2.5-2.7 / ~2 us), the FC1 -> FC2 boundary, sh_down's 3.7 us tail;
-  roughly 5-8 us a layer at 8-48 rows, 75-120 us a step of the 16-layer bench (2-3.5%). removes FC1's
-  entry wait behind the tables only if the tables are built inside it, and FC1's / FC2's last-wave
-  quantization (half a wave each, 2-3 us). Needs block-scaled tcgen05 MMA and, for numerics, the
-  GEMM.md proof (FC1's mxfp8 output requantizes any change of summation order).
+  quantization (half a wave each, 2-3 us), the FC1 -> FC2 boundary, FC1's entry wait behind the tables
+  (only if it builds them itself) and the shared projection's tail past the row blocks (0-1 us at 8-36
+  rows, ~4.5 at 48): roughly 5-8 us a layer at 8-48 rows, 2-3.5% of the 16-layer bench. Needs
+  block-scaled tcgen05 MMA and, for numerics, the GEMM.md proof (FC1's mxfp8 output requantizes any
+  change of summation order).
+- **The shared projection on a graph branch beside FC1 / FC2 (direction 4): not worth a runtime change.**
+  Beside moe_front it costs only its tail past the row blocks (above). On a parallel branch its 112 CTAs
+  (one an SM, ~3.5 us each, bound by their 98 KB weight loads) would take ~2.6 us of whole-GPU SM time from
+  FC1's / FC2's waves, more than that tail at 8-36 rows; only FC1's last-wave idle SMs could absorb it for
+  free, and no launch-level scheduler can aim there (the persistent kernel above can).
