@@ -250,11 +250,13 @@ def dim(x):
     return {"var": x} if isinstance(x, str) else {"expr": x}
 
 
-def mla_attn_op(batch_max, split_max, reduce=True, scale_log2=bf16((NOPE_DIM + ROPE) ** -0.5) * math.log2(math.e)):
+def mla_attn_op(batch_max, split_max, reduce=True, scale_log2=bf16((NOPE_DIM + ROPE) ** -0.5) * math.log2(math.e),
+                ours_from=None):
     """The DSL attention as one op: split kernel + reduction, structs packed from the interface.
     Interface: q_abs latent | q_abs rope (+1024 B) | kv latent | kv rope (+1024 B) | block_table |
     seq_lens | mla_bsk | o_lat | lse | acc_o | acc_lse | B | max_pages, at most `batch_max` rows.
-    Without `reduce` the splits stay in acc_o / acc_lse for their merge (D's exchange, P's gate).
+    Without `reduce` the splits stay in acc_o / acc_lse for their merge (D's exchange, P's gate), and with
+    `ours_from` batches of that many rows take k3_mla_decode.cu instead (mla_decode_launch).
     `scale_log2`: the softmax scale times log2(e)."""
     batch = T
     V = {"at": 0, **dim(batch)}
@@ -305,16 +307,43 @@ def mla_attn_op(batch_max, split_max, reduce=True, scale_log2=bf16((NOPE_DIM + R
         acc_o, acc_lse, {"i32": split_max}, seqs, bsk,
     ]
     mod = module(MLA_MODULE)
+    main = {**mod, "entry": MLA_MAIN, "params": main_params, "args": main_args, "block": [384, 1, 1],
+            "grid": [2, batch, split_max], "cluster": [2, 1, 1], "shared_mem": MLA_MAIN_SMEM}
+    ours = [] if reduce or ours_from is None else [
+        mla_decode_launch(batch_max, split_max, scale_log2, {"var": T, "min": ours_from})]
+    if ours:
+        main["when"] = {"var": T, "max": ours_from - 1}
     return {
         "params": ["in buffer<bf16>", "in buffer<bf16>", "in state", "in state", "in buffer<i32>", "in buffer<i32>",
                    "in buffer<i32>", "out buffer<bf16>", "out buffer<f32>", "out buffer<f32>", "out buffer<f32>", "i32", "i32"],
-        "impl": {"launches": [
-            {**mod, "entry": MLA_MAIN, "params": main_params, "args": main_args, "block": [384, 1, 1],
-             "grid": [2, batch, split_max], "cluster": [2, 1, 1], "shared_mem": MLA_MAIN_SMEM},
+        "impl": {"launches": [main, *ours] + [
             {**mod, "entry": MLA_REDUCE, "params": reduce_params, "args": reduce_args, "block": [128, 1, 1],
              "grid": [HEADS, 1, batch], "shared_mem": MLA_REDUCE_SMEM},
-        ][:2 if reduce else 1]},
+        ][:1 if reduce else 0]},
     }
+
+
+# D's MLA decode over the DCP member's pages, its splits left for the exchange, from MLA_OURS_FROM rows:
+# k3_mla_decode.cu, the DSL split kernel's grid and output (acc_o / acc_lse, `mla_bsk` splits), a CTA pair a
+# (row, split). Below it the DSL's fixed cost a launch is the smaller (notes/r-attn.md).
+MLA_DECODE_SMEM = 232320  # k3_mla_decode.cu SMEM_BYTES
+MLA_OURS_FROM = 24
+
+
+def mla_decode_launch(batch_max, split_max, scale_log2, when):
+    """k3_mla_decode.cu over mla_attn_op's interface: q and the pages by 64 x 64 boxes of their 576-wide rows,
+    128 B swizzle."""
+    tmap = lambda param, d1, d2, stride: pack(128, {"at": 0, "tensormap": {
+        "param": param, "dtype": "bf16", "dims": [LATENT_ROW, d1, d2], "strides": [LATENT_ROW * 2, stride],
+        "box": [64, 64, 1], "swizzle": 128, "l2_promotion": 128}})
+    return {**module("k3_mla_decode"), "entry": "kern_k3_mla_decode",
+            "params": ["bytes<128>", "bytes<128>", "in buffer<i32>", "in buffer<i32>", "in buffer<i32>", "out buffer<f32>",
+                       "out buffer<f32>", "i32", "i32", "f32"],
+            "args": [tmap(0, HEADS, batch_max, HEADS * LATENT_ROW * 2), tmap(2, PAGE, 0, PAGE * LATENT_ROW * 2),
+                     {"param": 4}, {"param": 5}, {"param": 6}, {"param": 9}, {"param": 10}, {"i32": split_max},
+                     {"param": 12}, {"f32": scale_log2}],
+            "block": [224, 1, 1], "grid": [2, T, split_max], "cluster": [2, 1, 1], "shared_mem": MLA_DECODE_SMEM,
+            "when": when}
 
 
 def cake_attn_op(batch_max):
@@ -501,7 +530,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 for defs, smem, when in (({"KDA_SMEM_STATE": 1, "ROWS_PER_ITER": 1}, KDA_STATE_SMEM, {"max": kda_smem_rows}),
                                          ({"KDA_MINB": 4, "ROWS_PER_ITER": 2}, 0, {"min": kda_smem_rows + 1}))]},
         },
-        "mla_attn": cake_attn_op(seqs_max) if fp8 else mla_attn_op(seqs_max, mla_split_max, reduce=not xchg),
+        "mla_attn": cake_attn_op(seqs_max) if fp8 else mla_attn_op(seqs_max, mla_split_max, reduce=not xchg,
+                                                                    ours_from=MLA_OURS_FROM if xchg else None),
         } if decode else {}),
         "gemm_bf16": {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32", "i32"],
