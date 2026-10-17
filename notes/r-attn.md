@@ -4,7 +4,7 @@ Kernels: `k3_kda_core`, MLA (`k3_mla_prep`, `k3_mla_absorb_tc` (`_mma` under `--
 `mla_decode_h96_p64` and its grid), the DCP exchange (`k3_dcp`).
 Previous lane notes: `notes/d-attn.md` (round 1, every idea tried there).
 
-## Status (06:25 UTC): k3_mla_decode in the step from 24 rows, -0.19%
+## Status (06:10 UTC): k3_mla_decode in the step from 24 rows, -0.19%
 
 4ebcfd9: D's MLA attention runs on our kernel (`source/k3_mla_decode.cu`) from 24 rows, the DSL below (one
 `when` launch each). D weighted 3.219 → 3.213 ms/step (branch HEAD vs it, one lease, 3 rounds); at the A/B
@@ -699,6 +699,16 @@ slower at every distance), K / V rings 11 / 3, 13 / 2, 7 / 5, 5 / 6 boxes (9 / 4
 epilogue's TMEM loads four at a time (no change). In the step (A/B against the DSL everywhere, 3 rounds):
 equal weighted (3.217 / 3.215), 36 / 48 rows x 64k -20..-25 µs a step, 8 / 16 rows +7..+15 (the DSL's ~2.5
 µs less a launch at 8 tiles an item, and its tiles faster when only 64 pairs run): hence the 24-row split.
+
+**Persistent grid, tried after 4ebcfd9** (`work/md/vP5_persistent.cu`): 76 clusters, each walking items
+(row, split) blockIdx.y + 76 j with one setup, the pipeline drained by a cluster barrier between items (the
+epilogue stages in the ring). Correct at every shape. Harness µs, v15 → persistent (row-major items / split-
+major, the DSL grid's launch order): 32 x 1k 19.3 → 17.0 / 17.6, 64 x 1k 31.9 → 25.1 / 25.6 (the 16-slot
+grid's empty clusters: GRID_Z=1 at 64 x 1k is 23.8, so ~8 µs a call), but 8 x 8k 22.4 → 23.4 / 24.2, 24 x 8k
+48.9 → 50.1 / 49.9, 36 x 8k 66.6 → 68.4 / 68.0, 48 x 16k 167.8 → 170.7 / 168.3. Every cluster scans the rows'
+splits before its first page ids (a second dependent round trip), and the split-major decode's loop over
+split levels costs more at small batches. Not kept: the bench shapes are 24-48 rows x 64k / 128k, where the
+empty clusters cost < 1 µs. It would pay at many short rows (the A/B shapes) if its prologue were free.
 
 What is left in ours (v15, 8 x 8k, clocks in the kernel): setup to TMEM 1.4 µs (the lengths' load 0.7,
 the pair's TMEM alloc 0.4, the cluster barrier), Q and the first page ~1 µs more, the epilogue's 96 KB of
