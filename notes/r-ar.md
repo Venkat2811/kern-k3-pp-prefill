@@ -202,7 +202,8 @@ window's, not the row's.
 | the closing add's prefetch blocks pass griddepcontrol.wait before their hints | 3.275-3.277 -> 3.270-3.271 | yes |
 | no push spread at all / PUSH_RUN 64 / 256 (one-shot) | 3.276-3.277 -> 3.278-3.279 (8 rows +10 us) / 3.278-3.280 / 3.278 | no: noise |
 | embed_rms_plan's split plan in block B (was: warp 0 of every row block, before the row's norm) | embed alone 4.37-5.14 -> 2.97-3.64 us, the same outputs and splits; step 3.284 -> 3.282 | yes |
-| land's mix norm from the candidates' pairwise dots (one cluster reduction after the wait instead of two) | | not retried: -0.09% in round 3's first session, and the only change here that would move outputs (0.1-0.4% by 1-2 ulp) |
+| the mix's norm from the candidates' pairwise dots (MIX_GRAM: the snapshots' scores and pair dots in one reduction before the row is in, the row's score and dots with the snapshots in one after: one reduction after the data instead of two), attention all-reduce | nb 1 / 2, 1-64 rows: -0.1..-0.4 us (nb 2 at 1-8 rows +0.1); 0.17-0.46% of outputs move, max rel 0.014 (1-2 bf16 ulp: the norm of the f32 mix, not of its bf16 rounding) | 3.267 / 3.266 -> 3.266 / 3.271 | no: flat, and it moves outputs |
+| the same in the closing add (the snapshots' reduction before griddepcontrol.wait, only ~1 us ahead of lat_up's end) | 1 GPU, nb 1 / 2: +0.0..+0.6 us (the pre-wait reduction is on the path) | | no |
 
 ## Multicast for the exchanges: measured, not worth a runtime feature now
 
