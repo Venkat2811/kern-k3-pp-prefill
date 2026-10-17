@@ -150,6 +150,18 @@ Attention floor (the rank's latent rows once, 1152 B a position): 10.3 /
 
 ## Done table (rank 0 busy µs a call in the step, nsys; floors from roofline/decode.md)
 
+The branch on main 21a9174 at 2f5eb5f (`work/prof.sh`, 16 layers):
+
+| kernel | 1 | 8 | 32 | 64 | 32 × 32k | floor (1 / 8 / 32 / 64 / 32×32k) | named limit |
+|---|---|---|---|---|---|---|---|
+| kda_core | 5.79 | 6.14 | 11.15 | 19.41 | 10.90 | 0.29 / 1.87 / 7.29 / 14.52 / 7.29 | chain (≤ 25 rows), prologue beside the state (R build) |
+| mla_attn (DSL, 16 slots) | 8.68 | 10.60 | 27.37 | 48.51 | 43.82 | 0.42 / 2.48 / 7.36 / 12.99 / 22.80 | a kernel with these items: ≥ the no-math bound below |
+| mla_absorb (tcgen05) | 5.02 | 4.84 | 5.33 | 5.79 | 5.09 | 1.72 (12.6 MB) | launch + HBM round trip + 12.6 MB (loads alone 3.7) |
+| mla_prep | 1.71 | 1.62 | 1.96 | 1.87 | 1.63 | launch | the launch |
+
+The table below is the earlier one (the branch at 6029a75), kept for its
+derivations.
+
 A/B shapes, rows × 8k (and 32 × 32k), the branch at 6029a75:
 
 | kernel | 1 | 8 | 32 | 64 | 32 × 32k | floor (1 / 8 / 32 / 64 / 32×32k) | main (roofline) |
