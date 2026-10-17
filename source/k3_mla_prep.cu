@@ -162,7 +162,7 @@ extern "C" __global__ __launch_bounds__(MAXNT) void kern_k3_mla_prep(
   __shared__ float red[2][MAXW];  // warp partials: [0] q, [1] kv
 
   // =====================================================================
-  // Fast path: the documented grid (B, 4, 1) block (512, 1, 1).
+  // Fast path: the documented grid (B, GYF, 1) block (512, 1, 1).
   // =====================================================================
   if (nt == NTF && gridDim.y == GYF) {
     if (blockIdx.y != 0) {  // ---- gate segment, 4 * GSEGU columns -------
