@@ -9,12 +9,14 @@
 //
 // Row b's block:
 //   * the router top-k of columns [0, EXPERTS) (k3_router_argmax.cu's picks and
-//     order): warp w < EXPERTS / 32 sorts its 32 biased scores by a bitonic
-//     network, then warps 0..13 merge the warps' top 16 pairwise (below);
+//     order), exact: warp w < EXPERTS / 32 holds 32 biased scores; tau, the 16th
+//     largest warp maximum, bounds the top 16 from below; the scores >= tau
+//     (16-30 of them on real routing) are compacted and warp 0 sorts them 32 at a
+//     time into a running top 16 (below);
 //   * meanwhile warps 28..31 run k3_land.cu's land_situ on the shared expert's
-//     gate | up (the SH columns after the latent), and once the sorts are done
-//     warps 14..27 land the latent (columns EXPERTS + [0, LATENT)) to bf16 and
-//     quantise it to mxfp8 as k3_moe_prefill.cu's kern_k3_moe_quant (four
+//     gate | up (the SH columns after the latent), and once the candidates are
+//     in, warps 14..27 land the latent (columns EXPERTS + [0, LATENT)) to bf16
+//     and quantise it to mxfp8 as k3_moe_prefill.cu's kern_k3_moe_quant (four
 //     threads per 32-element group);
 // then the last block to finish (`done`, a zeroed carry it re-zeroes) builds
 // the routing tables of this rank's experts `first + j * STRIDE` (j < LOCAL)
