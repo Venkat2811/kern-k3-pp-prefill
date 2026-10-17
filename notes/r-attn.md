@@ -318,7 +318,8 @@ A member's view: 96 heads (every head, a DCP member's positions), latent 512
   41.9 (7.33 TB/s / 1152 B / 152 SMs): the 96 → 128 padding costs ~10% in
   the steady state. The larger part of the gap is fixed: ~7-10 µs a launch
   (each split loads its row's 110 KB of q from L2 and writes a 196 KB f32
-  partial; 8 x 8k is 64 splits of one tile... 8 tiles, 21.9 µs) and
+  partial; 8 x 8k runs 8 splits a row of 8 tiles, 64 clusters: 21.9 µs
+  where the tiles alone are ~12) and
   clusters left idle (72 of 76 at 24-36 rows, uniform splits). A kernel
   that merged its splits on chip (a persistent cluster per row group, bf16
   or in-cluster partials) and fed every cluster would target those first.
