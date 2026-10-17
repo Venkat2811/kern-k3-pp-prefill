@@ -530,3 +530,30 @@ math, TMEM O, bf16 P) to write and tune from PTX, more than this session.
   one GPU no change (5.54 → 5.55 at 8 rows, 12.98 → 12.96 at 48), D A/B on
   main 21a9174 3.285 / 3.286 → 3.285 / 3.287. The all-warm harness's extra
   0.6 µs over a warm state is not those weights' L2 misses. Dropped.
+
+## For an MLA kernel later: measured building blocks (this session)
+
+- tcgen05 rates by shape (`harness/attn/mma_rate.cu`, above); a TMEM kernel
+  is resident one block an SM (`work/mma/occk.cu`); ptxas rejects
+  cta_group::1 and ::2 in one kernel.
+- **Where a CTA pair's D lands** (`harness/attn/tmem_layout.cu`): at M = 128
+  (64 rows a CTA) each CTA keeps its rows twice down the lanes, lanes 0-63
+  for columns 0 .. N/2 and lanes 64-127 for N/2 .. N, in N/2 TMEM columns; at
+  M = 256 its 128 rows fill lanes 0-127 over N columns. So heads-as-M in a
+  pair (64 heads a CTA) holds O (512 latent columns) in 256 TMEM columns and
+  two 128-position S buffers in 2 x 64: 384 of 512. That is the budget the
+  DSL and Cake's kernel live in; a 1-CTA heads-as-M O alone is 512.
+- Verified descriptor forms (absorb on tcgen05, bit-identical to mma.sync):
+  K-major SW128 (start + 32 B a k16 step inside the 128 B row, SBO 1 KB) and
+  MN-major SW128 (64 elements x 8 rows a 1 KB atom, SBO 1 KB between 8-row
+  groups, LBO between 64-element blocks), the latter straight from a TMA box
+  of 64 x rows with the 128 B swizzle; manifest tensor maps (`tensormap` in a
+  `bytes<128>` pack) for TMA.
+- A starting point in plain CUDA: the vendored Cake kernel
+  (`source/flashinfer-cake-k3-mla/`) is the pair heads-as-M design (M = 128,
+  N = 128 positions, cta_group::2 TMA and multicast commit, softmax warps on
+  64 rows) for e4m3; bf16 doubles its q (64 KB) and stage bytes, so its 5 x
+  32 KB K stages become a ring of 64-dim chunks. The ceiling for any kernel
+  with the DSL's items is the no-math table above (5.9 / 7.5 / 11.5 / 27.9
+  µs a call at the bench shapes); a persistent one also removes the second
+  wave's chain at 48 rows and the 16-slot grid's empty clusters.
