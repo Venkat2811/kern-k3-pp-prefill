@@ -831,7 +831,8 @@ extern "C" __global__ void __launch_bounds__(LT, 1) kern_k3_land_add2_attnres_rm
   extern __shared__ uint4 cand[];
   __shared__ LandSmem s;
   asm volatile("griddepcontrol.launch_dependents;");
-  if ((int)blockIdx.x >= LAND_CL * B) return l2_prefetch(pf, pf_bytes, LAND_CL * B);
+  // the idle blocks' hints after lat_up (the kernel before) is done: not on top of its own weight stream
+  if ((int)blockIdx.x >= LAND_CL * B) return grid_wait(), l2_prefetch(pf, pf_bytes, LAND_CL * B);
 #define LAND(NB) land_add2_attnres_rms<NB>(p1, p2, prefix2, hidden, two, blocks, sw, gamma, normed, snapshot, cand, s)
   NB_DISPATCH(nb, LAND)
 }
