@@ -564,7 +564,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         "mla_prep": {
             "params": ["in buffer<f32>", "in buffer<bf16>", "in buffer<bf16>", "in buffer<i64>", "inout state",
                        "i64", "i64", "out buffer<bf16>", "out buffer<bf16>", "i32"],
-            "impl": {"launches": [launch("k3_mla_prep", "kern_k3_mla_prep", grid=[T, 3, 1],
+            # k3_mla_prep.cu's fast path: the norm / append block and a gate block per 4096 columns
+            "impl": {"launches": [launch("k3_mla_prep", "kern_k3_mla_prep", grid=[T, 1 + -(-inner_l // 4096), 1],
                                          defines={"INNER": inner_l, "MLA_FUSED": mla_fused_l,
                                                   **({"KV_FP8": 1} if fp8 else {})}) if tp > 1
                                   else launch("k3_mla_prep", "kern_k3_mla_prep")]},

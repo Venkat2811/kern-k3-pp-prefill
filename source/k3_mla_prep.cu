@@ -22,7 +22,8 @@
 //
 // ---- grid / block / smem (this is what the manifest should copy) --------
 //
-//   grid (B, 4, 1)      block (512, 1, 1)      dynamic smem 0
+//   grid (B, GYF, 1)    block (512, 1, 1)      dynamic smem 0
+//   GYF = 1 + ceil(INNER / 4096): 4 at 12288 gate columns, 2 at a TP8 rank's 1536
 //   static smem: 2112 f32 staged head columns + 512 staged gamma pairs
 //                + 64 f32 warp partials = 12800 B/block
 //
@@ -33,7 +34,7 @@
 //                      12288 gate columns: a pure f32 -> bf16 landing copy.
 // grid.x is exactly B, per the ABI.
 //
-// The kernel has two paths.  The documented (512, gridDim.y == 4) shape takes
+// The kernel has two paths.  The documented (512, gridDim.y == GYF) shape takes
 // a fully specialised path with compile-time trip counts -- at B = 1 this
 // kernel is far too small to be bandwidth bound, so its cost is instruction
 // issue and one memory round trip, and every predicate removed from the inner
@@ -99,10 +100,8 @@
 #define GU   (INNER / 4)                // 3072 float4 units of gate
 
 #define NTF   512                       // fast-path block
-#ifndef GYF
-#define GYF   4                         // fast-path gridDim.y
-#endif
-#define GSEGU (GU / (GYF - 1))          // 1024 gate units per fast segment
+#define GYF   (1 + (GU + 1023) / 1024)  // fast-path gridDim.y: the head block + gate segments of <= 1024 units
+#define GSEGU (GU / (GYF - 1))          // gate units per fast segment: 1024, or a TP8 rank's 384 (GYF 2)
 #define QWF   (QU / 32)                 // 12 warps of q on the fast head
 
 #define MAXNT 1024
@@ -166,16 +165,18 @@ extern "C" __global__ __launch_bounds__(MAXNT) void kern_k3_mla_prep(
   // Fast path: the documented grid (B, 4, 1) block (512, 1, 1).
   // =====================================================================
   if (nt == NTF && gridDim.y == GYF) {
-    if (blockIdx.y != 0) {  // ---- gate segment, 4096 columns -------------
+    if (blockIdx.y != 0) {  // ---- gate segment, 4 * GSEGU columns -------
       const float* __restrict__ src = P + HEADC;
       __nv_bfloat16* __restrict__ dst = mla_gate + (long long)b * INNER;
       const int base = (int)(blockIdx.y - 1) * GSEGU + t;
 #pragma unroll
-      for (int k = 0; k < GSEGU / NTF; ++k) {  // 2 passes, both loads in flight
+      for (int k = 0; k < (GSEGU + NTF - 1) / NTF; ++k) {  // every pass's load in flight
         const int u = base + k * NTF;
-        const float4 v = *reinterpret_cast<const float4*>(src + 4 * u);
-        *reinterpret_cast<uint2*>(dst + 4 * u) =
-            make_uint2(pack2(v.x, v.y), pack2(v.z, v.w));
+        if (GSEGU % NTF == 0 || k * NTF + t < GSEGU) {
+          const float4 v = *reinterpret_cast<const float4*>(src + 4 * u);
+          *reinterpret_cast<uint2*>(dst + 4 * u) =
+              make_uint2(pack2(v.x, v.y), pack2(v.z, v.w));
+        }
       }
       return;
     }

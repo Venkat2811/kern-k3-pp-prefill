@@ -65,12 +65,12 @@ sha256 = "e2637887194ef0ce631f85716b7ce919654edf3b9c6f41e70049d3c86e26e62e"
 source = "source/k3_mla_prep.cu"
 
 [kernels."k3_mla_prep+INNER=1536+MLA_FUSED=3648"]
-sha256 = "8847e422800c072d15483389f867db81c0f91a44ecaa3c97066b24528b0e1b04"
+sha256 = "69a1277dced71841680c57c7928d497406e84a8ac709dbcf21c9c705942e47a5"
 source = "source/k3_mla_prep.cu"
 defines = { INNER = 1536, MLA_FUSED = 3648 }
 
 [kernels."k3_mla_prep+INNER=1536+KV_FP8=1+MLA_FUSED=3648"]
-sha256 = "02bd392e2c3974fd24c1e3faf53ef249317b00be1c383615cf8f47bff012ad57"
+sha256 = "7da90ce2c20ac2587587771c69ee67f6a27da3ad63e56b8c16703fd64b353d0a"
 source = "source/k3_mla_prep.cu"
 defines = { INNER = 1536, KV_FP8 = 1, MLA_FUSED = 3648 }
 
