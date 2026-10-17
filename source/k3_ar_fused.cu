@@ -12,7 +12,9 @@
 // 1024 threads with the reduction trees of the kernels it replaces. From
 // TWO_SHOT_ROWS rows a row goes to its owner (row % NRANKS) only, whose row
 // block sums it as the one-shot does and gathers the sum to the others. The
-// blocks past B pull the next GEMM's weight `pf` (`pf_bytes`) into L2.
+// blocks past B load the next GEMM's weight `pf` (`pf_bytes`) into L2 while a
+// row block still waits (k3_l2_prefetch.cuh; state[1] stamps a row's data in,
+// state[3] counts the blocks done, state[7] is the loads' sink).
 //
 //   kern_k3_ar_attnres_rms(const bf16* x, u8* lamport, const u64* lamport_peers, i32* state,
 //       i32* err, int rank, const bf16* prefix, const bf16* blocks, const f32* sw,
@@ -43,6 +45,17 @@
 
 #include <cuda_bf16.h>
 #include <cstdint>
+
+#include "k3_l2_prefetch.cuh"
+
+// how long the loads of the next weight go on past a row's arrival: under kern_k3_ar_attnres_rms's row
+// epilogue (the attention residual's ~4.3 us) and kern_k3_ar_finalize_rms's (the latent norm's ~1 us)
+#ifndef AR_GRACE_NS
+#define AR_GRACE_NS 2500
+#endif
+#ifndef FIN_GRACE_NS
+#define FIN_GRACE_NS 500
+#endif
 
 #ifndef NRANKS
 #define NRANKS 8
@@ -148,15 +161,6 @@ __device__ __forceinline__ Lamport lamport_open(uint8_t* lamport, const unsigned
   __syncthreads();
   if (threadIdx.x == 0) atomicAdd(state, 1);
   return l;
-}
-
-// The next GEMM's weight pulled into L2 by the blocks that hold no row (b >= B), once their pushes
-// are out, while the row blocks wait on the peers: a prefetch.global.L2 a 128-byte line.
-__device__ __forceinline__ void l2_prefetch(const uint8_t* w, long long bytes, int B) {
-  if ((int)blockIdx.x < B) return;
-  const long long step = (long long)(gridDim.x - B) * blockDim.x * 128;
-  for (long long o = ((long long)(blockIdx.x - B) * blockDim.x + threadIdx.x) * 128; o < bytes; o += step)
-    asm volatile("prefetch.global.L2 [%0];" ::"l"(w + o));
 }
 
 __device__ __forceinline__ void lamport_push(const Lamport& l, long long i, uint4 v) {
@@ -462,7 +466,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_attnres_rms
       lamport_push(l, i, v);
   }
   lamport_clear(l);
-  l2_prefetch(pf, pf_bytes, B);
+  l2_load_while(pf, pf_bytes, B, (unsigned*)state + 1, AR_GRACE_NS, state + 7);
 
   int fail = 0;
   if (row) {
@@ -473,6 +477,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_attnres_rms
       const long long i = (long long)b * KVEC + t;
       const int owner = b % NRANKS;
       const V8 lp = asv(lamport_get(l, two, owner, rank, i, timeout_ns, fail));
+      l2_arrive((unsigned*)state + 1);
       if (snapshot) {
         pv = lp;
       } else {
@@ -486,6 +491,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_attnres_rms
     }
     row_finish(cand, r, pv, normed + (size_t)b * KH, nb, t, s);
   }
+  l2_close((unsigned*)state + 1, state + 3);
   lamport_close(l, state, err, fail);
 }
 
@@ -579,7 +585,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
       lamport_push(l, i, v);
   }
   lamport_clear(l);
-  l2_prefetch(pf, pf_bytes, B);
+  l2_load_while(pf, pf_bytes, B, (unsigned*)state + 1, FIN_GRACE_NS, state + 7);
 
   int fail = 0;
   if (b < B) {
@@ -587,6 +593,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
     const int owner = b % NRANKS;
     const auto summed = [&](long long i) { return lamport_get(l, two, owner, rank, i, timeout_ns, fail); };
     if (t < KVEC) shared_sum[(long long)b * KVEC + t] = summed(base + KLATV + t);
+    l2_arrive((unsigned*)state + 1);
     // kern_k3_rms at h = KLAT: vector t of the row, its squares serially, a warp
     // butterfly, then the 32 warp slots (zero past the row) by another
     uint4 x = make_uint4(0u, 0u, 0u, 0u), g;
@@ -624,6 +631,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
       stv(latent_norm + (long long)b * KLAT + t * 8, o);
     }
   }
+  l2_close((unsigned*)state + 1, state + 3);
   lamport_close(l, state, err, fail);
 }
 
