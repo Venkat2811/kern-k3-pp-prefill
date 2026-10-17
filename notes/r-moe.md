@@ -224,14 +224,19 @@ Before that, as a dependent of FC2:
 
 ## Proposals
 
-- **For r-ar: launch `ar_finalize_rms` as a programmatic dependent of FC2** (measured, not committed: the
-  kernel is r-ar's). Since `939a424` nothing sits between FC2 and `ar_finalize_rms` (sh_down used to). In
-  `kern_k3_ar_finalize_rms` add `asm volatile("griddepcontrol.wait;" ::: "memory");` right after
-  `lamport_open(...)` (it touches only the all-reduce's own state; everything after reads FC2's or
-  earlier outputs), and `"pdl": True` on its launch in gen_stage.py. On HEAD 1384303: 3.4373 -> 3.4183
-  ms/step (-0.55%, 3 interleaved rounds in one lease), loop/d/check bit-identical (run it 3 times
-  before merging: it is a Lamport kernel). work/arpdl.cu has the one-line change.
-
+- **For r-ar: launch `ar_finalize_rms` (and `ar_attnres_rms`) as programmatic dependents** (measured,
+  not committed: the kernels are r-ar's). Since `939a424` nothing sits between FC2 and `ar_finalize_rms`
+  (sh_down used to). In `kern_k3_ar_finalize_rms` add `asm volatile("griddepcontrol.wait;" ::: "memory");`
+  right after `lamport_open(...)` (it touches only the all-reduce's own state; everything after reads
+  FC2's or earlier outputs); in `kern_k3_ar_attnres_rms` the same wait before its entry trigger; and
+  `"pdl": True` on both launches in gen_stage.py. Against HEAD in one lease, 3 interleaved rounds:
+  ar_finalize alone 3.4373 -> 3.4183 ms/step (-0.55%), both 3.4380 -> 3.4207 (-0.5%); loop/d/check
+  bit-identical for both (run it 3 times before merging: Lamport kernels).
+- **For r-attn: the same on `kda_core`, `mla_prep`, `mla_absorb`, `dcp_exchange` is not safe as is.**
+  With griddepcontrol.wait before each one's entry trigger and `pdl: true` (on top of the two AR
+  kernels): 3.4347 -> 3.4143 ms/step, but loop/d/check FAILs (3 extra confident flips, max relRMS
+  0.104), while the AR pair alone is bit-identical. One of the four misbehaves as a programmatic
+  dependent (round 1 saw the same on `land_add2_attnres_rms`); not bisected further. Worth ~-0.14%.
 - **EP balance (largest MoE lever, outside the fixed layout).** Simulated on the dumped real routing
   (`work/epsim.py`, 64 rows x 160 steps x 15 layers; a replicated expert goes to the holder with fewer
   touched experts so far, which every rank can compute from the same picks): busiest rank's touched
