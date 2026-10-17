@@ -1409,7 +1409,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     def prefetch_next(prog):
         """Every PF_OPS call names the weight of the GEMM after it (up to PF_MAX bytes) for L2; ar_finalize_rms
         also the next PF_LAST GEMM's, at evict_last, and the ar_attnres_rms after that GEMM the same range to
-        put back to evict_normal."""
+        put back to evict_normal. Our own GEMM (gemm_t*) for front pins the layer's sh_down weight the same way
+        (for after the MoE), and the next of our GEMMs demotes it."""
         gemms = [(k, c) for k, c in enumerate(prog) if c["op"].startswith("gemm_")]
         size = lambda w: math.prod(buffers[w["buf"]]["shape"]) * {"bf16": 2, "f32": 4, "u8": 1}[
             buffers[w["buf"]]["dtype"]] - w.get("offset", 0)
