@@ -198,12 +198,15 @@ __device__ __forceinline__ void lamport_clear(const Lamport& l) {
 #ifndef PUSH_SPREAD_ROWS
 #define PUSH_SPREAD_ROWS 33
 #endif
+__device__ __forceinline__ int share_per(long long tot) {
+  return (((int)tot + PUSH_RUN - 1) / PUSH_RUN + KGRID - 1) / KGRID * PUSH_RUN;
+}
 __device__ __forceinline__ long long share(long long tot, int B) {
   if (B >= PUSH_SPREAD_ROWS) {
     const int i = (int)blockIdx.x * KTHREADS + (int)threadIdx.x;
     return i < (int)tot ? i : -1;
   }
-  const int per = (((int)tot + PUSH_RUN - 1) / PUSH_RUN + KGRID - 1) / KGRID * PUSH_RUN;
+  const int per = share_per(tot);
   const int i = per * (int)blockIdx.x + (int)threadIdx.x;
   return (int)threadIdx.x < per && i < (int)tot ? i : -1;
 }
@@ -828,15 +831,14 @@ extern "C" __global__ void __launch_bounds__(LT, 1) kern_k3_land_add2_attnres_rm
 static_assert(((64 * ROWV + PUSH_RUN - 1) / PUSH_RUN + KGRID - 1) / KGRID * PUSH_RUN <= KTHREADS,
               "a push share past KTHREADS");
 
-// kern_k3_moe_finalize's column vector h of row t
-__device__ __forceinline__ uint4 finalize(const bf16_t* __restrict__ fc2, const int* __restrict__ exp2perm,
-                                          const float* __restrict__ wts, int t, int h) {
+// kern_k3_moe_finalize's column vector h of a row, its top-k (exp2perm, wts) in shared memory
+__device__ __forceinline__ uint4 finalize(const bf16_t* __restrict__ fc2, const int* e2p, const float* w16, int h) {
   float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll
   for (int k = 0; k < TOPK; ++k) {
-    const int p = exp2perm[t * TOPK + k];
+    const int p = e2p[k];
     if (p < 0) continue;
-    const float w = wts[t * TOPK + k];
+    const float w = w16[k];
     const uint4 u = reinterpret_cast<const uint4*>(fc2 + (long long)p * KLAT)[h];
     const __nv_bfloat162* v = reinterpret_cast<const __nv_bfloat162*>(&u);
 #pragma unroll
@@ -863,10 +865,19 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
   const int t = threadIdx.x, b = blockIdx.x;
   const long long tot = (long long)B * ROWV, i = share(tot, B);
   const int row = (int)(i / ROWV), c = (int)(i % ROWV);
+  // the top-k of the (at most two) rows this block's share spans, written by moe_front: read before the wait
+  __shared__ int s_e2p[2][TOPK];
+  __shared__ float s_w[2][TOPK];
+  const int row0 = (B >= PUSH_SPREAD_ROWS ? b * KTHREADS : share_per(tot) * b) / ROWV;
+  if (t < 2 * TOPK && row0 + t / TOPK < B) {
+    s_e2p[t / TOPK][t % TOPK] = exp2perm[(row0 + t / TOPK) * TOPK + t % TOPK];
+    s_w[t / TOPK][t % TOPK] = wts[(row0 + t / TOPK) * TOPK + t % TOPK];
+  }
   const Lamport l = lamport_open(lamport, lamport_peers, state, err, rank, tot, stage_bytes, timeout_ns);
   grid_wait();
   const uint4 v = i < 0 ? make_uint4(0u, 0u, 0u, 0u)
-                  : c < KLATV ? finalize(fc2, exp2perm, wts, row, c) : shared[(long long)row * KVEC + c - KLATV];
+                  : c < KLATV ? finalize(fc2, s_e2p[row - row0], s_w[row - row0], c)
+                              : shared[(long long)row * KVEC + c - KLATV];
   // From TWO_SHOT_ROWS rows the sum runs as two shots: every row goes to its owner (row % NRANKS) only, the
   // owner sums it and gathers the sum to the others, 2 x 7/8 of a partial out of each rank instead of 7.
   const bool two = B >= TWO_SHOT_ROWS;
