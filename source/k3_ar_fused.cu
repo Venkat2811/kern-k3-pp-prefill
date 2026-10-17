@@ -190,11 +190,19 @@ __device__ __forceinline__ void lamport_clear(const Lamport& l) {
 // Vector i of a call's `tot` this thread pushes, or -1: runs of PUSH_RUN vectors dealt to the
 // KGRID blocks in order, so a row's pushes leave from several SMs rather than from the one block
 // a row would fill (an SM pushes ~55 GB/s). The grid is a constant: a division by gridDim.x
-// costs the push 0.3 us.
+// costs the push 0.3 us. From PUSH_SPREAD_ROWS rows the pushes fill the first blocks a vector a
+// thread instead, so the blocks past them start loading the next weight (l2_load_while) at once.
 #ifndef PUSH_RUN
 #define PUSH_RUN 128
 #endif
-__device__ __forceinline__ long long share(long long tot) {
+#ifndef PUSH_SPREAD_ROWS
+#define PUSH_SPREAD_ROWS 33
+#endif
+__device__ __forceinline__ long long share(long long tot, int B) {
+  if (B >= PUSH_SPREAD_ROWS) {
+    const int i = (int)blockIdx.x * KTHREADS + (int)threadIdx.x;
+    return i < (int)tot ? i : -1;
+  }
   const int per = (((int)tot + PUSH_RUN - 1) / PUSH_RUN + KGRID - 1) / KGRID * PUSH_RUN;
   const int i = per * (int)blockIdx.x + (int)threadIdx.x;
   return (int)threadIdx.x < per && i < (int)tot ? i : -1;
@@ -604,7 +612,7 @@ __device__ __forceinline__ void ar_attnres_rms(const uint4* __restrict__ x, uint
   const int t = threadIdx.x, b = blockIdx.x;
   const bool row = b < B, act = t < KVEC;
   const size_t off = (size_t)b * KH + t * 8;
-  const long long tot = (long long)B * KVEC, i = share(tot);
+  const long long tot = (long long)B * KVEC, i = share(tot, B);
   RowRegs r;
   V8 pr;
   pr.w[0] = 0u, pr.w[1] = 0u, pr.w[2] = 0u, pr.w[3] = 0u;
@@ -846,7 +854,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
     const uint8_t* __restrict__ pf2, long long pf2_bytes) {
   __shared__ float red[32 * RED_LD];
   const int t = threadIdx.x, b = blockIdx.x;
-  const long long tot = (long long)B * ROWV, i = share(tot);
+  const long long tot = (long long)B * ROWV, i = share(tot, B);
   const int row = (int)(i / ROWV), c = (int)(i % ROWV);
   const Lamport l = lamport_open(lamport, lamport_peers, state, err, rank, tot, stage_bytes, timeout_ns);
   grid_wait();
