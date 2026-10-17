@@ -171,6 +171,37 @@ GEOM = {
 }
 
 
+# source/k3_gemm_f32.cu: D's K = 7168 f32 projections (qkvg 6400, front 6016) over 1-32 rows in cuBLAS's split-K
+# order (cuBLAS splits K at these 64-column blocks below 49 rows) with the reduce in the same launch; from 33 rows
+# cuBLAS keeps them (ours, at most 4 stages of a 40-48-row A, was 1-2 us a call slower there).
+GEMM_T_SPLIT = (38, 76)
+GEMM_T_BN = ((8, 8), (16, 16), (24, 24), (32, 32))  # (max rows, BN)
+GEMM_T_BM = 64
+GEMM_T_KB = {6016: 100}  # n -> a CTA's shared memory (KB): 100 two CTAs an SM where its clusters all fit, else 73
+
+
+def gemm_t_op(n, k):
+    """C[m, n] = A[m, k] @ W[n, k]^T, f32: one launch for each row bucket, cuBLAS past the last."""
+    tiles = -(-n // GEMM_T_BM)
+    kb = GEMM_T_KB.get(n, 73)
+    tmap = lambda param, rows, box: pack(128, {"at": 0, "tensormap": {
+        "param": param, "dtype": "bf16", "dims": [k, rows], "strides": [k * 2], "box": [64, box], "swizzle": 128,
+        "l2_promotion": 256}})
+    launches, lo = [], 1
+    for hi, bn in GEMM_T_BN:
+        launches.append({**module("k3_gemm_f32", BN=bn, CTA_KB=kb, SPLITS=3), "entry": "kern_k3_gemm_f32",
+                         "block": [128, 1, 1], "grid": [tiles * 3, 1, 1], "cluster": [3, 1, 1],
+                         "shared_mem": (kb + 1) * 1024, "pdl": True, "when": {"var": T, "min": lo, "max": hi},
+                         "params": ["bytes<128>", "bytes<128>", "out buffer<f32>", "i32", "i32", "i32", "i32", "i32",
+                                    "i32"],
+                         "args": [tmap(1, n, GEMM_T_BM), tmap(0, 0, bn), {"param": 2}, {"param": 6}, {"param": 3},
+                                  {"param": 4}, {"param": 5}, {"i32": GEMM_T_SPLIT[0]}, {"i32": GEMM_T_SPLIT[1]}]})
+        lo = hi + 1
+    launches.append({"entry": "extern:cublas_bf16_tn_f32", "when": {"var": T, "min": lo}})
+    return {"params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32", "i32"],
+            "impl": {"launches": launches}}
+
+
 def is_mla(i):
     return i in MLA_LAYERS
 
@@ -399,6 +430,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32", "i32"],
             "impl": {"launches": [{"entry": "extern:cublas_bf16_tn_f32"}]},
         },
+        **({f"gemm_t{n}": gemm_t_op(n, H) for n in (front, kfused)} if xchg else {}),
         # K1 residual stream
         **({"attnres_rms": {
             "params": ["in buffer<bf16>", "inout buffer<bf16>", "in buffer<f32>", "in buffer<bf16>", "out buffer<bf16>",
@@ -969,14 +1001,18 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     def step(label, op, *args):
         prog.append({"label": label, "op": op, "args": list(args)})
 
+    def f32_op(n, k):
+        """D's own split-K GEMM (gemm_t_op) for its shapes, else cuBLAS."""
+        return f"gemm_t{n}" if f"gemm_t{n}" in ops and k == H else "gemm_f32"
+
     def gemm(label, a, w, c, n, k, m=B):
         """c[m, n] = a[m, k] @ w[n, k]^T, f32."""
-        step(label, "gemm_f32", a, w, c, m, i32(n), i32(k), i32(n))
+        step(label, f32_op(n, k), a, w, c, m, i32(n), i32(k), i32(n))
 
     def proj(label, a, w, c, n, k, m=B, dt="bf16"):
         """A projection whose readers land it: the GEMM lands it (bf16) in P and for D's sums, else f32
         (`dt` the readers' dtype)."""
-        step(label, "gemm_bf16" if dt == "bf16" else "gemm_f32", a, w, c, m, i32(n), i32(k), i32(n))
+        step(label, "gemm_bf16" if dt == "bf16" else f32_op(n, k), a, w, c, m, i32(n), i32(k), i32(n))
 
     def land(label, p, o, n, off, ldc):
         step(label, land_op(n), p, o, i32(n), i32(off), i32(ldc), B)
@@ -1363,7 +1399,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         """Every PF_OPS call names the weight of the GEMM after it (up to PF_MAX bytes) for L2; ar_finalize_rms
         also the next PF_LAST GEMM's, at evict_last, and the ar_attnres_rms after that GEMM the same range to
         put back to evict_normal."""
-        gemms = [(k, c) for k, c in enumerate(prog) if c["op"] in ("gemm_f32", "gemm_bf16")]
+        gemms = [(k, c) for k, c in enumerate(prog) if c["op"].startswith("gemm_")]
         size = lambda w: math.prod(buffers[w["buf"]]["shape"]) * {"bf16": 2, "f32": 4, "u8": 1}[
             buffers[w["buf"]]["dtype"]] - w.get("offset", 0)
         last = {}
