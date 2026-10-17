@@ -19,8 +19,8 @@
 //
 //   grid  (B, HEADS=96, 1)      (grid.x == B exactly, per the ABI; the `B`
 //                               argument itself is therefore never read)
-//   block 128            (one thread per output v-dim in the prologue/epilogue)
-//   smem  static, 3872 B/block (no dynamic smem)
+//   block KDA_THREADS (128; one thread per output v-dim in the prologue/epilogue)
+//   smem  static ~37 KB/block; + 65,536 B dynamic with -DKDA_SMEM_STATE=1
 //
 // Math (per block, b = blockIdx.x, h = blockIdx.y, base = h*128):
 //   q,k,v   = conv_q/k/v[b, base + d]                                   (bf16)
@@ -60,13 +60,23 @@
 //     have to be re-read after dlt is known.
 //   * ROWS_PER_ITER dv rows are in flight per lane (16 B * 4 * RPI bytes of
 //     outstanding loads per thread) to keep enough memory parallelism;
+//   * issues every load that depends only on (b, h) at entry, in one round
+//     trip: the head's 32 KB w_f_b tile into shared memory by cp.async (no
+//     registers), the row's scalars into registers.  The prologue walked ~7
+//     dependent round trips before (7 us of a 9 us call at 8 rows);
+//   * -DKDA_SMEM_STATE=1 also bulk-copies the head's 64 KB state slice into
+//     dynamic shared memory right after the line index, beside the conv
+//     window's loads, so the state read overlaps the whole prologue and the
+//     delta rule runs from shared memory (65,536 B of dynamic smem, ~100 KB a
+//     block: 2 blocks an SM, the build for batches that fit one wave of them).
+//     The register build stays for larger batches (-DKDA_MINB=4: 4 blocks an SM);
 //   * streams rec both ways (__ldcs/__stcs): nothing re-reads it, so it must
 //     not evict the w_f_b tile from L2  (+9% at B=64);
 //   * remaps (blockIdx.x, blockIdx.y) to (b, h) head-fastest, so blocks issued
 //     close in time walk contiguous rec instead of B lines 6.5 MB apart
 //     (+8% at B=64).
-// The w_f_b tile is read with the same lane split, and summed as a pairwise
-// tree -- see the comment on the ga block.
+// The w_f_b tile (swizzled in shared memory) is summed by thread d over its row
+// d as a pairwise tree -- see the comment on the ga block.
 //
 // -DKDA_CONV=1 folds K2 (k3_conv_silu.cu) into the prologue: the block's
 // thread d runs the short conv + SiLU of column base + d of the q, k and v
@@ -165,7 +175,10 @@ typedef __nv_bfloat16 bf16;
 #define KLANES 8
 #define KPER (KD / KLANES) /* 16 */
 #define KVEC (KPER / 4)    /* 4 float4 per lane */
-#define DVGRP (128 / KLANES) /* 16 dv rows covered per pass */
+#ifndef KDA_THREADS
+#define KDA_THREADS 128
+#endif
+#define DVGRP (KDA_THREADS / KLANES) /* dv rows covered per pass */
 
 #if KDA_STREAM
 // rec has no reuse inside the kernel: stream both directions so the lines do
@@ -183,12 +196,29 @@ __device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + __ex
 __device__ __forceinline__ float block_sum(float v, float* sm) {
 #pragma unroll
   for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
-  if ((threadIdx.x & 31) == 0) sm[threadIdx.x >> 5] = v;
+  if ((threadIdx.x & 31) == 0 && threadIdx.x < KD) sm[threadIdx.x >> 5] = v;
   __syncthreads();
   return (sm[0] + sm[1]) + (sm[2] + sm[3]);
 }
 
-extern "C" __global__ __launch_bounds__(128) void kern_k3_kda_core(
+// block_sum of two values with one barrier: the same sums.
+__device__ __forceinline__ void block_sum2(float a, float b, float* sm, float& sa, float& sb) {
+#pragma unroll
+  for (int m = 16; m > 0; m >>= 1) a += __shfl_xor_sync(0xffffffffu, a, m), b += __shfl_xor_sync(0xffffffffu, b, m);
+  if ((threadIdx.x & 31) == 0 && threadIdx.x < KD) sm[threadIdx.x >> 5] = a, sm[4 + (threadIdx.x >> 5)] = b;
+  __syncthreads();
+  sa = (sm[0] + sm[1]) + (sm[2] + sm[3]);
+  sb = (sm[4] + sm[5]) + (sm[6] + sm[7]);
+}
+
+#ifndef KDA_SMEM_STATE
+#define KDA_SMEM_STATE 0
+#endif
+#define KDA_BULKN 16  // the state slice's bulk copies, 4 KB each
+#ifndef KDA_MINB
+#define KDA_MINB 1
+#endif
+extern "C" __global__ __launch_bounds__(KDA_THREADS, KDA_MINB) void kern_k3_kda_core(
 #if KDA_CONV
     const float* __restrict__ gate_partial,
     const float* __restrict__ cw,
@@ -225,23 +255,61 @@ extern "C" __global__ __launch_bounds__(128) void kern_k3_kda_core(
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
   if ((unsigned)(b - span_at[0]) < (unsigned)span) return;
-  const int d = threadIdx.x;
+  // past 128 threads (KDA_THREADS 256) a thread runs the prologue of column d with its twin below, and
+  // writes nothing but shared memory until the delta rule, which every thread takes a share of
+  const int tid = threadIdx.x, d = tid & (KD - 1);
   const int base = h * KD;
 #if LINE_GUARD
   if (line_index[b] < 0) {
-    out[(size_t)b * INNER + base + d] = __float2bfloat16(0.0f);
+    if (tid < KD) out[(size_t)b * INNER + base + d] = __float2bfloat16(0.0f);
     return;
   }
 #endif
 
-  __shared__ float sh_qs[KD];
-  __shared__ float sh_kn[KD];
-  __shared__ float sh_dec[KD];
+  __shared__ __align__(16) float sh_qs[KD];
+  __shared__ __align__(16) float sh_kn[KD];
+  __shared__ __align__(16) float sh_dec[KD];
   __shared__ float sh_v[KD];
   __shared__ float sh_attn[KD];
-  __shared__ float sh_flow[192];   // 8-float groups padded to 12: conflict-free 16-B LDS
-  __shared__ float sh_ga[KD];
+  __shared__ __align__(16) float sh_flow[192];   // 8-float groups padded to 12: conflict-free 16-B LDS
   __shared__ float sh_red[8];
+  __shared__ __align__(16) uint4 sh_tile[KD * 16];  // the head's w_f_b tile, 32 KB
+  __shared__ float sh_gam[KD], sh_gate[KD];
+
+  // Every load that depends on nothing but the indices goes out now, in one round trip: the head's
+  // w_f_b tile into shared memory (cp.async, no registers), the row's scalars into registers.
+  {
+    const uint4* tile = reinterpret_cast<const uint4*>(w_f_b + (size_t)base * KD);
+    const unsigned dst = (unsigned)__cvta_generic_to_shared(sh_tile);
+#pragma unroll
+    for (int i = 0; i < 16 * KD / KDA_THREADS; ++i) {
+      const int q = i * KDA_THREADS + tid, r = q >> 4, c = q & 15;  // chunk c of row r lands at c ^ (r & 15)
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst + (r * 16 + (c ^ (r & 15))) * 16), "l"(tile + q));
+    }
+    asm volatile("cp.async.commit_group;");
+  }
+#if KDA_SMEM_STATE
+  // The head's 64 KB state slice into shared memory by one bulk copy, issued with the window's loads:
+  // its round trip overlaps the whole prologue.
+  extern __shared__ __align__(128) float4 sh_rec[];
+  __shared__ __align__(8) unsigned long long rec_bar;
+  const char* rec_src = reinterpret_cast<const char*>(kda_base) + (long long)line_index[b] * line_bytes + (size_t)h * KD * KD * 4;
+  const unsigned bar = (unsigned)__cvta_generic_to_shared(&rec_bar);
+  if (tid == 0) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(bar));
+    asm volatile("fence.mbarrier_init.release.cluster;");
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bar), "r"(KD * KD * 4));
+#pragma unroll
+    for (int q = 0; q < KDA_BULKN; ++q)
+      asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                   ::"r"((unsigned)__cvta_generic_to_shared(sh_rec) + q * (KD * KD * 4 / KDA_BULKN)),
+                   "l"(rec_src + q * (KD * KD * 4 / KDA_BULKN)), "r"(KD * KD * 4 / KDA_BULKN), "r"(bar) : "memory");
+  }
+#endif
+  const float wsm_beta = wsm_partial[(size_t)b * WSM_LDS + h];
+  const float wsm_flow = wsm_partial[(size_t)b * WSM_LDS + WSM_FA + d];
+  const float dtb = dt_bias[base + d], alog = a_log[h], gam = gamma_o[d];
+  const float gate_raw = gate_partial[(size_t)b * LDS + 3 * INNER + base + d];
 
   // ---- l2norm chain for q and k (all-bf16 chain, f32 sums) ----
 #if KDA_CONV
@@ -254,18 +322,27 @@ extern "C" __global__ __launch_bounds__(128) void kern_k3_kda_core(
     bf16* win = reinterpret_cast<bf16*>(reinterpret_cast<char*>(kda_base) + (long long)line_index[b] * line_bytes +
                                         (long long)HEADS * KD * KD * 4) + c;
 #endif
+    bf16 w[3][3];
+    float x[3], k[3][4];
 #pragma unroll
-    for (int s = 0; s < 3; ++s, win += CONV_STREAM) {
-      const bf16 w0 = win[0], w1 = win[CONV_TAP], w2 = win[2 * CONV_TAP];
-      const bf16 x = __float2bfloat16_rn(gate_partial[(size_t)b * LDS + s * INNER + c]);
-      const float* k = cw + (size_t)s * 4 * INNER + c;
-      win[0] = w1;
-      win[CONV_TAP] = w2;
-      win[2 * CONV_TAP] = x;
-      float y = __bfloat162float(w0) * k[0];
-      y = fmaf(__bfloat162float(w1), k[INNER], y);
-      y = fmaf(__bfloat162float(w2), k[2 * INNER], y);
-      y = fmaf(__bfloat162float(x), k[3 * INNER], y);
+    for (int s = 0; s < 3; ++s) {
+      w[s][0] = win[s * CONV_STREAM], w[s][1] = win[s * CONV_STREAM + CONV_TAP], w[s][2] = win[s * CONV_STREAM + 2 * CONV_TAP];
+      x[s] = gate_partial[(size_t)b * LDS + s * INNER + c];
+#pragma unroll
+      for (int t = 0; t < 4; ++t) k[s][t] = cw[(size_t)s * 4 * INNER + t * INNER + c];
+    }
+#pragma unroll
+    for (int s = 0; s < 3; ++s) {
+      const bf16 xb = __float2bfloat16_rn(x[s]);
+      if (tid < KD) {
+        win[s * CONV_STREAM] = w[s][1];
+        win[s * CONV_STREAM + CONV_TAP] = w[s][2];
+        win[s * CONV_STREAM + 2 * CONV_TAP] = xb;
+      }
+      float y = __bfloat162float(w[s][0]) * k[s][0];
+      y = fmaf(__bfloat162float(w[s][1]), k[s][1], y);
+      y = fmaf(__bfloat162float(w[s][2]), k[s][2], y);
+      y = fmaf(__bfloat162float(xb), k[s][3], y);
       const float sb = __bfloat162float(__float2bfloat16_rn(y));
       qkv[s] = __float2bfloat16_rn(sb * (1.0f / (1.0f + expf(-sb))));
     }
@@ -278,12 +355,13 @@ extern "C" __global__ __launch_bounds__(128) void kern_k3_kda_core(
   const bf16 kv = conv_k[(size_t)b * INNER + base + d];
   sh_v[d] = __bfloat162float(conv_v[(size_t)b * INNER + base + d]);
 #endif
+  sh_gam[d] = gam;  // the epilogue's two, parked: no register lives across the delta rule for them
+  sh_gate[d] = gate_raw;
 
   float qsq = __bfloat162float(__hmul(qv, qv));
   float ksq = __bfloat162float(__hmul(kv, kv));
-  const float qtot = block_sum(qsq, sh_red);
-  __syncthreads();
-  const float ktot = block_sum(ksq, sh_red + 4);
+  float qtot, ktot;
+  block_sum2(qsq, ksq, sh_red, qtot, ktot);
 
   const bf16 qr = __float2bfloat16(rsqrtf(__bfloat162float(__float2bfloat16(qtot)) + L2_EPS));
   const bf16 kr = __float2bfloat16(rsqrtf(__bfloat162float(__float2bfloat16(ktot)) + L2_EPS));
@@ -293,34 +371,27 @@ extern "C" __global__ __launch_bounds__(128) void kern_k3_kda_core(
   sh_kn[d] = knd;
 
   // ---- beta, f_a -> f_b projection, the decay gate ----
-  const float beta = sigmoidf_(__bfloat162float(__float2bfloat16(wsm_partial[(size_t)b * WSM_LDS + h])));
-  sh_flow[d + ((d >> 3) << 2)] = __bfloat162float(__float2bfloat16(wsm_partial[(size_t)b * WSM_LDS + WSM_FA + d]));
+  const float beta = sigmoidf_(__bfloat162float(__float2bfloat16(wsm_beta)));
+  sh_flow[d + ((d >> 3) << 2)] = __bfloat162float(__float2bfloat16(wsm_flow));
+  asm volatile("cp.async.wait_group 0;" ::: "memory");
   __syncthreads();
 
-  // ga[d] = sum_j flow[j] * w_f_b[base+d, j].  This head's 128x128 bf16 tile is
-  // 32 KB of *contiguous* w_f_b, shared by all B rows of the head, so it comes
-  // out of L2.  Read it with the same 8-lanes-per-row split as rec: one warp
-  // instruction then covers 4 rows x 128 B, where a thread-per-row walk touches
-  // 32 distinct 128-B lines per instruction (8x the L1 wavefronts for the same
-  // bytes) and cost 17 us of 140 at B=64.
-  // Accuracy: every flow[j]*w[j] is exact in f32 (8+8 mantissa bits), so the
-  // only error is the summation -- this is a full pairwise tree (4 levels in
-  // the lane over fma-fused pairs, 3 by shuffle), ~7*u instead of ~128*u.  It
-  // matters because ga lands in bf16 before dt_bias, and a flipped landing
-  // moves dec, hence a whole dv row of the state.
+  // ga[d] = sum_j flow[j] * w_f_b[base+d, j], thread d over its own row of the tile. Every
+  // flow[j]*w[j] is exact in f32 (8+8 mantissa bits), so the only error is the summation: a full pairwise
+  // tree, the 16 columns of each of 8 groups (8 rl .. +8 and 64 + 8 rl .. +8) over fma-fused pairs in 4
+  // levels, then the 8 groups in 3. It matters because ga lands in bf16 before dt_bias, and a flipped
+  // landing moves dec, hence a whole dv row of the state.
+  float ga;
   {
-    const int rl = d & (KLANES - 1);       // 8 lanes per w_f_b row
-    const int rg = d >> 3;                 // 16 rows per pass, 8 passes
-    const uint4* tile = reinterpret_cast<const uint4*>(w_f_b + (size_t)base * KD);
-    const float4 fa = *reinterpret_cast<const float4*>(sh_flow + 12 * rl);
-    const float4 fb = *reinterpret_cast<const float4*>(sh_flow + 12 * rl + 4);
-    const float4 fc = *reinterpret_cast<const float4*>(sh_flow + 96 + 12 * rl);
-    const float4 fd = *reinterpret_cast<const float4*>(sh_flow + 96 + 12 * rl + 4);
+    const uint4* row = sh_tile + d * 16;
+    float g[KLANES];
 #pragma unroll
-    for (int it = 0; it < KD / DVGRP; ++it) {
-      const int row = it * DVGRP + rg;
-      const uint4 a = tile[row * 16 + rl];        // cols 8*rl .. +8
-      const uint4 c = tile[row * 16 + 8 + rl];    // cols 64 + 8*rl .. +8
+    for (int rl = 0; rl < KLANES; ++rl) {
+      const uint4 a = row[rl ^ (d & 15)], c = row[(8 + rl) ^ (d & 15)];
+      const float4 fa = *reinterpret_cast<const float4*>(sh_flow + 12 * rl);
+      const float4 fb = *reinterpret_cast<const float4*>(sh_flow + 12 * rl + 4);
+      const float4 fc = *reinterpret_cast<const float4*>(sh_flow + 96 + 12 * rl);
+      const float4 fd = *reinterpret_cast<const float4*>(sh_flow + 96 + 12 * rl + 4);
       float p[8];
       p[0] = fmaf(fa.x, BFLO(a.x), fa.y * BFHI(a.x));
       p[1] = fmaf(fa.z, BFLO(a.y), fa.w * BFHI(a.y));
@@ -334,24 +405,25 @@ extern "C" __global__ __launch_bounds__(128) void kern_k3_kda_core(
       for (int st = 1; st < 8; st <<= 1)
 #pragma unroll
         for (int i = 0; i < 8; i += 2 * st) p[i] += p[i + st];
-      float g = p[0];
-#pragma unroll
-      for (int msk = 1; msk < KLANES; msk <<= 1) g += __shfl_xor_sync(0xffffffffu, g, msk);
-      if (rl == 0) sh_ga[row] = g;
+      g[rl] = p[0];
     }
+#pragma unroll
+    for (int st = 1; st < KLANES; st <<= 1)
+#pragma unroll
+      for (int i = 0; i < KLANES; i += 2 * st) g[i] += g[i + st];
+    ga = g[0];
   }
-  __syncthreads();
 
-  const float raw = __bfloat162float(__float2bfloat16(sh_ga[d])) + dt_bias[base + d];
-  sh_dec[d] = __expf(LB * sigmoidf_(__expf(a_log[h]) * raw));
+  const float raw = __bfloat162float(__float2bfloat16(ga)) + dtb;
+  sh_dec[d] = __expf(LB * sigmoidf_(__expf(alog) * raw));
 
   // c = sum_k kn[k]*qs[k]; lets attn ride along with the m reduction.  Its
   // internal barrier is also what publishes sh_dec/sh_qs/sh_kn to the block.
   const float ckq = block_sum(knd * qsd, sh_red);
 
   // ---- delta rule over rec ----
-  const int kl = d & (KLANES - 1);   // 8 lanes over k
-  const int dvl = d >> 3;            // 16 dv rows per pass
+  const int kl = tid & (KLANES - 1);   // 8 lanes over k
+  const int dvl = tid >> 3;            // DVGRP dv rows per pass
   float* rec = reinterpret_cast<float*>(reinterpret_cast<char*>(kda_base) +
                                         (long long)line_index[b] * line_bytes) +
                (size_t)h * KD * KD;
@@ -369,6 +441,12 @@ extern "C" __global__ __launch_bounds__(128) void kern_k3_kda_core(
   }
 
   float4* recv = reinterpret_cast<float4*>(rec) + kl;   // + dv*32 + 8*j
+#if KDA_SMEM_STATE
+  const float4* srcv = sh_rec + kl;
+  asm volatile("{\n.reg .pred p;\nW: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], 0;\n@!p bra W;\n}" ::"r"(bar) : "memory");
+#else
+  const float4* srcv = recv;
+#endif
 
 #pragma unroll 1
   for (int it = 0; it < KD / (DVGRP * ROWS_PER_ITER); ++it) {
@@ -377,9 +455,13 @@ extern "C" __global__ __launch_bounds__(128) void kern_k3_kda_core(
 #pragma unroll
     for (int r = 0; r < ROWS_PER_ITER; ++r) {
       dv[r] = (it * ROWS_PER_ITER + r) * DVGRP + dvl;
-      const float4* p = recv + (size_t)dv[r] * 32;
+      const float4* p = srcv + (size_t)dv[r] * 32;
 #pragma unroll
+#if KDA_SMEM_STATE
+      for (int j = 0; j < KVEC; ++j) s[r][j] = p[8 * j];
+#else
       for (int j = 0; j < KVEC; ++j) s[r][j] = LDST(p + 8 * j);
+#endif
     }
 #pragma unroll
     for (int r = 0; r < ROWS_PER_ITER; ++r) {
@@ -420,8 +502,8 @@ extern "C" __global__ __launch_bounds__(128) void kern_k3_kda_core(
   const bf16 attnb = __float2bfloat16(sh_attn[d]);
   const float af = __bfloat162float(attnb);
   const float atot = block_sum(af * af, sh_red);
-  const bf16 o = __float2bfloat16(af * rsqrtf(atot / (float)KD + RMS_EPS) * gamma_o[d]);
+  const bf16 o = __float2bfloat16(af * rsqrtf(atot / (float)KD + RMS_EPS) * sh_gam[d]);
   const bf16 g = __float2bfloat16(
-      sigmoidf_(__bfloat162float(__float2bfloat16(gate_partial[(size_t)b * LDS + 3 * INNER + base + d]))));
-  out[(size_t)b * INNER + base + d] = __hmul(o, g);
+      sigmoidf_(__bfloat162float(__float2bfloat16(sh_gate[d]))));
+  if (tid < KD) out[(size_t)b * INNER + base + d] = __hmul(o, g);
 }

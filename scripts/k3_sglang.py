@@ -100,20 +100,22 @@ def kda_core(op: dict, line: int, h: int, modules: dict) -> tuple[dict, dict]:
     params = op["params"]
     rec = params.index("inout state")
     assert params[rec + 1] == "in buffer<i32>", f"`kda_core` params {params}"
-    (l,) = op["impl"]["launches"]
-    args = l["args"]
-    at = args.index({"i64": line})
-    assert args[at - 2:at] == [{"param": rec}, {"param": rec + 1}], f"`kda_core` launch args {args}"
-    module, entry = variant(l["module"], modules, CONV_TAP_MAJOR=1, LINE_GUARD=1)
     shift = lambda a: {"param": a["param"] + 2} if a.get("param", -1) > rec + 1 else a
-    launch = {**l, "module": module,
-              "params": l["params"][: at + 1] + ["inout state", "in buffer<i32>", "i64"] + l["params"][at + 1:],
-              "args": args[: at - 2] +
-                      [{"param": rec}, {"param": rec + 2}, {"i64": h * REC_HEAD},
-                       {"param": rec + 1}, {"param": rec + 3}, {"i64": h * CONV_HEAD}] +
-                      [shift(a) for a in args[at + 1:]]}
+    launches, entries = [], {}
+    for l in op["impl"]["launches"]:
+        args = l["args"]
+        at = args.index({"i64": line})
+        assert args[at - 2:at] == [{"param": rec}, {"param": rec + 1}], f"`kda_core` launch args {args}"
+        module, entry = variant(l["module"], modules, CONV_TAP_MAJOR=1, LINE_GUARD=1)
+        launches.append({**l, "module": module,
+                         "params": l["params"][: at + 1] + ["inout state", "in buffer<i32>", "i64"] + l["params"][at + 1:],
+                         "args": args[: at - 2] +
+                                 [{"param": rec}, {"param": rec + 2}, {"i64": h * REC_HEAD},
+                                  {"param": rec + 1}, {"param": rec + 3}, {"i64": h * CONV_HEAD}] +
+                                 [shift(a) for a in args[at + 1:]]})
+        entries[module] = entry
     params = params[: rec + 1] + ["inout state", "in buffer<i32>", "in buffer<i32>"] + params[rec + 2:]
-    return {**op, "params": params, "impl": {**op["impl"], "launches": [launch]}}, {module: entry}
+    return {**op, "params": params, "impl": {**op["impl"], "launches": launches}}, entries
 
 
 def on_sglang(m: dict) -> dict:

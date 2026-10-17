@@ -150,6 +150,8 @@ CTX = "ctx"
 TP_AR_GRID = 152  # the GB300's SM count, a multiple of the cluster of 8 and under the 256-row flag table
 TP_TIMEOUT_NS = 30_000_000_000  # a deadline that passes traps: long enough for any start skew
 DCP_GRID = 256  # two exchange blocks fit an SM: every block resident with room to spare
+KDA_STATE_SMEM = HEAD_DIM * HEAD_DIM * 4  # k3_kda_core.cu's KDA_SMEM_STATE build: a head's state slice
+KDA_SMEM_BLOCKS = 2 * 152  # ... and two of its blocks an SM: the batches of one wave of them
 CAND_SMEM = NB_MAX * H * 2  # k3_ar_fused.cu: a row's snapshots prefetched into shared memory
 PF_PARAMS = ["in buffer<bf16>", "i64"]  # k3_ar_fused.cu: the next GEMM's weight, prefetched into L2
 PF_OPS = {"ar_attnres_rms", "ar_finalize_rms", "land_add2_attnres_rms_snap"}
@@ -381,6 +383,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     inner_l, fused_l = hl * HEAD_DIM, 4 * hl * HEAD_DIM
     line_l = hl * HEAD_DIM * HEAD_DIM * 4 + 3 * (3 * inner_l * 2)
     kda_defs = {"HEADS": hl} if tp > 1 else None
+    kda_smem_rows = KDA_SMEM_BLOCKS // hl
     # P's KDA projections, and a D member's, are one GEMM: its heads' q | k |
     # v | g, then beta's columns and f_a's, the wsm partial read from the same
     # row, padded to WSM columns with f_a's first rows again (nobody reads
@@ -476,10 +479,14 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             "params": ["in buffer<f32>", "in buffer<f32>", "in buffer<f32>", "in buffer<bf16>", "in buffer<f32>",
                        "in buffer<f32>", "in buffer<f32>", "inout state", "in buffer<i32>", "i64", "out buffer<bf16>",
                        "i32", "in buffer<i32>", "i32"],
-            "impl": {"launches": [launch("k3_kda_core", "kern_k3_kda_core", grid=[T, hl, 1],
-                                         defines={"KDA_CONV": 1, **(kda_defs or {}),
-                                                  **({"LDS": kfused, "WSM_LDS": kfused, "WSM_FA": hl}
-                                                     if kfused else {})})]},
+            # a batch whose blocks fit two an SM takes the build that copies the state into shared memory
+            # at entry; a larger one the register build, four an SM (k3_kda_core.cu)
+            "impl": {"launches": [
+                launch("k3_kda_core", "kern_k3_kda_core", grid=[T, hl, 1], smem=smem, when={"var": T, **when},
+                       defines={"KDA_CONV": 1, **(kda_defs or {}), **defs,
+                                **({"LDS": kfused, "WSM_LDS": kfused, "WSM_FA": hl} if kfused else {})})
+                for defs, smem, when in (({"KDA_SMEM_STATE": 1}, KDA_STATE_SMEM, {"max": kda_smem_rows}),
+                                         ({"KDA_MINB": 4}, 0, {"min": kda_smem_rows + 1}))]},
         },
         "mla_attn": cake_attn_op(seqs_max) if fp8 else mla_attn_op(seqs_max, mla_split_max, reduce=not xchg,
                                                                       slots=mla_slot_ranges(mla_split_max, seqs_max)),
