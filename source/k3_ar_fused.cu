@@ -377,6 +377,9 @@ __device__ __forceinline__ void halve(float* v, int lane) {
   if constexpr (O > 1) halve<(N > 1 ? N / 2 : 1), O / 2>(v, lane);
 }
 
+#ifndef BS_SMALL
+#define BS_SMALL 8
+#endif
 // Every thread of the 32-warp block gets the block's totals of its N values: the warps'
 // totals meet in `red` behind one barrier, and every warp sums them itself.
 template <int N>
@@ -386,12 +389,25 @@ __device__ __forceinline__ void block_sum(float (&v)[N], float* red, int t) {
   halve<N, 16>(v, lane);
   if ((lane & ((1 << SH) - 1)) == 0) red[(lane >> SH) * RED_LD + warp] = v[0];
   __syncthreads();
+  if constexpr (N <= BS_SMALL) {
 #pragma unroll
-  for (int j = 0; j < N; ++j) v[j] = red[j * RED_LD + lane];
-  halve<N, 16>(v, lane);
-  const float mine = v[0];
+    for (int j = 0; j < N; ++j) v[j] = red[j * RED_LD + lane];
+    halve<N, 16>(v, lane);
+    const float mine = v[0];
 #pragma unroll
-  for (int j = 0; j < N; ++j) v[j] = __shfl_sync(0xffffffffu, mine, j << SH);
+    for (int j = 0; j < N; ++j) v[j] = __shfl_sync(0xffffffffu, mine, j << SH);
+  } else {
+    // warp w sums value w, the totals behind one more barrier: N x 5 shuffles a block, not 32 x 3N
+    if (warp < N) {
+      float x = red[warp * RED_LD + lane];
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) x += __shfl_xor_sync(0xffffffffu, x, o);
+      if (lane == 0) red[warp * RED_LD + 32] = x;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < N; ++j) v[j] = red[j * RED_LD + 32];
+  }
 }
 
 // candidate x's sum of squares and dot with sw over this thread's eight
