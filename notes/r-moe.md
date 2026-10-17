@@ -327,7 +327,10 @@ Before that, as a dependent of FC2:
   block-scaled tcgen05 MMA and, for numerics, the GEMM.md proof (FC1's mxfp8 output requantizes any
   change of summation order).
 - **The shared projection on a graph branch beside FC1 / FC2 (direction 4): not worth a runtime change.**
-  Beside moe_front it costs only its tail past the row blocks (above). On a parallel branch its 112 CTAs
+  The runtime cannot express a branch: a launch is module / entry / params / grid / block / shared_mem /
+  cluster / pdl / args (+ `when`) in the kern checkout's `tools/kern_manifest.py` (its `docs/runtime.md`
+  is not in this checkout), one stream, PDL the only overlap; the merged moe_front is what PDL allows.
+  Beside moe_front the projection costs only its tail past the row blocks (above). On a parallel branch its 112 CTAs
   (one an SM, ~3.5 us each, bound by their 98 KB weight loads) would take ~2.6 us of whole-GPU SM time from
   FC1's / FC2's waves, more than that tail at 8-36 rows; only FC1's last-wave idle SMs could absorb it for
   free, and no launch-level scheduler can aim there (the persistent kernel above can).
