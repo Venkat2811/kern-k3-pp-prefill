@@ -4,6 +4,16 @@ Kernels: `k3_kda_core`, MLA (`k3_mla_prep`, `k3_mla_absorb_mma`, the DSL
 `mla_decode_h96_p64` and its grid), the DCP exchange (`k3_dcp`).
 Previous lane notes: `notes/d-attn.md` (round 1, every idea tried there).
 
+## Status (04:15 UTC)
+
+Branch rebased on main 21a9174 (r-ar merged): check PASS bit-identical, D
+3.295 / 3.295 → 3.294 / 3.293. New on it: absorb on tcgen05 (a block a head,
+W_UK by TMA; -0.25..-2.05 µs a call from 8 rows, +0.3 at 1 row) and the
+fp8 builds' e4m3 cast in hardware (absorb fp8 16.4 → 8.1 µs at 48 rows;
+`--kv fp8` only). Tried and dropped since: W_UK into L2 from mla_prep, the
+next KDA layer's state from kda_core (both slower; numbers below), the
+fp8 query on tcgen05.
+
 ## Status (03:40 UTC)
 
 Merged as d85613c. The orchestrator's 02:52 task 1 (a new MLA kernel) is
@@ -42,6 +52,7 @@ next op was taken.
 | kda ROWS_PER_ITER 1 / 2 (f8bd7e6), copy issue from 16 threads | 13.9 | 3.431 (vs 3.433) |
 | rebased on main 95bc0b0; slot tiers reverted (skewed batches) | 13.7 | **3.386 vs main 3.414** (-0.84%, same lease, 2 rounds) |
 | absorb on tcgen05, a block a head (697a625; vs 68ebced) | 13.7 | 3.367 / 3.368 vs 3.369 / 3.369 (same lease, 2 rounds) |
+| rebased on main 21a9174 (absorb on tcgen05 + the fp8 cast) | 13.7 | **3.294 / 3.293 vs main 3.295 / 3.295** (same lease, 2 rounds; check bit-identical) |
 
 Launches counted 13.7 a layer against main's 12.9: kda_core's second `when`
 launch (S / R builds); one of them runs, so executed launches are unchanged.
