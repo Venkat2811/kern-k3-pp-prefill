@@ -154,6 +154,25 @@ Tried and dropped (A/B in one lease each, ms/step):
   griddepcontrol.wait (work/h/k3_gemm_pre.cu, bit-identical 1..64 rows): 8.6 vs 5.2 us alone, 7.1 vs 4.7 after a
   9 us PDL predecessor: A's 64-row boxes through a 3-deep ring after the wait cost more than the preload saves.
 
+## Lever 4: FlashInfer's TGV GEMM and SGLang's CuTe-DSL bf16 GEMM
+
+`work/h/tgv.cu` builds FlashInfer's `tgv_gemm_host` (include/flashinfer/gemm/tgv_gemm.cuh, its 10 configs: 64x8 /
+64x16 / 64x32 at 6-12 stages, 128x16) against kern's bf16 call (cuBLASLt heuristic #0), weight over 8 copies.
+Every config is **bit-identical** to cuBLAS (one K-ascending tcgen05 chain an output, as nvjet's split-K 1), but the
+best of them is slower cold on every shape, us a call at 1 / 8 / 16 / 24 rows:
+
+| shape | cuBLAS cold (hot) | best TGV cold (hot) |
+|---|---|---|
+| o_proj 7168 x 1536 | 5.22 / 5.25 / 5.27 / 5.96 (4.66 / 3.23 / 3.30 / 4.13) | 6.04 / 6.03 / 6.07 / 6.20 (4.93 / 4.25 / 4.07 / 4.36) |
+| sh_down 7168 x 768 | 3.04 / 2.80 / 2.81 / 3.54 (3.04 / 2.30 / 2.36 / 2.86) | 3.38 / 3.47 / 3.53 / 3.65 (3.37 / 3.19 / 3.22 / 3.48) |
+| lat_up 7168 x 3584 | 9.81 / 9.78 / 9.81 / 9.85 (7.98 / 5.18 / 5.36 / 5.68) | 10.31 / 10.31 / 10.31 / 10.57 (6.27 / 5.92 / 5.96 / 6.20) |
+
+Its one win is lat_up hot at 1 row (6.3 vs 8.0: cuBLAS's 1-row kernel is 2.8 us slower than its 8-row one from L2),
+a shape the bench does not weight; not worth a CuTe kernel in the manifest. The CuTe-DSL version
+(sglang/.../cutedsl_bf16_gemm.py) is the same design (64 x 8-256 tiles, 6-12 stages, plus a 2-CTA mode whose 128-row
+pair tiles still cover n = 7168 with 56 pairs); it needs the CUTLASS Python DSL and torch, which these hosts do not
+have, so it is not measured.
+
 ## Own f32 GEMM (source/k3_gemm_f32.cu)
 
 Round 2's reason for not beating cuBLAS: the main loop. What made it competitive here, in order (harness
