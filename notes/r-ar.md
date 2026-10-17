@@ -6,6 +6,17 @@ fused kernels' row math).
 
 Bench: `loop/d/bench loop/out/d-l16-tp8.json`. Check: `loop/d/check loop/out/d-l4-tp8.json` (x3 for protocol).
 main at the start: 12.9 launches/layer, 3.486-3.491 ms/step (same-lease A/B, below).
+Rebased onto main 95bc0b0 (r-gemm's L2 loads in the exchanges, 3.411-3.416 ms/step): the branch's first five
+commits on it were flat (3.418-3.420: 8-24 rows faster, 36/48 rows +20 us, the spread push delaying the idle
+blocks' weight loads); with the spread only below 33 rows, 3.404-3.405 (-0.2%).
+
+## Where it stands (02:55 UTC)
+
+12.9 launches/layer (207 a step, unchanged). Same-lease A/B vs main 95bc0b0 (3.407-3.410 ms/step):
+- push spread only below 33 rows: 3.404-3.405
+- the closing add's prefetch capped at 16 MB (`LAND_PF_MAX`): 3.382-3.390
+- the all-reduces' load-window stamp a phase, no l2_close grid count: 3.371-3.374 (-1.1% vs main)
+All bit-identical vs main (loop/d/check x3).
 
 ## Tools (work/ar/, not committed unless kept)
 
@@ -81,3 +92,88 @@ Measured (same lease, 2 rounds, ms/step): main 3.488 / 3.489, main without the p
 3.485 / 3.485, cand without the prefetch 3.524 / 3.521. Without the prefetch the exchange work is worth
 -14..-18 us a step (0.4-0.5%); with it, -3..-4 us. So the exchanges' latency reaches the step only if the weight
 stream starts earlier than the exchange, or where the exchange outlasts the stream.
+
+## The references, as written, next to ours (`--test ref`, work/ar/ref_ar.cu)
+
+FlashInfer / TRT-LLM `allreduce_fusion_kernel_oneshot_lamport` (trt: kARResidualRMSNorm; trtar: kAllReduce): its
+token-per-cluster layout and launcher geometry (224 threads x cluster 4 at 7168 wide, 448 x 2 past 38 rows), push,
+clear of the buffer two calls back, -0.0 poll, grid counter; SGLang `all_reduce_push_res_kernel` (sgl: residual
+add, no norm) with its `multimem.st` replaced by 8 unicast stores (no multicast object in the runtime), its
+two-phase per-block buffers, zero-atom marker, poller re-zeroing. Ours: `kern_k3_ar_attnres_rms` at nb 0 (residual
+add, the attention residual's mix of nothing, norm). 8 ranks over 2 trays, rank 0, us per call, **spacer 5 us
+included** (subtract 5):
+
+| 7168 wide | 1 | 8 | 16 | 24 | 32 | 48 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ours nb 0 | 13.25 | 13.79 | 14.88 | 15.70 | 15.84 | 16.11 | 16.52 |
+| ours nb 1 | 14.34 | 14.74 | 15.97 | 17.06 | 16.93 | 17.61 | 17.88 |
+| trt (+ residual + rms) | 12.42 | 12.83 | 14.20 | 15.29 | 16.66 | 19.39 | 21.98 |
+| trtar (sum only) | 10.79 | 11.33 | 12.56 | 13.93 | 15.29 | 17.75 | 20.21 |
+| sgl (+ residual) | 9.80 | 10.51 | 11.74 | 13.11 | 14.48 | 17.20 | 19.80 |
+
+| 10752 wide | 1 | 8 | 16 | 24 | 32 | 48 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ours (`ar_finalize_rms`: + MoE finalize, latent norm) | 14.34 | 14.86 | 16.66 | 17.18 | 17.29 | 17.88 | 18.16 |
+| trt (+ residual + rms over 10752) | 12.40 | 13.49 | 15.70 | 17.73 | 19.66 | 23.89 | 27.85 |
+| trtar | 10.65 | 11.99 | 13.93 | 15.97 | 17.88 | 22.25 | 26.21 |
+| sgl | 9.83 | 11.20 | 13.11 | 15.16 | 17.20 | 21.06 | 25.53 |
+
+From 24 rows ours is the fastest (two-shot from 20 rows, the push spread over the grid); the references are one-shot
+to 128 tokens. Below 24 rows ours is 0.4-1 us behind TRT's fused one-shot and ~2.5-3.5 us behind SGLang's push (which
+does no norm).
+
+Ablation of ours at 1 / 8 / 16 rows (spacer 0, same lease; us per call): ours 8.23 / 8.85 / 10.24; without the row
+epilogue 7.78 / 8.30 / 9.56; also without main's L2 bookkeeping (l2_load_while / l2_demote / l2_arrive / l2_close,
+pf_bytes 0) 6.96 / 7.78 / 9.01; trtar 5.60 / 6.42 / 7.78; sgl 4.78 / 5.46 / 6.83; an empty 152-block launch 1.50
+(1024 or 128 threads, with or without 112 KB of dynamic smem: the same). So at <= 16 rows our protocol itself is
+~2.2 us behind SGLang's push and ~1.4 behind TRT's: l2_close's grid counter (a __syncthreads and an atomic a block
+before the grid ends) is 0.8 of it.
+
+## In the step (nsys, rank 0/1/4, work/ar/expo.py: time on the step's frontier, i.e. a kernel's end minus the end
+## of the kernel before it)
+
+| us / step | 8 rows x 64k (2.41 ms) | 48 rows x 64k (4.39-4.58 ms) |
+|---|---:|---:|
+| ar_finalize_rms (16 calls) | 278-344 | 484-507 |
+| ar_attnres_rms (17) | 249-298 | 400-418 |
+| land_add2_attnres_rms (15) | 99-101 | 119-121 |
+| head_argmax (1) | 12-14 | 51-53 |
+| embed_rms_plan (1) | 6 | 6 |
+
+- An all-reduce's frontier time is the protocol, the wait for the last rank (EP skew before ar_finalize) and the
+  next weight's load window (l2_load_while runs AR_GRACE_NS = 2.5 us past the first row's data): ar_attnres at
+  48 rows ends 13-17.5 us after its o_proj ends (alone: ~10 us), the next GEMM ends 13-16 us after it.
+- The closing add ends 5.2-7.1 us after lat_up ends (it launches only ~1 us before): alone it is 3.96 / 4.07 /
+  4.10 / 4.64 us at 1 / 8 / 32 / 48 rows with no prefetch, and 6.12 / 7.07 / 7.35 / 7.75 us prefetching the
+  92 MB qkvg weight (16 MB: +0.3, 48 MB: +1 us): the 576 idle blocks' prefetch issue holds the grid the qkvg GEMM
+  waits on.
+
+## Tried and dropped
+
+| idea | harness | step | kept |
+|---|---|---|---|
+| ar_attnres_rms's row epilogue over a cluster of 4 (kern_k3_ar_attnres_rms_cl, rows <= 38 by `when`) | -0.5..-1.0 us a call at 1-32 rows, bit-identical | 3.404 -> 3.473 (+2%; 36 rows +220 us): clusters of 4 cannot make all 152 blocks co-resident (GPC packing), and the protocol needs every block resident: a deadlock risk | no |
+
+Block 0's stamps at 1 row (ns from the first block's entry, ar_attnres_rms nb 1, harness without PDL): push and
+clear issued 2080, the row's data in 5472, exit 6976; 8 rows: 2144 / 5728-6272 / 7776; 32 rows: 1984 / 6720-7872 /
+9440. In the step the open (state, handshake, slot pointers) runs before griddepcontrol.wait under the GEMM; after
+the wait it is x's load, the push, ~3.4 us to the slowest peer's data, the epilogue (~1.5 us at nb 1) and the exit.
+The epilogue sits under the load window (AR_GRACE_NS = 2.5 us past the first row's data), so the grid's end is the
+window's, not the row's.
+
+| land prefetch / load-window idea | step (ms) | kept |
+|---|---|---|
+| closing add's prefetch hints capped at 0 / 8 / 12 / 16 / 24 / 32 / 48 MB (was the whole next weight, 92 MB for qkvg) | main 3.407-3.410; none 3.399-3.400; 3.390 / 3.392 / 3.391 / 3.382-3.390 / 3.397-3.408 / 3.389-3.391 / 3.394-3.397 | 16 MB |
+| the hints stop 1 / 2 / 3 us after the block starts (whole weight) | 3.403 / 3.404 / 3.405 | no |
+| l2_close's grid count replaced by a stamp a phase | 3.390 -> 3.371 / 3.374 | yes |
+
+## Runtime proposal: multicast for the exchanges
+
+`multimem.st` to a multicast alias of `tp_ar_lamport` makes a one-shot push one copy of the partial out of each rank
+(the switch fans it out) instead of 8 unicast copies, and the two-shot's gather one store. Round 2 (agent/x-mcast,
+f07e2f9) measured it with k3_step creating the object (rank 0 cuMulticastCreate, its fabric handle shared beside the
+NCCL id, every rank cuMulticastAddDevice, binds its own mapping by address, maps the alias, writes the alias into a
+`tp_ar_lamport_mc` u64 buffer): one-shot 7168 wide 8.06 / 8.36 / 9.16 / 10.25 -> 6.92 / 8.05 / 9.31 / 10.53 us at
+8 / 16 / 24 / 32 rows, two-shot 8.07-8.31 flat; in the step -0.25% (3.484 -> 3.475). What the runtime would need: a
+buffer kind `multicast_of: <peer buffer>` that kern creates after the peers' handles are imported and whose value is
+the alias, so a manifest can pass it to a launch. Not shipped (the manifest must run on today's kern).
