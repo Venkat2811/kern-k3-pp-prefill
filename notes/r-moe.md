@@ -224,6 +224,14 @@ Before that, as a dependent of FC2:
 
 ## Proposals
 
+- **For r-ar: launch `ar_finalize_rms` as a programmatic dependent of FC2** (measured, not committed: the
+  kernel is r-ar's). Since `939a424` nothing sits between FC2 and `ar_finalize_rms` (sh_down used to). In
+  `kern_k3_ar_finalize_rms` add `asm volatile("griddepcontrol.wait;" ::: "memory");` right after
+  `lamport_open(...)` (it touches only the all-reduce's own state; everything after reads FC2's or
+  earlier outputs), and `"pdl": True` on its launch in gen_stage.py. On HEAD 1384303: 3.4373 -> 3.4183
+  ms/step (-0.55%, 3 interleaved rounds in one lease), loop/d/check bit-identical (run it 3 times
+  before merging: it is a Lamport kernel). work/arpdl.cu has the one-line change.
+
 - **EP balance (largest MoE lever, outside the fixed layout).** Simulated on the dumped real routing
   (`work/epsim.py`, 64 rows x 160 steps x 15 layers; a replicated expert goes to the holder with fewer
   touched experts so far, which every rank can compute from the same picks): busiest rank's touched
