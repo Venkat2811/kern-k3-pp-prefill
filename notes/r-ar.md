@@ -23,6 +23,24 @@ Two commits on main fd5c92c (3.244-3.247 ms/step, same lease):
   flat. It guards the merge with r-moe's branch, which moves sh_down out from between fc2 and this all-reduce:
   without it the pre-wait read of fc2's output would race. A d-l4 copy with early = 0 checks bit-identical.
 
+## The per-snapshot cost at production's counts (05:40 UTC)
+
+In the step (nbx manifests above) an attention all-reduce costs ~0.3 us a snapshot (nb 8 ~10.2 us against ~8
+at nb 1), the closing add ~0.2 (4.4 against 3.1). The production step runs mostly nb 3-8.
+- **ccc5111 the softmax's division on the candidate's lane** (each thread divided e_c / den for every c; now lane
+  c divides once and the warp broadcasts, k3_residual.cu's way): harness nb 2-8 -0.1..-0.45 us, nb 1 flat,
+  bench flat, bit-identical. In the closing add (256 threads a row an SM) no gain: not applied there.
+- Fine stamps (harness, block 0, us from entry, nb 1 / 2 / 4 / 8, 8 rows, no load window): open done 0.77 /
+  0.83 / 1.54 / 1.47 (the row's snapshot copies are issued before lamport_open's barrier), push done 1.86 /
+  2.02 / 2.91 / 3.36, snapshot scores 2.34 / 2.66 / 3.84 / 4.67 (block_sum<2N> 0.29 / 0.45 / 0.64 / 0.93),
+  row data in 6.05 / 5.60 / 6.82 / 7.68, done 7.65 / 7.30 / 8.83 / 10.21. Single replays, noisy; the hot
+  harness also runs at whatever clock an idle GPU holds, so its ALU phases read slower than the step's.
+- Push runs dealt from block B on (push_at: the row blocks, which load the snapshots, push nothing): this rank's
+  push done earlier (nb 1 1.86 -> 1.41, nb 8 3.39 -> 2.11) but the row's data not (every call per harness
+  within +-0.2 us); step A/B 3 rounds 3.230-3.240 vs 3.232-3.236: flat. Reverted.
+- Issuing the snapshot copies after the push instead of at entry: no change at nb 1 or 8 (harness).
+- nb >= 4 entries spill 24-40 bytes at the 64-register cap (sc[] across the poll; Lamport's slot pointers).
+
 ## Done table
 
 ba3b52b (27a664e runs the same path), nsys, all 8 ranks. Own time = the last-arriving rank's: end minus the
