@@ -150,7 +150,9 @@ A/B shapes, rows × 8k (and 32 × 32k), the branch at 6029a75:
 
 Bench shapes (8 / 24 / 36 rows × 64k, 48 × 128k): kda 6.45 / 9.15 / 11.65 /
 13.68; DSL 21.9 / 46.7 / 65.0 / 160.9 (floors 10.3 / 31 / 46 / 123);
-absorb 5.0 / 5.8 / 6.7 / 6.9; prep 1.6-1.9 after 41d420d.
+absorb 5.0 / 5.8 / 6.7 / 6.9; prep 1.6-1.9 after 41d420d. Absorb after
+697a625 (tcgen05, a block a head), in the step: 4.98 at 8 × 64k, 5.31 at
+48 × 128k (one GPU 4.64 / 4.80 / 5.09 / 5.12 at 8 / 24 / 36 / 48 rows).
 
 Named limits for what is not within 1.15x:
 - **kda_core, 1-24 rows** (shared-memory build): a latency chain, not bytes.
