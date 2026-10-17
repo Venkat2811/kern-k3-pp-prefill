@@ -134,11 +134,17 @@ Named limits for what is not within 1.15x:
   from smem + its 64 KB of stores 1.9 (stores alone 0.55; 1.4 at 16-24 rows,
   the L2 write rate). Its floor is the dependent chain launch → line index
   → state → one pass → write-back, ~4.5-5 µs; it measures 5.8.
-- **kda_core, 26-64 rows** (register build): every block of the batch is
-  resident at once and in the same phase, so the 3-4 µs prologue does not
-  overlap the state stream (DRAM read = state + inputs, as round 1 measured);
-  at 64 rows 768 blocks are 1.26 waves at 4 an SM. Overlapping them needs a
-  persistent pipeline (item i+1's prologue under item i's stream): not done.
+- **kda_core, 26-64 rows** (register build): every block is resident at
+  once and in the same phase, so the prologue does not overlap the state
+  read. Ablated (one GPU, cold): without the state 6.2 / 6.6 / 7.6 µs at
+  26 / 36 / 48 rows (4.6 at 8: four blocks an SM contend; the per-block
+  32 KB tile alone is 0.5 / 0.65 / 0.9 µs of it); the state adds 3.6 / 4.5 /
+  5.5 µs, its read time. Overlapping the two needs a block's 64 KB of state
+  on chip during its prologue: at 4 blocks an SM that is the whole register
+  file. Staged in shared memory it loses at 2 an SM (S build, 2 waves from
+  26 rows) and at 3 (tile in registers, 69 KB: 36 rows 11.8 vs 11.0 µs);
+  a quarter of the state loaded early into registers spills. At 64 rows
+  768 blocks are 1.26 waves at 4 an SM. Bytes are the minimum (ncu above).
 - **mla_attn**: FlashInfer's prebuilt CuTe-DSL kernel (no source build: the
   cutlass DSL package is absent; no PDL in the cubin). Its grid is now the
   plan's slots; the plan is near the kernel's best (uniform splits a row,
