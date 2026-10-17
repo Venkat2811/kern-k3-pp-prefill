@@ -9,10 +9,12 @@ them in the TP8 / EP8 / DCP8 decode step. Main at the start: 3.486 ms/step weigh
   `79e5da7` (moe_front sorts only the keys above the 16th largest warp maximum, bit-identical),
   `9652f64` (tau by REDUX of the score bits, table counts zeroed early, bit-identical),
   `9eb4ece` (the shared expert's down projection runs beside moe_front as a non-waiting programmatic
-  dependent fed by per-row flags, bit for bit cuBLASLt's).
+  dependent fed by per-row flags, bit for bit cuBLASLt's), `fd69491` (sh_down reads each fragment once
+  up to 24 rows: two warps x 32 rows; eight warps x 16 rows above, bit-identical).
   moe_front 6.5-6.6 -> 5.5-5.6 us a call in the step at 8-64 rows (before sh_down moved beside it).
   D 16 layers weighted, against the commit before each in one lease: 3.4857 -> 3.4733 (moe_front
-  top-k), 3.4690 -> 3.4665 (tau), 3.4710 -> 3.4540 (sh_down); about -0.9% against main overall.
+  top-k), 3.4690 -> 3.4665 (tau), 3.4710 -> 3.4540 (sh_down), 3.4497 -> 3.4403 (sh_down layout).
+  HEAD (fd69491) against main in one lease, 3 rounds each: 3.4873 -> 3.4467 ms/step (-1.16%).
   Launches 12.9/layer (unchanged: sh_down moved, nothing added).
 - FC1 / FC2: no variant, bucket or grid change beats main's pair (below); the remaining gap is the
   cubins' one CTA per SM (wave quantization, ~46 GB/s a CTA) and FC1's wait at entry.
@@ -164,6 +166,14 @@ the flags carry that ordering (noted in the commit and the kernel).
   behind 6144 cp.async: flags seen 0.4 us earlier, but the weights land 2.6 us later); weights by TMA
   bulk copies from two warps with two other warps only polling, and one gpu fence + relaxed flag
   stores in moe_front instead of 112 st.release: same as committed.
+
+- After `fd69491` (nsys, bench, sh_down end minus moe_front end): 0.2 / 0.8 / 2.4 / 3.2 us at 8 / 24 /
+  36 / 48 rows, and moe_front itself runs 0.6-1.2 us longer from 24 rows (5.5 -> 6.3-6.85: sh_down's
+  11 MB of weight loads contend with its L2 round trips). Still ahead of the old 3.7 us tail after FC2
+  at every row count. Tried, not better: four warps x 32 rows x alternate tiles for every row count
+  (harness 8.2 vs 7.6 us at 36 rows).
+- Verification caveat: main itself gave different logits at 24 rows teacher-forced across two leases
+  once (48 rows reproducible); compare a candidate against main run in the same batch.
 
 Before that, as a dependent of FC2:
 
