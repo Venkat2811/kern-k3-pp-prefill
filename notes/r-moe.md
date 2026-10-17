@@ -29,7 +29,8 @@ them in the TP8 / EP8 / DCP8 decode step. Main at the start: 3.486 ms/step weigh
   moe_front a programmatic dependent of the front GEMM: one launch less a MoE layer, bit-identical),
   `9399a42` (above 24 rows the shared-expert blocks multiply on tcgen05 into TMEM, bit-identical),
   `3854ef6`, `3fba6c7`, `9e77304`, `0cf0afa` (FC1's two lowest touched experts prefetched into L2 while
-  moe_front runs, below; bit-identical).
+  moe_front runs, below; bit-identical), `b5c3e3b` (after the rebase: tcgen05 at every row count, the
+  mma.sync path gone; equal in the step, bit-identical).
   moe_front 6.5-6.6 -> 5.5-5.6 us a call in the step at 8-64 rows (before sh_down moved beside it).
   D 16 layers weighted, against the commit before each in one lease: 3.4857 -> 3.4733 (moe_front
   top-k), 3.4690 -> 3.4665 (tau), 3.4710 -> 3.4540 (sh_down), 3.4497 -> 3.4403 (sh_down layout).
@@ -90,6 +91,21 @@ Real text, teacher-forced (`work/dprof2.sh`, `work/mkrows.py` rows), 16-layer st
 | FC2 meas / floor (x) | 5.4 / 1.6 (3.4) | 13.7 / 10.2 (1.34) | 29.1 / 23.9 (1.22) | 34.9 / 28.8 (1.21) | 43.8 / 40.1 (1.09) | 50.7 / 46.7 (1.09) | cubin waves |
 | moe_front now / est. floor | 5.9 / 4.3 | 5.6 / 4.3 | 5.5 / 4.3 | 5.6 / 4.3 | 5.6 / 4.3 | 5.7 / 4.3 | latency chain (below) |
 | moe_front + shared projection (`9399a42`, bench) | | 7.2 | 7.5 | | 11.1 | | 36 rows 8.3; see sh_down below |
+
+Rebased branch against main e343e79 (bench, nsys, rank 0, mean of 15 MoE layers; us from the end of the
+front GEMM, r-gemm's own kernel up to 32 rows, cuBLAS + split-K reduce above):
+
+| section | 8 rows main / branch | 24 rows main / branch | 36 rows branch | 48 rows branch |
+|---|---|---|---|---|
+| moe_front (branch: + shared projection + FC1 prefetch) | 5.87 / 6.98 | 5.84 / 8.29 | 7.48 | 12.16 |
+| FC1 after moe_front | 27.55 / 26.46 | 52.55 / 50.75 | 66.51 | 77.74 |
+| FC2 after FC1 | 13.07 / 13.02 | 25.12 / 25.15 | 32.88 | 38.68 |
+| front end -> FC2 end | 46.49 / 46.47 | 83.51 / 84.20 | 106.87 | 128.57 |
+| sh_down after FC2 (main only) | 4.2 | 6.0 | | |
+
+The branch's moe_front includes ~1-2 us of waiting for its FC1 prefetches to land (a grid retires once
+they have), which FC1 gets back; main's separate sh_down after FC2 is what the step saves. Without the
+prefetch (warp 31 exits) the branch measures 3.1643 -> 3.1810 ms/step: the prefetch is -0.5% here.
 
 (1-row FC numbers are bench routing: 2.0 touched experts on rank 0 either way. 32 and 64 rows: touched
 counts from the first rows of the 64-row dump, the profile from its own 32 / 64-row file.)
