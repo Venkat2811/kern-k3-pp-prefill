@@ -557,3 +557,18 @@ math, TMEM O, bf16 P) to write and tune from PTX, more than this session.
   with the DSL's items is the no-math table above (5.9 / 7.5 / 11.5 / 27.9
   µs a call at the bench shapes); a persistent one also removes the second
   wave's chain at 48 rows and the 16-slot grid's empty clusters.
+- **The pair design worked through** (not built): CTA c holds heads 64c ..
+  64c + 63 (CTA 1's last 32 zero-filled by the q tensor map's bounds), q as
+  9 chunks of 64 dims (72 KB). A tile is 128 positions, page 2t + c in CTA c
+  (QK^T's B, N-split); PV's B is N-split by latent dims, so CTA c also needs
+  the other page's 4 chunks of its PV dims (128c .. +128 and 256 + 128c ..
+  +128): 13 chunks of 8 KB a tile (104 KB), 5 of them free after QK^T, 8
+  after PV. TMEM: S 2 x 64 columns (lanes 0-63 positions 0-63, 64-127 the
+  rest: softmax warps w and w ^ 2 share a head row), O 2 x 128 (lanes 0-63
+  the low 128 dims of each 256 group). Shared memory: q 72 + P 16-32 + one
+  tile's 104 KB + ~2 chunks: about 1.2 tiles in flight, the DSL's own
+  budget, so the tile rate is not where it would win; a persistent grid is.
+  Output either the DSL's contract (acc_o f32 [R][128][split_max][512]
+  normalized, acc_lse in log2 units, S = ceil(t / ceil(t / bsk)) splits a
+  row) or k3_dcp's CAKE build's (bf16 parts, max and sum, uniform splits:
+  half the partial bytes).
