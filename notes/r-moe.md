@@ -6,9 +6,14 @@ them in the TP8 / EP8 / DCP8 decode step. Main at the start: 3.486 ms/step weigh
 ## Where it stands
 
 - Committed: `c70361f` (moe_front top-k by warp bitonic sorts and a merge tree, bit-identical),
-  `79e5da7` (moe_front sorts only the keys above the 16th largest warp maximum, bit-identical).
-  moe_front 6.5-6.6 -> 5.5-5.6 us a call in the step at 8-64 rows; D 16 layers weighted
-  3.4857 -> 3.4733 ms/step against main in one lease (3 interleaved rounds each). Launches 12.9/layer.
+  `79e5da7` (moe_front sorts only the keys above the 16th largest warp maximum, bit-identical),
+  `9652f64` (tau by REDUX of the score bits, table counts zeroed early, bit-identical),
+  `9eb4ece` (the shared expert's down projection runs beside moe_front as a non-waiting programmatic
+  dependent fed by per-row flags, bit for bit cuBLASLt's).
+  moe_front 6.5-6.6 -> 5.5-5.6 us a call in the step at 8-64 rows (before sh_down moved beside it).
+  D 16 layers weighted, against the commit before each in one lease: 3.4857 -> 3.4733 (moe_front
+  top-k), 3.4690 -> 3.4665 (tau), 3.4710 -> 3.4540 (sh_down); about -0.9% against main overall.
+  Launches 12.9/layer (unchanged: sh_down moved, nothing added).
 - FC1 / FC2: no variant, bucket or grid change beats main's pair (below); the remaining gap is the
   cubins' one CTA per SM (wave quantization, ~46 GB/s a CTA) and FC1's wait at entry.
 - The largest MoE cost left is EP skew (ar_finalize_rms waits for the busiest rank), a placement
@@ -130,7 +135,37 @@ Tried:
   same, because a grid does not complete before its prefetches land, and FC1 waits for the grid.
   Prefetching from the kernel before FC1 cannot overlap FC1's wait.
 
-## The launches around: sh_down (r-gemm's GEMM)
+## The launches around: sh_down (r-gemm's GEMM; r-gemm: it is ours now, see below)
+
+**Committed (`9eb4ece`): sh_down beside moe_front.** During moe_front (~5.5 us) ~140 SMs only host FC1's
+CTAs parked at their griddepcontrol.wait. sh_down's input (the SiTU row) exists ~1.2 us into
+moe_front. `k3_sh_down.cu` launches right after moe_front with `pdl: true` and never waits on it:
+moe_front's row block b raises ready[64 c + b] for each of sh_down's 112 CTAs (st.release.gpu after
+its SiTU warps' barrier); CTA c acquires its T flags, clears them (a carry; no cross-CTA reset),
+stages the rows by cp.async and multiplies. FC1 (the next launch) waits for both grids (measured,
+work/pdl). The manifest rule says a pdl kernel waits before reading its predecessor's output; here
+the flags carry that ordering (noted in the commit and the kernel).
+- Bit-identical to cuBLASLt: one mma.sync m16n8k16 chain per output over contiguous k16 blocks in
+  ascending order reproduces cuBLASLt's nvjet sums exactly (100% of outputs at 1-64 rows, random and
+  real layer-3 weights; step logits byte-identical at 24 and 48 rows; loop/d/check bit-identical).
+  Two near misses on the way, worth knowing: a K permutation (two k16 steps fed from one 16-byte load)
+  or K split into halves / accumulator sets gave 99.95-99.99% identical outputs (one bf16 ulp, never
+  less accurate than cuBLAS), and that alone FAILed loop/d/check: 105 flips vs main, 3 confident flips
+  vs the oracle. A one-ulp difference in 2-5 of 28672 hidden elements after one layer grows through
+  routing near-ties over four layers. In this step only bit-identity is safe.
+- mma.sync on sm_103 (work/mmalat): ~20 cycles dependent latency, one every ~8.4 cycles per warp.
+- In the step (nsys and in-kernel %globaltimer stamps via `--dump` of a debug buffer, work/dbgrun.sh;
+  24 rows, us from moe_front's entry): moe_front's SiTU done 1.2, sh_down entry 1.0, flags seen
+  2.2-4.1 (median 2.9), act landed +0.8, GEMM +2.0 (smem-bandwidth-bound: the two tile-parity warps of a
+  row group load the same A fragments), end ~6.5 against moe_front's ~5.5. sh_down ends 1.4-1.6 us
+  after moe_front at 8-24 rows instead of 3.7-3.8 after FC2; at 48 rows its 112 CTAs (207 KB of shared
+  memory each) do not all fit beside moe_front's 48 blocks and it ends 4 us after.
+- Tried after the commit, no better: weight loads issued after the flags (the polls no longer queue
+  behind 6144 cp.async: flags seen 0.4 us earlier, but the weights land 2.6 us later); weights by TMA
+  bulk copies from two warps with two other warps only polling, and one gpu fence + relaxed flag
+  stores in moe_front instead of 112 st.release: same as committed.
+
+Before that, as a dependent of FC2:
 
 - cuBLAS's sh_down already launches as a programmatic dependent (it starts ~2 us before FC2 ends) and
   ends 3.7-3.8 us after FC2.
