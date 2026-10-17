@@ -136,7 +136,7 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_mla_absorb_tc(c
     wait(done + 8 * g);
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
     __nv_bfloat16* o = q_abs + (size_t)h * ROW + 128 * g + 32 * (warp % 4) + lane;
-    for (int b0 = 0; b0 < n; b0 += 8) {
+    for (int b0 = 0; b0 < B; b0 += 8) {
       uint32_t v[8];
       asm volatile("tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                    : "=r"(v[0]), "=r"(v[1]), "=r"(v[2]), "=r"(v[3]), "=r"(v[4]), "=r"(v[5]), "=r"(v[6]), "=r"(v[7])
