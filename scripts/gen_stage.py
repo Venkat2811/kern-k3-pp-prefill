@@ -124,6 +124,10 @@ MLA_SHORT_SPLITS = 16
 # o_bf16, the keys two pieces share fewer than SPLIT_ROWS more of latent_g / kv_exp.
 SPLIT_ROWS, SPLIT_EXTRA = 512, 1024
 MLA_REDUCE_SMEM = 1024    # 256-split reducer scratch
+# D's split slots by batch, (first row count, slots): a cluster per slot past a row's planned splits launches and
+# exits, and a uniform batch plans ~76 / rows splits a row. One launch a range; k3_ar_fused.cu's plan caps a row's
+# splits at its range's slots (the table packed a byte an entry, `mla_slot_args`).
+MLA_SLOTS = ((1, 16), (16, 4))
 
 # D's MLA decode attention over SGLang's fp8 cache (--kv fp8): FlashInfer's
 # Cake-generated Kimi-K3 kernel (source/flashinfer-cake-k3-mla), its wide
@@ -209,12 +213,26 @@ def dim(x):
     return {"var": x} if isinstance(x, str) else {"expr": x}
 
 
-def mla_attn_op(batch_max, split_max, reduce=True, scale_log2=bf16((NOPE_DIM + ROPE) ** -0.5) * math.log2(math.e)):
+def mla_slot_ranges(split_max, batch_max):
+    """(first row, last row, slots) of every MLA_SLOTS range, the slots at most `split_max`."""
+    firsts = [lo for lo, _ in MLA_SLOTS[1:]] + [batch_max + 1]
+    return [(lo, nxt - 1, min(n, split_max)) for (lo, n), nxt in zip(MLA_SLOTS, firsts) if lo <= batch_max]
+
+
+def mla_slot_args(split_max):
+    """MLA_SLOTS as the plan's two i32: the ranges' first rows and their slots, a byte each."""
+    word = lambda xs: sum(x << 8 * k for k, x in enumerate(xs))
+    return [{"i32": word([lo for lo, _ in MLA_SLOTS])}, {"i32": word([min(n, split_max) for _, n in MLA_SLOTS])}]
+
+
+def mla_attn_op(batch_max, split_max, reduce=True, scale_log2=bf16((NOPE_DIM + ROPE) ** -0.5) * math.log2(math.e),
+                slots=None):
     """The DSL attention as one op: split kernel + reduction, structs packed from the interface.
     Interface: q_abs latent | q_abs rope (+1024 B) | kv latent | kv rope (+1024 B) | block_table |
     seq_lens | mla_bsk | o_lat | lse | acc_o | acc_lse | B | max_pages, at most `batch_max` rows.
     Without `reduce` the splits stay in acc_o / acc_lse for their merge (D's exchange, P's gate).
-    `scale_log2`: the softmax scale times log2(e)."""
+    `scale_log2`: the softmax scale times log2(e). `slots`: (first row, last row, slots) launches, the grid's
+    split slots by batch (D, mla_slot_ranges); else every batch has `split_max`."""
     batch = T
     V = {"at": 0, **dim(batch)}
     tmap = lambda param, d0, page, box1, stride1: pack(128, {"at": 0, "tensormap": {
@@ -269,10 +287,12 @@ def mla_attn_op(batch_max, split_max, reduce=True, scale_log2=bf16((NOPE_DIM + R
                    "in buffer<i32>", "out buffer<bf16>", "out buffer<f32>", "out buffer<f32>", "out buffer<f32>", "i32", "i32"],
         "impl": {"launches": [
             {**mod, "entry": MLA_MAIN, "params": main_params, "args": main_args, "block": [384, 1, 1],
-             "grid": [2, batch, split_max], "cluster": [2, 1, 1], "shared_mem": MLA_MAIN_SMEM},
+             "grid": [2, batch, n], "cluster": [2, 1, 1], "shared_mem": MLA_MAIN_SMEM,
+             **({"when": {"var": batch, "min": lo, "max": hi}} if slots else {})}
+            for lo, hi, n in slots or [(0, 0, split_max)]] + [
             {**mod, "entry": MLA_REDUCE, "params": reduce_params, "args": reduce_args, "block": [128, 1, 1],
              "grid": [HEADS, 1, batch], "shared_mem": MLA_REDUCE_SMEM},
-        ][:2 if reduce else 1]},
+        ][:1 if reduce else 0]},
     }
 
 
@@ -420,7 +440,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         # ... and D's MLA split plan (k3_mla_split_plan) in the same launch, a row's per block
         **({"embed_rms_plan": {
             "params": ["in buffer<i64>", "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "in buffer<bf16>",
-                       "out buffer<bf16>", "in buffer<i32>", "out buffer<i32>", "i32", "i32"],
+                       "out buffer<bf16>", "in buffer<i32>", "out buffer<i32>", "i32", "i32", "i32", "i32"],
             "impl": {"launches": [launch("k3_ar_fused", "kern_k3_embed_rms_plan", grid=[T, 1, 1], block=[1024, 1, 1])]},
         }} if decode and mla else {}),
         # The attention's landing is o_proj's bf16 output, the value the f32 form rounds to first.
@@ -461,7 +481,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                                                   **({"LDS": kfused, "WSM_LDS": kfused, "WSM_FA": hl}
                                                      if kfused else {})})]},
         },
-        "mla_attn": cake_attn_op(seqs_max) if fp8 else mla_attn_op(seqs_max, mla_split_max, reduce=not xchg),
+        "mla_attn": cake_attn_op(seqs_max) if fp8 else mla_attn_op(seqs_max, mla_split_max, reduce=not xchg,
+                                                                      slots=mla_slot_ranges(mla_split_max, seqs_max)),
         } if decode else {}),
         "gemm_bf16": {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32", "i32"],
@@ -1064,7 +1085,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                      i32(pack + 3), i32(mla_short), b("moe.route_sync"), i32(bp["route_sync_words"]), B)
             elif i == 0 and decode and mla:
                 step(L + "res_in", "embed_rms_plan", b("token_ids"), b("embed"), b("hidden"), b("blocks"),
-                     w("gamma_in"), b("normed"), b("seq_lens"), b("mla_bsk"), i32(mla_split_max), B)
+                     w("gamma_in"), b("normed"), b("seq_lens"), b("mla_bsk"), i32(mla_split_max), *mla_slot_args(mla_split_max), B)
             elif i == 0:
                 step(L + "res_in", "embed_rms", b("token_ids"), b("embed"), b("hidden"), b("blocks"), w("gamma_in"),
                      b("normed"), B)
