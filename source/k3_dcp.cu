@@ -189,7 +189,7 @@ extern "C" __global__ void __launch_bounds__(256) kern_k3_dcp_combine(const bf16
 }
 
 #define REC (LANES + 1)
-#define SPLITS_AT_ONCE 8
+#define SPLITS_AT_ONCE 16
 #define NOPE 128
 #define RB (256 / LANES)   // rows of a merge item
 #define M_TILE 128
@@ -287,7 +287,54 @@ __device__ __forceinline__ void await_all(uint4 (&v)[NRANKS], const uint4* p, lo
   }
 }
 
-extern "C" __global__ void __launch_bounds__(256, 1) kern_k3_dcp_exchange(
+// await_all of two vectors of every member's record at once (the lse word and a vector of o): both
+// loads in flight together instead of one wait after the other.
+__device__ __forceinline__ void await_all2(uint4 (&u)[NRANKS], const uint4* pu, uint4 (&v)[NRANKS], const uint4* pv,
+                                           long long stride, long long timeout_ns, int& fail) {
+#pragma unroll
+  for (int q = 0; q < NRANKS; ++q) u[q] = ld_volatile(pu + q * stride), v[q] = ld_volatile(pv + q * stride);
+  long long t0 = 0;
+  while (true) {
+    int missing = 0;
+#pragma unroll
+    for (int q = 0; q < NRANKS; ++q) {
+      if (!arrived(u[q])) u[q] = ld_volatile(pu + q * stride), missing = 1 + q;
+      if (!arrived(v[q])) v[q] = ld_volatile(pv + q * stride), missing = 1 + q;
+    }
+    if (!missing || fail) return;
+    const long long now = clock64();
+    if (t0 == 0) {
+      t0 = now;
+    } else if (now - t0 > 2 * timeout_ns) {
+      fail = missing;
+      return;
+    }
+  }
+}
+
+// The sums over the warp of 16 values a lane, the butterfly of xor 1, 2, .. 16 (own + partner's) as a
+// reduce-scatter: a stage halves the values a lane carries, 16 shuffles for all instead of 80, each
+// sum bit for bit the butterfly's. Lane l ends with value (l & 1) * 8 + (l >> 1 & 1) * 4 +
+// (l >> 2 & 1) * 2 + (l >> 3 & 1); lane l ^ 16 holds the same.
+__device__ __forceinline__ float warp_sums16(float (&a)[16], int lane) {
+#pragma unroll
+  for (int o = 1, n = 16; o < 32; o <<= 1, n = n > 1 ? n / 2 : 1) {
+    if (n > 1) {
+      const bool up = lane & o;
+#pragma unroll
+      for (int k = 0; k < 8; ++k)
+        if (k < n / 2) {
+          const float keep = up ? a[k + n / 2] : a[k], send = up ? a[k] : a[k + n / 2];
+          a[k] = keep + __shfl_xor_sync(0xffffffffu, send, o);
+        }
+    } else {
+      a[0] += __shfl_xor_sync(0xffffffffu, a[0], o);
+    }
+  }
+  return a[0];
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2) kern_k3_dcp_exchange(
 #ifdef CAKE
     const bf16* __restrict__ part_o, const float* __restrict__ part_max, const float* __restrict__ part_sum,
     const int* __restrict__ seq_lens, int split,
@@ -441,16 +488,15 @@ extern "C" __global__ void __launch_bounds__(256, 1) kern_k3_dcp_exchange(
       reinterpret_cast<uint4*>(lat[sub])[lane] = make_uint4(0, 0, 0, 0);
     } else {
     const uint4* rec = mine + ((long long)b * HL + j) * REC;
-    uint4 v[NRANKS];
-    await_all(v, rec + LANES, slot, timeout_ns, fail);
+    uint4 v[NRANKS], u[NRANKS];
+    await_all2(u, rec + LANES, v, rec + lane, slot, timeout_ns, fail);
     float l[NRANKS];
     float m = -CUDART_INF_F;
 #pragma unroll
     for (int q = 0; q < NRANKS; ++q) {
-      l[q] = word_lse(v[q]);
+      l[q] = word_lse(u[q]);
       m = fmaxf(m, l[q]);
     }
-    await_all(v, rec + lane, slot, timeout_ns, fail);
     float acc[VEC] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     float den = 0.f;
 #pragma unroll
@@ -493,35 +539,38 @@ extern "C" __global__ void __launch_bounds__(256, 1) kern_k3_dcp_exchange(
       }
     wait_w<0>();
     __syncthreads();
+    // warp dl's dv are half * 64 + dl + 8 k: four at a time, the four rows' sums of each in one reduce-scatter
+    const int vi = (kl & 1) * 8 + (kl >> 1 & 1) * 4 + (kl >> 2 & 1) * 2 + (kl >> 3 & 1);
 #pragma unroll 1
-    for (int dv = half * NOPE / 2 + dl; dv < (half + 1) * NOPE / 2; dv += 256 / 32) {
-      const uint4* w = sw + (dv - half * NOPE / 2) * (LAT / 8) + kl;
-      const uint4 wv[2] = {w[0], w[32]};
-      float a[RB] = {0.f, 0.f, 0.f, 0.f};
+    for (int k0 = 0; k0 < 8; k0 += 4) {
+      float a[16];
 #pragma unroll
-      for (int i = 0; i < 2; ++i) {
-        const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(&wv[i]);
+      for (int k = 0; k < 4; ++k) {
+        const int dv = half * NOPE / 2 + dl + 8 * (k0 + k);
+        const uint4* w = sw + (dv - half * NOPE / 2) * (LAT / 8) + kl;
+        const uint4 wv[2] = {w[0], w[32]};
 #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-          const float2 g = __bfloat1622float2(w2[k]);
+        for (int r = 0; r < RB; ++r) a[r * 4 + k] = 0.f;
 #pragma unroll
-          for (int r = 0; r < RB; ++r) {
-            a[r] = fmaf(g.x, x[r][8 * i + 2 * k], a[r]);
-            a[r] = fmaf(g.y, x[r][8 * i + 2 * k + 1], a[r]);
+        for (int i = 0; i < 2; ++i) {
+          const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(&wv[i]);
+#pragma unroll
+          for (int c = 0; c < 4; ++c) {
+            const float2 g = __bfloat1622float2(w2[c]);
+#pragma unroll
+            for (int r = 0; r < RB; ++r) {
+              a[r * 4 + k] = fmaf(g.x, x[r][8 * i + 2 * c], a[r * 4 + k]);
+              a[r * 4 + k] = fmaf(g.y, x[r][8 * i + 2 * c + 1], a[r * 4 + k]);
+            }
           }
         }
       }
-#pragma unroll
-      for (int r = 0; r < RB; ++r)
-#pragma unroll
-        for (int msk = 1; msk < 32; msk <<= 1) a[r] += __shfl_xor_sync(0xffffffffu, a[r], msk);
-      float mine_a = a[0];
-#pragma unroll
-      for (int r = 1; r < RB; ++r) mine_a = kl == r ? a[r] : mine_a;
-      if (kl < RB && b0 + kl < R) {
-        const long long oi = (long long)(b0 + kl) * (HL * NOPE) + j * NOPE + dv;
-        const float gf = __bfloat162float(gate[kl][dv]);
-        gated[oi] = __hmul(__float2bfloat16_rn(mine_a), __float2bfloat16_rn(1.0f / (1.0f + expf(-gf))));
+      const float sum = warp_sums16(a, kl);
+      const int r = vi / 4, dv = half * NOPE / 2 + dl + 8 * (k0 + vi % 4);
+      if (kl < 16 && b0 + r < R) {
+        const long long oi = (long long)(b0 + r) * (HL * NOPE) + j * NOPE + dv;
+        const float gf = __bfloat162float(gate[r][dv]);
+        gated[oi] = __hmul(__float2bfloat16_rn(sum), __float2bfloat16_rn(1.0f / (1.0f + expf(-gf))));
       }
     }
     __syncthreads();
