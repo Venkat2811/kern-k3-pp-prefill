@@ -877,7 +877,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
   const int t = threadIdx.x, b = blockIdx.x;
   const long long tot = (long long)B * ROWV, i = share(tot, B);
   const int row = (int)(i / ROWV), c = (int)(i % ROWV);
-  // the top-k of the (at most two) rows this block's share spans, written by moe_front: read before the wait
+  // the top-k of the (at most two) rows this block's share spans, written by moe_front
   __shared__ int s_e2p[2][TOPK];
   __shared__ float s_w[2][TOPK];
   const int row0 = (B >= TWO_SHOT_ROWS ? b * KTHREADS : share_per(tot) * b) / ROWV;
@@ -886,10 +886,10 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
     s_w[t / TOPK][t % TOPK] = wts[(row0 + t / TOPK) * TOPK + t % TOPK];
   }
   const Lamport l = lamport_open(lamport, lamport_peers, state, err, rank, tot, stage_bytes, timeout_ns);
+  // the routed latent is fc2's, two kernels back: summed before the wait; the shared expert's partial after it
+  uint4 v = i >= 0 && c < KLATV ? finalize(fc2, s_e2p[row - row0], s_w[row - row0], c) : make_uint4(0u, 0u, 0u, 0u);
   grid_wait();
-  const uint4 v = i < 0 ? make_uint4(0u, 0u, 0u, 0u)
-                  : c < KLATV ? finalize(fc2, s_e2p[row - row0], s_w[row - row0], c)
-                              : shared[(long long)row * KVEC + c - KLATV];
+  if (i >= 0 && c >= KLATV) v = shared[(long long)row * KVEC + c - KLATV];
   // From TWO_SHOT_ROWS rows the sum runs as two shots: every row goes to its owner (row % NRANKS) only, the
   // owner sums it and gathers the sum to the others (gather_share), 2 x 7/8 of a partial out of each rank
   // instead of 7.
