@@ -1,6 +1,6 @@
 # r-attn: D's attention kernels at their floor (round 3)
 
-Kernels: `k3_kda_core`, MLA (`k3_mla_prep`, `k3_mla_absorb_mma`, the DSL
+Kernels: `k3_kda_core`, MLA (`k3_mla_prep`, `k3_mla_absorb_tc` (`_mma` under `--kv fp8`), the DSL
 `mla_decode_h96_p64` and its grid), the DCP exchange (`k3_dcp`).
 Previous lane notes: `notes/d-attn.md` (round 1, every idea tried there).
 
@@ -8,7 +8,7 @@ Previous lane notes: `notes/d-attn.md` (round 1, every idea tried there).
 
 Branch rebased on main 21a9174 (r-ar merged): check PASS bit-identical, D
 3.295 / 3.295 → 3.294 / 3.293. New on it: absorb on tcgen05 (a block a head,
-W_UK by TMA; -0.25..-2.05 µs a call from 8 rows, +0.3 at 1 row) and the
+W_UK by TMA; -0.3..-2.0 µs a call from 8 rows, +0.2 at 1 row) and the
 fp8 builds' e4m3 cast in hardware (absorb fp8 16.4 → 8.1 µs at 48 rows;
 `--kv fp8` only). Tried and dropped since: W_UK into L2 from mla_prep, the
 next KDA layer's state from kda_core (both slower; numbers below), the
