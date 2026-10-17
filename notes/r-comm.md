@@ -198,8 +198,12 @@ us per call (harness, 8192 positions a member, the plan's splits):
   it; the rest is reading the attention's f32 split partials (2 KB a split and head: 27.6 MB at 48
   rows x 3 splits, ~3 TB/s achieved in 2-4 rounds a block). Hoisting the splits' loads, a lane per
   split (max by a warp reduction, the sum in order through shuffles; bit-identical), L2-prefetching
-  the next round, warp-uniform early exits: none moved 24-48 rows. bf16 partials (the Cake path's)
-  would halve the reads: the attention's output format, not the exchange's.
+  the next round, warp-uniform early exits, software-pipelining the items (the next item's row
+  length, split count, lse and first four splits' o loaded before this one merges; 128 registers,
+  bit-identical): none moved 24-48 rows. bf16 partials (the Cake path's) would halve the reads: the
+  attention's output format, not the exchange's. Caveat: the harness writes the partials once at
+  setup; in the step the attention writes them just before, so they sit in L2 and the step's merge
+  phase may be faster than the harness's.
 - Left: at 36-64 rows the push of R x 96 records of 1 KB (5.4 MB at 64 rows, 7.7 us at the
   all-to-all rate) and two merge rounds; at 1-24 rows the merge chain (load lse, weights, o, push)
   then the v-up. Applying W_UV before the exchange would cut the bytes 4x but needs every head's
