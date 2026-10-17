@@ -48,6 +48,11 @@ at nb 1), the closing add ~0.2 (4.4 against 3.1). The production step runs mostl
 - The row epilogue's code warmed before the poll (a two-pass loop, `#pragma unroll 1`: pass 0 on a zero row with
   no stores while the peers' data is in flight): in the step +1.2 us a call (8 x 64k, 16 calls 124 -> 143 us).
   Dropped: whatever the epilogue's fetch costs, a second pass costs more.
+- The closing add's snapshots scored before griddepcontrol.wait from nb 3 (LAND_EARLY; nb 1-2 untouched):
+  bit-identical (a value's total in block_sum / cluster_block_sum does not depend on the values reduced beside
+  it: the same butterfly per value, and a + b = b + a), harness (no PDL) +0.4..+0.8 us at nb 3-8, in the step
+  (work/ar/nbx.sh manifests, 8 x 64k) +1.0..+1.5 us a call at nb 3-8 (16 calls 62 -> 75 us): the add launches
+  ~1 us before lat_up ends, too short for a cluster reduction. Dropped.
 - Under nsys the ranks start a replay up to ~0.3 ms apart, and the early ones wait in the step's first exchange;
   the plain bench's rank 0 p50 matches the latest rank's span under nsys, so the score does not carry it.
 
