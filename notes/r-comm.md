@@ -78,7 +78,7 @@ kernel at 4 CTAs x 224 threads a 7168 row (FlashInfer's shape) is 4.65 us at 1 r
 threads a row (one SM) 7.27. One SM storing a row to 8 members and polling its 8 slots is the
 limit, not the wire (1 x 7168: 112 KB of egress, 0.16 us).
 
-## k3_xchg.cuh (`51538be`)
+## k3_xchg.cuh (`51538be`, on the local branch `r-comm-pre-rebase`)
 
 Wire unchanged (TRT-LLM's Lamport one-shot / two-shot, rank-order f32 sums: bit-identical).
 
@@ -173,7 +173,7 @@ in the slots, same sums: bit-identical.
   allocation, map the alias, expose it as `X_mc` (u64[1]) like a peer table. `agent/x-mcast` does
   this in `k3_step`.
 
-## k3_dcp (`d315411`)
+## k3_dcp (`7560058`, `a6707bd`)
 
 Stamps (per-block globaltimer, `stamp_dcp.cu`) put the time in three serial chains:
 
@@ -188,7 +188,7 @@ us per call (harness, 8192 positions a member, the plan's splits):
 | rows | 1 | 8 | 16 | 24 | 36 | 48 | 64 |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | main | 12.0 | 10.5 | 11.5 | 12.7 | 15.7 | 22.4 | 24.9 |
-| `d315411` | 9.6 | 9.7 | 10.8 | 12.2 | 15.2 | 20.5 | 22.6 |
+| `7560058` | 9.6 | 9.7 | 10.8 | 12.2 | 15.2 | 20.5 | 22.6 |
 | floor (the rank's 7/8 of R x 96 heads x 1 KB at 700 GB/s, + 2.9 us exchange) | 3.0 | 3.9 | 4.9 | 5.8 | 7.2 | 8.6 | 10.6 |
 
 - Grid 304 (two blocks an SM) made the 48-row merge one round (22.4 -> 17.5) but the step slower:
@@ -216,7 +216,7 @@ us per call (harness, 8192 positions a member, the plan's splits):
   then the v-up. Applying W_UV before the exchange would cut the bytes 4x but needs every head's
   W_UV on every rank (+300 MB a rank) and a tensor-core GEMM in the kernel: not done.
 
-## k3_head (`fd8a04b`)
+## k3_head (`5307a10`)
 
 The row's tail ran two system fences in a row (every block's before it counts in, then the last
 block's again before it pushes the row's key); stamps put the second at ~2 us (rank 5, 8 rows:
@@ -249,8 +249,10 @@ idea 12), or let the lm_head GEMM write rank 0's buffer directly through a peer-
 Harness, us a call (`fusedv`, `attnv`, `sweep`; 1 snapshot):
 
 - One-shot vs two-shot: at 16 rows the MoE all-reduce is 10.30 one-shot / 8.54 two-shot, the
-  attention's 9.56 / 8.42; at 12 rows 8.96 / 8.56 (attention); 8 and 24 rows unchanged. Both now
-  switch at 12 (`08b98c2`, `fb64092`), byte for byte main's outputs.
+  attention's 9.56 / 8.42; at 12 rows 8.96 / 8.56 (attention); 8 and 24 rows unchanged. This branch
+  switched both at 12 on `21a9174` (3.291 / 3.288 -> 3.280 / 3.278 ms/step over two commits, byte
+  for byte main's outputs); r-ar's main has since switched at 14, which the bench's shapes cannot
+  tell apart from 12, so the rebase onto `fd5c92c` keeps main's 14.
 - Pushes from every block at all sizes (PUSH_SPREAD_ROWS 33 -> 65): 0.4 us faster for the attention
   all-reduce at 36-48 rows in the harness, but in the step it competes with the next weight's L2
   loads: 3.288 -> 3.286-3.306 ms (noisy, not better). Kept r-ar's 33.
@@ -259,7 +261,7 @@ Harness, us a call (`fusedv`, `attnv`, `sweep`; 1 snapshot):
   Stamps (`stmoe`) of a build with two `__syncthreads` added made the cause visible: that build
   was faster. Warps that finish a phase early (the gather, the shared half) start spinning on the
   next phase's slots before the data is there, and their polls slow everyone's. Two-shot, the
-  row block now waits after each (`23bf79b`): 8.2-9.1 us at every count from 12 to 48. One-shot
+  row block now waits after each (`c934878`): 8.5-9.1 us at every count from 14 to 48. One-shot
   the second wait costs 0.2-0.4 us (fewer slots, all landing together), so not there.
 - The same lesson the other way: one-shot, giving the shared half's first 576 vectors to the
   threads past the latent's 448 (so no thread waits twice) is slower, 8.12 -> 8.88 us at 1 row:
@@ -304,10 +306,9 @@ Harness, us a call (`fusedv`, `attnv`, `sweep`; 1 snapshot):
 
 ## Done table (harness, us a call, 8 GB300 over two trays)
 
-The all-reduce rows are r-ar's kernels as merged (`21a9174`) with this branch's switch points and
-waits (`08b98c2`, `fb64092`, `23bf79b`), 1 snapshot; the closing-add row is this branch's before
-the rebase (r-ar's now runs a row over a cluster of 4 blocks). `k3_dcp` and `k3_head` are this
-branch's.
+The all-reduce rows are main's (`fd5c92c`, r-ar's) kernels with this branch's two-shot waits
+(`c934878`), 1 snapshot; the closing-add row is this branch's before the rebase (r-ar's now runs a
+row over a cluster of 4 blocks, theirs to table). `k3_dcp` and `k3_head` are this branch's.
 
 Floors: an exchange is latency-bound at these sizes. The empty 8-rank Lamport exchange in a graph
 is 2.9 us (launch 0.6 + one-way 1.3 + a poll's round trip); a row's push and poll spread over 4 SMs
@@ -317,10 +318,10 @@ block reductions: 2.2 us a call, `skel`).
 
 | kernel | rows | measured | floor | x | limit |
 |---|---:|---:|---:|---:|---|
-| `ar_attnres_rms` (r-ar's, this branch's switch; 1 snapshot) | 1 / 8 | 8.2 / 8.3 | 4.65 + 2.2 | 1.2 | one SM a row: its 8-slot poll (+0.9 measured on the header's one-shot, `xar_spreadpoll`) and its row tail |
-| | 16 / 24 / 36 / 48 | 8.7 / 8.8 / 9.5 / 9.5 | two-shot 7.8-8.3 + 0.6 | 1.0-1.1 | at the protocol (the spread two-shot bare) plus its row math; from 33 rows the pushes leave from the first blocks so the rest can load the next weight (spread: 0.4 us faster here, not in the step) |
-| `ar_finalize_rms` (r-ar's, this branch's switch and waits) | 1 / 8 | 8.0 / 8.6 | 4.6 / 6.0 (local) + 0.3 | 1.7 / 1.4 | the row's 1344 vectors polled by one block, the shared half then the latent; spreading them over more threads at once is slower (more spinners) |
-| | 16 / 24 / 36 / 48 | 8.2 / 8.3 / 9.0 / 8.7 | spread two-shot bare 7.9 / 8.3 / 8.6 / 9.2 | 1.0-1.05 | at the protocol's floor; multicast's two-shot is 0.3-1.0 below it (proposal) |
+| `ar_attnres_rms` (main's; 1 snapshot) | 1 / 8 | 7.9 / 8.3 | 4.65 + 2.2 | 1.15-1.2 | one SM a row: its 8-slot poll (+0.9 measured on the header's one-shot, `xar_spreadpoll`) and its row tail |
+| | 16 / 24 / 36 / 48 | 8.7 / 8.8 / 9.3 / 9.2 | two-shot 7.8-8.3 + 0.6 | 1.0-1.1 | at the protocol (the spread two-shot bare) plus its row math; from 33 rows the pushes leave from the first blocks so the rest can load the next weight (spread: 0.4 us faster here, not in the step) |
+| `ar_finalize_rms` (main's with this branch's waits) | 1 / 8 | 8.1 / 8.6 | 4.6 / 6.0 (local) + 0.3 | 1.7 / 1.4 | the row's 1344 vectors polled by one block, the shared half then the latent; spreading them over more threads at once is slower (more spinners) |
+| | 16 / 24 / 36 / 48 | 8.5 / 8.5 / 9.0 / 8.7 | spread two-shot bare 7.9 / 8.3 / 8.6 / 9.2 | 0.95-1.07 | at the protocol's floor; multicast's two-shot is 0.3-1.0 below it (proposal) |
 | `land_add2_attnres_rms` (no exchange) | any | 4.1 / 4.8 / 5.9 / 8.2 (1 / 2 / 4 / 8 snapshots) | 2.2 skeleton | 1.9-3.7 | one SM a row: the snapshots' copies (one SM keeps ~30-50 KB in flight) and 32 warps' scalar work; a cluster of 7 / 4 / 2 SMs a row costs as much (tried) |
 | `k3_dcp` | 1 / 8 / 16 / 24 | 9.6 / 9.7 / 10.8 / 12.2 | 3.0 / 3.9 / 4.9 / 5.8 | 3.2-2.1 | the merge phase: reading the attention's f32 split partials at ~3 TB/s in 2-3 rounds a block (registers allow one item in flight; two blocks an SM starve the o_proj GEMM behind it), then the egress |
 | | 36 / 48 / 64 | 15.2 / 20.5 / 22.6 | 7.2 / 8.6 / 10.6 | 2.1-2.4 | the same (f32 partials: 27.6 MB at 48 rows), plus two merge rounds from 43 rows |
