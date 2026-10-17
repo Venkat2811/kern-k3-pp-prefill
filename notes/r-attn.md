@@ -145,6 +145,11 @@ Named limits for what is not within 1.15x:
   26 rows) and at 3 (tile in registers, 69 KB: 36 rows 11.8 vs 11.0 µs);
   a quarter of the state loaded early into registers spills. At 64 rows
   768 blocks are 1.26 waves at 4 an SM. Bytes are the minimum (ncu above).
+  The no-state prologue at 48 rows (7.50 µs), piece by piece: without the
+  tile 6.34 (the per-block 32 KB tile is 18.9 MB through L2 for 384 KB of
+  unique bytes), without f_b's projection 5.66, without the window 5.02,
+  an empty launch 0.74. Two rows of a head a block (256 threads, one tile)
+  would recover ~0.5 µs at 36-48 rows, ~2 µs a step: not done.
 - **mla_attn**: FlashInfer's prebuilt CuTe-DSL kernel (no source build: the
   cutlass DSL package is absent; no PDL in the cubin). Its grid is now the
   plan's slots; the plan is near the kernel's best (uniform splits a row,
