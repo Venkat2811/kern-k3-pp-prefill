@@ -330,6 +330,11 @@ After the rebase, also tried: a speculative prefetch (each expert below j0 = 2 x
 expected touched experts, issued as soon as any row reports it, the two least once all rows are in):
 3.1573 -> 3.1587, nothing gained; moe_front without PDL at <= 32 rows (behind r-gemm's front kernel):
 3.1643 -> 3.1813, worse (the early launch pays).
+At 41+ rows (48 + 112 blocks > 152 SMs) a grid of 152 whose first 8 shared-expert blocks take a second
+column tile after their first (its weights prefetched into L2 at entry, the product into the same TMEM
+columns, mbarrier phase 1): bit-identical, 48 rows -0.02 / -0.03 ms in two leases, but 24 rows at 128k
++0.01 in both (the narrow path's code is the same logic, refactored): 3.1617 -> 3.1637, 3.1603 -> 3.1613.
+Not kept (`work/umma/k3_moe_front.twotile.cu`).
 
 ## Proposals
 
