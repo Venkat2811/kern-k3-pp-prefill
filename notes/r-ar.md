@@ -10,13 +10,32 @@ Rebased onto main 95bc0b0 (r-gemm's L2 loads in the exchanges, 3.411-3.416 ms/st
 commits on it were flat (3.418-3.420: 8-24 rows faster, 36/48 rows +20 us, the spread push delaying the idle
 blocks' weight loads); with the spread only below 33 rows, 3.404-3.405 (-0.2%).
 
-## Where it stands (02:55 UTC)
+## Where it stands (03:25 UTC, rebased on main d85613c)
 
-12.9 launches/layer (207 a step, unchanged). Same-lease A/B vs main 95bc0b0 (3.407-3.410 ms/step):
+12.9 launches/layer of mine unchanged (D 207 a step before r-attn's `when` variants). Same-lease A/B vs main
+95bc0b0 (3.407-3.417 ms/step), each step cumulative:
 - push spread only below 33 rows: 3.404-3.405
 - the closing add's prefetch capped at 16 MB (`LAND_PF_MAX`): 3.382-3.390
-- the all-reduces' load-window stamp a phase, no l2_close grid count: 3.371-3.374 (-1.1% vs main)
-All bit-identical vs main (loop/d/check x3).
+- the all-reduces' load-window stamp a phase, no l2_close grid count: 3.371-3.374 (on another lease 3.357-3.361)
+- AR_GRACE_NS 2500 -> 500: 3.343-3.351
+- ar_finalize's top-k staged in smem before the wait: 3.342-3.343 (-0.1%)
+- two-shot gather spread over the non-owned rows' blocks: 3.335-3.344 (36-48 rows -30 us)
+= -2.0% vs main 95bc0b0. Rebased on main d85613c (3.377-3.380): 3.300-3.302 (-2.4%), then
+- L2_INFLIGHT 8 MB for the all-reduces: 3.295-3.296
+- two-shot from 14 rows (was 20): 3.299 vs 3.300-3.302 before the in-flight change (16 rows -5..-10 us)
+- embed_rms_plan's plan in block B: 3.282-3.284 (vs 3.284-3.285)
+- push spread over every block in the one-shot only: 3.273-3.274
+= main d85613c 3.373 -> 3.273 (-3.0%). **Offer: the branch at its head** (13 commits on d85613c).
+All bit-identical vs main (loop/d/check x3; two-shot paths in the harness).
+
+Each exchange's own time in the step (work/ar/own.py: per call, end minus the previous kernel's end, the minimum
+over 5 ranks = the last-arriving rank's; us a call, 8 / 48 rows): ar_attnres own 12.6 / 13.5, mean 17.8 / 18.0,
+max 21.7 / 20.8; ar_finalize own 11.0 / 12.2, mean 19.5 / 27.3, max 28.3 / 41.3 (EP skew); land 4.1 / 4.9.
+
+What is left in the step (nsys, 8 / 48 rows x 64k, us a step on the frontier): ar_attnres 331 / 306, ar_finalize
+237 / 349, land 66 / 79, embed 6 / 6. An all-reduce's frontier time is ~2x its time alone: the wait for the
+last rank (the GEMM before it ends 2-6 us apart across ranks; EP skew before ar_finalize) and the load window's
+drain. The closing add ends 3.8-4.9 us after lat_up (1-1.5 of it the release of griddepcontrol.wait).
 
 ## Tools (work/ar/, not committed unless kept)
 
@@ -152,6 +171,10 @@ before the grid ends) is 0.8 of it.
 
 | idea | harness | step | kept |
 |---|---|---|---|
+| two-shot owner's gather by TMA (the summed row staged in smem, one cp.async.bulk a peer) | MoE 20-64 rows +1.2..+1.9 us a call | | no: slower than 7 x n stores |
+| two-shot gather spread over the non-owned rows' blocks (an equal run of the owned vectors each, before their own poll; the owner's block sums its row again for itself) | attn 20-64 rows 11.20 / 11.29 / 11.33 / 11.84 / 11.97 -> 9.65 / 9.51 / 9.56 / 10.20 / 10.60 us; MoE alone slower when the owned rows are unbalanced (20-23, 28 rows: +1 us), faster at 24 (-0.4) | see below | |
+| ar_finalize_rms: the top-k (exp2perm, wts) of the block's <= 2 rows staged in smem before griddepcontrol.wait (written by moe_front, 4 kernels back) | with the spread gather, MoE 20 / 21 / 24 / 28 / 48 rows 11.71 / 11.61 / 11.69 / 11.74 / 12.15 -> 11.47 / 10.65 / 9.69 / 10.78 / 11.70 | see below | |
+| ar_attnres_rms's rows over clusters of 2 (152 blocks = 76 clusters: cudaOccupancyMaxActiveClusters at one 1024-thread block an SM says 76 of 2 fit, 36 of 4, 15 of 8) | nb 1-2: flat at 1-16 rows, +0.5..+0.9 us at 24-64 (two-shot); nb 8: -0.4 at 1-16 | | no |
 | ar_attnres_rms's row epilogue over a cluster of 4 (kern_k3_ar_attnres_rms_cl, rows <= 38 by `when`) | -0.5..-1.0 us a call at 1-32 rows, bit-identical | 3.404 -> 3.473 (+2%; 36 rows +220 us): clusters of 4 cannot make all 152 blocks co-resident (GPC packing), and the protocol needs every block resident: a deadlock risk | no |
 
 Block 0's stamps at 1 row (ns from the first block's entry, ar_attnres_rms nb 1, harness without PDL): push and
@@ -166,6 +189,14 @@ window's, not the row's.
 | closing add's prefetch hints capped at 0 / 8 / 12 / 16 / 24 / 32 / 48 MB (was the whole next weight, 92 MB for qkvg) | main 3.407-3.410; none 3.399-3.400; 3.390 / 3.392 / 3.391 / 3.382-3.390 / 3.397-3.408 / 3.389-3.391 / 3.394-3.397 | 16 MB |
 | the hints stop 1 / 2 / 3 us after the block starts (whole weight) | 3.403 / 3.404 / 3.405 | no |
 | l2_close's grid count replaced by a stamp a phase | 3.390 -> 3.371 / 3.374 | yes |
+| AR_GRACE_NS 2500 -> 0 / 500 / 1000 / 1500 / 2000 (FIN_GRACE_NS 0 / 500 / 1000: no difference) | 3.357-3.361 -> 3.342-3.346 / 3.343-3.344 / 3.344-3.345 / 3.348-3.349 / 3.354-3.355 | 500 |
+| the closing add's grid 4B + 64 / 4B + 152 instead of 608 (fewer prefetching blocks) | 3.333-3.338 -> 3.346-3.368 / 3.344-3.345 | no |
+| L2_INFLIGHT (the all-reduces' loads in flight) 12 -> 4 / 8 MB | 3.338-3.339 -> 3.340-3.342 / (d85613c) 3.300-3.302 -> 3.295-3.296 | 8 MB |
+| the closing add's second partial (the MoE sum, two kernels back) loaded before griddepcontrol.wait | 3.300-3.302 -> 3.301-3.304 | no |
+| two-shot from 14 rows (harness: attn wins from 12, MoE from 14, loses at 10-12) | 3.300-3.302 -> 3.299 (16 rows -5..-10 us) | yes |
+| push spread (runs over all 152 blocks) below 14 rows only, i.e. one-shot only / at every row count / AR_GRACE_NS 250 | 3.290-3.293 -> 3.283 / 3.292-3.294 / 3.291 | one-shot only |
+| embed_rms_plan's split plan in block B (was: warp 0 of every row block, before the row's norm) | embed alone 4.37-5.14 -> 2.97-3.64 us, the same outputs and splits; step 3.284 -> 3.282 | yes |
+| land's mix norm from the candidates' pairwise dots (one cluster reduction after the wait instead of two) | | not retried: -0.09% in round 3's first session, and the only change here that would move outputs (0.1-0.4% by 1-2 ulp) |
 
 ## Runtime proposal: multicast for the exchanges
 
@@ -177,3 +208,8 @@ NCCL id, every rank cuMulticastAddDevice, binds its own mapping by address, maps
 8 / 16 / 24 / 32 rows, two-shot 8.07-8.31 flat; in the step -0.25% (3.484 -> 3.475). What the runtime would need: a
 buffer kind `multicast_of: <peer buffer>` that kern creates after the peers' handles are imported and whose value is
 the alias, so a manifest can pass it to a launch. Not shipped (the manifest must run on today's kern).
+
+Note on checking: loop/d/check runs 4 rows, i.e. only the one-shot path. Every two-shot change was checked in the
+harness instead: outputs at 8-64 rows bit-for-bit equal to the variant before on every rank (no DIFF in any rank's
+log). The 16-layer bench only runs nb 1-2 (attnres calls: 13 at nb 1, 4 at nb 2), so work for many snapshots does
+not show in the score.
