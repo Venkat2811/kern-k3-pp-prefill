@@ -168,7 +168,7 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1)
   __syncthreads();
 
   // up to 24 rows warps 0-1 multiply (32 rows each: every fragment read from shared memory once); from 25
-  // rows, where two warps cannot issue the mma fast enough, warp 4 p + g takes rows 16 g + [0, 16), tiles p, p + 2, ...
+  // rows, where two warps cannot issue the mma fast enough, warps 0-3 take 16 rows each by every row tile
   if (T > 24) {
     if (warp < 4) {
       const int tiles = (T + 7) / 8;
