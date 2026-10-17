@@ -53,6 +53,10 @@
 #define NSH 7168  // the shared expert's output width (the hidden size)
 #endif
 #define READERS (NSH / 64)  // the shared-expert blocks: ready[c * 64 + b] is row b's flag for block T + c
+#define MOE_I 3072           // an expert's intermediate width: FC1 is [2 MOE_I, LATENT] mxfp4 + UE8M0 per 32
+#define FC1_W (2 * MOE_I * (LATENT / 2))
+#define FC1_SF (2 * MOE_I * (LATENT / 32))
+static_assert(FC1_W % (READERS * 16) == 0 && FC1_SF % (READERS * 16) == 0, "16-byte shares");
 #define TOPK 16
 #define TILE 16
 #define LOCAL (EXPERTS / STRIDE)
@@ -321,9 +325,38 @@ __device__ __forceinline__ void sh_rows16(uint32_t a_at, uint32_t b_at, int tile
         tile[(j * 8 + 2 * q + i % 2) * SROWS + n + (i / 2) * 8] = __float2bfloat16(acc[j][i]);
 }
 
+// FC1's first CTAs take the touched expert of the lowest local index: once every row's ids are in
+// (ids[c * 64 + b] = 1, cleared here), one warp of block T + c pulls its share of that expert's FC1
+// weights and scales into L2 while HBM is otherwise idle.
+__device__ __forceinline__ void prefetch_first(const int* __restrict__ idx, int* __restrict__ ids, int first, int T,
+                                               int c, const uint8_t* __restrict__ w13, const uint8_t* __restrict__ w13_sf) {
+  const int lane = threadIdx.x % 32;
+  for (int r = lane; r < T; r += 32) {
+    int v;
+    int* flag = ids + c * 64 + r;
+    asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(flag) : "memory");
+    while (v != 1) asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(flag) : "memory");
+    *flag = 0;
+  }
+  __syncwarp();
+  int j = LOCAL;
+  for (int i = lane; i < T * TOPK; i += 32) {
+    const int d = __ldcg(idx + i) - first;
+    if (d >= 0 && d % STRIDE == 0) j = min(j, d / STRIDE);
+  }
+  j = __reduce_min_sync(0xffffffffu, j);
+  if (lane == 0 && j < LOCAL) {
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
+                 ::"l"(w13 + (size_t)j * FC1_W + (size_t)c * (FC1_W / READERS)), "r"(FC1_W / READERS) : "memory");
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
+                 ::"l"(w13_sf + (size_t)j * FC1_SF + (size_t)c * (FC1_SF / READERS)), "r"(FC1_SF / READERS) : "memory");
+  }
+}
+
 __device__ __forceinline__ void shared_down(const __nv_bfloat16* __restrict__ act, int* __restrict__ ready,
                                             const __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ out,
-                                            int T, int c) {
+                                            int T, int c, const int* __restrict__ idx, int* __restrict__ ids, int first,
+                                            const uint8_t* __restrict__ w13, const uint8_t* __restrict__ w13_sf) {
   extern __shared__ __align__(128) uint8_t sm[];  // the weight rows, T activation rows, the bf16 tile [T][64]
   __shared__ __align__(8) uint64_t s_bar;
   __shared__ uint32_t s_tmem;
@@ -360,17 +393,20 @@ __device__ __forceinline__ void shared_down(const __nv_bfloat16* __restrict__ ac
   asm volatile("cp.async.commit_group;" ::: "memory");
   asm volatile("cp.async.wait_group 0;" ::: "memory");
   const int tiles = (T + 7) / 8;
+  const bool prefetcher = warp == 31 && tiles < 8;  // idle in either product below
   if (umma) {
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // the operands, to the tensor cores' reads
     asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+    if (prefetcher) prefetch_first(idx, ids, first, T, c, w13, w13_sf);
     umma_rows(smem_at(sw), smem_at(sa), s_tmem, &s_bar, tiles, tile);
     asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
     __syncthreads();
     if (warp == 2) asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 64;" ::"r"(s_tmem) : "memory");
   } else {
     __syncthreads();
+    if (prefetcher) prefetch_first(idx, ids, first, T, c, w13, w13_sf);
     if (warp < 4) {
       // ldmatrix rows: A (16 W rows) lane l -> row l % 16, column half l / 16; B (8 act rows) lane l -> row l % 8, half (l / 8) % 2
       const uint32_t a_at = smem_at(sw + (16 * warp + lane % 16) * SPITCH + (lane / 16) * 16);
@@ -391,10 +427,12 @@ __device__ __forceinline__ void shared_down(const __nv_bfloat16* __restrict__ ac
 extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
     const float* __restrict__ S, const float* __restrict__ bias, const __nv_bfloat16* __restrict__ rs,
     int* __restrict__ idx, float* __restrict__ wts, uint8_t* __restrict__ q, uint8_t* __restrict__ sf,
-    __nv_bfloat16* __restrict__ act, int* __restrict__ ready, int* __restrict__ done, int* __restrict__ cta_batch,
+    __nv_bfloat16* __restrict__ act, int* __restrict__ ready, int* __restrict__ ids, int* __restrict__ done,
+    int* __restrict__ cta_batch,
     int* __restrict__ cta_limit, int* __restrict__ num_non_exiting, int* __restrict__ total_padded,
     int* __restrict__ route_map, int* __restrict__ exp2perm, const __nv_bfloat16* __restrict__ wsh,
-    __nv_bfloat16* __restrict__ sh_out, int first, int T) {
+    __nv_bfloat16* __restrict__ sh_out, const uint8_t* __restrict__ w13, const uint8_t* __restrict__ w13_sf, int first,
+    int T) {
   __shared__ float s_sig[EXPERTS];
   __shared__ unsigned long long s_cand[EXPERTS];
   __shared__ u32 s_max[32], s_tau;
@@ -404,7 +442,7 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
   asm volatile("griddepcontrol.wait;" ::: "memory");
   asm volatile("griddepcontrol.launch_dependents;");
   if (b >= T) {
-    shared_down(act, ready, wsh, sh_out, T, b - T);
+    shared_down(act, ready, wsh, sh_out, T, b - T, idx, ids, first, w13, w13_sf);
     return;
   }
   const float* row = S + (long long)b * LDS;
@@ -449,6 +487,7 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
         wts[b * TOPK + lane] = (sg / (den + 1e-20f)) * __bfloat162float(rs[0]);
         idx[b * TOPK + lane] = e;
       }
+      asm volatile("bar.arrive 4, %0;" ::"n"(32 + THREADS - SORT_WARPS * 32) : "memory");  // the ids, to the SiTU warps
     } else if (warp >= QUANT_WARP0) {
       quant8(row + EXPERTS, q + (long long)b * LATENT, sf + (long long)b * (LATENT / 32), t - QUANT_WARP0 * 32);
     }
@@ -479,6 +518,11 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
     asm volatile("bar.sync 3, %0;" ::"n"(THREADS - SORT_WARPS * 32));
     for (int c = t - SORT_WARPS * 32; c < READERS; c += THREADS - SORT_WARPS * 32)  // a flag per reader CTA
       asm volatile("st.release.gpu.global.b32 [%0], %1;" ::"l"(ready + c * 64 + b), "r"(1) : "memory");
+    // then the row's ids to each shared-expert block's prefetcher (release: cumulative over warp 0's id
+    // stores, ordered before it by the barrier)
+    asm volatile("bar.sync 4, %0;" ::"n"(32 + THREADS - SORT_WARPS * 32) : "memory");
+    for (int c = t - SORT_WARPS * 32; c < READERS; c += THREADS - SORT_WARPS * 32)
+      asm volatile("st.release.gpu.global.b32 [%0], %1;" ::"l"(ids + c * 64 + b), "r"(1) : "memory");
   }
 
   __syncthreads();
