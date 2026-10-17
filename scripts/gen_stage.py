@@ -1009,9 +1009,16 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         """c[m, n] = a[m, k] @ w[n, k]^T, f32."""
         step(label, f32_op(n, k), a, w, c, m, i32(n), i32(k), i32(n))
 
+    # D's bf16 projections run over the rows rounded up to 8 (rows past `tokens` are scratch nobody reads): cuBLAS's
+    # 1-7-row kernel reads a weight already in L2 at 0.6-0.7x its 8-row rate, and every split-K 1 kernel gives a row
+    # the same bits (work/h/m1.cu)
+    rows8 = dim({"mul": [{"ceil_div": [T, 8]}, 8]}) if xchg and seqs_max % 8 == 0 else B
+
     def proj(label, a, w, c, n, k, m=B, dt="bf16"):
         """A projection whose readers land it: the GEMM lands it (bf16) in P and for D's sums, else f32
         (`dt` the readers' dtype)."""
+        if dt == "bf16" and m is B:
+            m = rows8
         step(label, "gemm_bf16" if dt == "bf16" else f32_op(n, k), a, w, c, m, i32(n), i32(k), i32(n))
 
     def land(label, p, o, n, off, ldc):
