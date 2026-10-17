@@ -10,12 +10,15 @@ them in the TP8 / EP8 / DCP8 decode step. Main at the start: 3.486 ms/step weigh
   `9652f64` (tau by REDUX of the score bits, table counts zeroed early, bit-identical),
   `9eb4ece` (the shared expert's down projection runs beside moe_front as a non-waiting programmatic
   dependent fed by per-row flags, bit for bit cuBLASLt's), `fd69491` (sh_down reads each fragment once
-  up to 24 rows: two warps x 32 rows; eight warps x 16 rows above, bit-identical).
+  up to 24 rows: two warps x 32 rows; eight warps x 16 rows above, bit-identical), `3677977` (sh_down
+  from 25 rows: four warps x 16 rows x every tile), `939a424` (sh_down merged into moe_front's grid,
+  moe_front a programmatic dependent of the front GEMM: one launch less a MoE layer, bit-identical).
   moe_front 6.5-6.6 -> 5.5-5.6 us a call in the step at 8-64 rows (before sh_down moved beside it).
   D 16 layers weighted, against the commit before each in one lease: 3.4857 -> 3.4733 (moe_front
   top-k), 3.4690 -> 3.4665 (tau), 3.4710 -> 3.4540 (sh_down), 3.4497 -> 3.4403 (sh_down layout).
-  HEAD (fd69491) against main in one lease, 3 rounds each: 3.4873 -> 3.4467 ms/step (-1.16%).
-  Launches 12.9/layer (unchanged: sh_down moved, nothing added).
+  HEAD (fd69491) against main in one lease, 3 rounds each: 3.4873 -> 3.4467 ms/step (-1.16%);
+  then 3.4413 -> 3.4393 (3677977) and 3.4460 -> 3.4380 (939a424): about -1.4% against main.
+  Launches 207 -> 192 a step, 12.9 -> 12.0 a layer (939a424).
 - FC1 / FC2: no variant, bucket or grid change beats main's pair (below); the remaining gap is the
   cubins' one CTA per SM (wave quantization, ~46 GB/s a CTA) and FC1's wait at entry.
 - The largest MoE cost left is EP skew (ar_finalize_rms waits for the busiest rank), a placement
@@ -179,7 +182,17 @@ the flags carry that ordering (noted in the commit and the kernel).
   tiles above 24 rows 3.4717, worse. FC1 waits for every grid launched before it (the transitive wait
   above), so sh_down's end, not moe_front's, now sets FC1's start at every row count: moe_front's own
   tail (hand-off, tables) only pays once sh_down is shorter.
-- **sh_down merged into moe_front's grid** (blocks T .. T + 111 of moe_front run the projection;
+- **Committed as `939a424`: the merge works once moe_front itself is a programmatic dependent.** With
+  `pdl: true` on moe_front and griddepcontrol.wait at the entry of every block (it waits for the front
+  GEMM's split-K reduce, then triggers FC1), FC1 runs as fast as before and the merged grid starts
+  ~1.1-1.5 us before the reduce ends: 3.4460 -> 3.4380 ms/step against 3677977, 12.0 launches a layer.
+  Measured from the reduce's end the merged grid ends at 6.0 / 6.0 / 8.1 / 10.0 us at 8 / 24 / 36 / 48
+  rows (HEAD before it: max(moe_front, sh_down) 5.9 / 7.3 / 9.2 / 10.3). In-kernel stamps at 36 rows:
+  SiTU done 1.2 us, the 112 st.release flags stored by 2.25, seen 3.0-3.2, act landed +0.9, GEMM 2.6
+  (4 + 1 tile chunks), end ~6.9. Tried on top, no gain: one gpu fence + relaxed flag stores with
+  3-tile chunks (36 / 48 rows a little better, 16 / 24 a little worse: 3.4360 = 3.4360), 3-tile chunks
+  alone (3.4353 -> 3.4350).
+- The first attempt (below) without that: blocks T .. T + 111 of moe_front run the projection;
   launch_bounds(1024) -> 54-64 registers, no spills; row blocks dispatch first, so no hang): one launch
   less a MoE layer, 207 -> 192 a step (12.9 -> 12.0 / layer), bit-identical (loop/d/check). But
   3.4480 -> 3.4740 ms/step (+0.75%): FC1 runs ~2.2 us longer after the merged kernel, at every layer
@@ -187,7 +200,9 @@ the flags carry that ordering (noted in the commit and the kernel).
   HEAD's sh_down at 24-36 rows. Bisected: merged with the shared blocks idle -> FC1 normal; without
   their GEMM -> normal; with the GEMM (even on garbage weights, even HEAD's exact GEMM code, even
   delayed 0.9 us) -> slow. Not the smem carveout (HEAD with moe_front's dynamic smem raised to 207 KB:
-  equal). Cause not found; reverted. If someone finds it, the merge is worth a launch a layer.
+  equal), not the block size (HEAD's sh_down at 1024 threads: FC1 normal). With FC1 not PDL, merged and
+  separate give the same FC1 (29.6 / 29.5 us): it was the PDL chain. Fixed by launching moe_front as a
+  programmatic dependent too (above).
 - Verification caveat: main itself gave different logits at 24 rows teacher-forced across two leases
   once (48 rows reproducible); compare a candidate against main run in the same batch.
 
