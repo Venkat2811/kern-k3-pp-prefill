@@ -520,6 +520,19 @@ __device__ __forceinline__ void row_scores(const uint4* cand, const RowRegs& r, 
 
 __device__ __forceinline__ float score_of(float sq, float dp) { return dp * rsqrtf(sq * (1.0f / (float)KH) + KEPS); }
 
+// The softmax's p_c = e_c / den: lane c divides, the warp broadcasts (k3_residual.cu's attnres_rms_row), not
+// C divisions a thread: a row's epilogue on one SM of 1024 threads is issue-bound past a few snapshots.
+template <int C>
+__device__ __forceinline__ void softmax_div(float (&e)[C], float den, int lane) {
+  static_assert(C <= 32, "a candidate a lane");
+  float mine = e[0];
+#pragma unroll
+  for (int c = 1; c < C; ++c) mine = lane == c ? e[c] : mine;
+  mine = mine / den;
+#pragma unroll
+  for (int c = 0; c < C; ++c) e[c] = __shfl_sync(0xffffffffu, mine, c);
+}
+
 // The softmax over the candidates' scores, the mix, its rms, the output.
 template <int NB>
 __device__ __forceinline__ void row_mix_norm(const uint4* cand, const RowRegs& r, const V8& pv, float (&sc)[NB + 1],
@@ -532,12 +545,13 @@ __device__ __forceinline__ void row_mix_norm(const uint4* cand, const RowRegs& r
     for (int c = 0; c <= NB; ++c) mx = fmaxf(mx, sc[c]);
 #pragma unroll
     for (int c = 0; c <= NB; ++c) den += (sc[c] = __expf(sc[c] - mx));
+    softmax_div(sc, den, t & 31);
     float acc[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j) acc[j] = 0.f;
 #pragma unroll
     for (int c = 0; c <= NB; ++c) {
-      const float p = sc[c] / den;
+      const float p = sc[c];
       const V8 x = c < NB ? cand_at(cand, c, t) : pv;
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
