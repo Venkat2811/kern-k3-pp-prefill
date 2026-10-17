@@ -137,3 +137,24 @@ Named limits for what is not within 1.15x:
   ~0.4 µs a 16-row tile on top. Only overlapping it with q_b (PDL; round 1:
   no gain, cuBLAS triggers no early launch) could hide the stream.
 - **mla_prep**: one launch, one L2 round trip, ≤ 0.2 µs of bytes: the launch floor.
+
+## Tried after the done table
+
+- **MLA slot caps 6 at 8-15 rows, 3 from 16** (fewer, longer splits at 8 / 16
+  rows; fewer empty slots at 24-48): 3.431 → 3.439 ms/step, 16 × 128k +34
+  µs, 8 rows +5-13 µs; only 48 rows gains (-5 µs). The plan's 8 / 4 splits
+  hold; a (32, 3) tier alone is ~0.4 µs a step: not worth a launch.
+- **kda_core: the decay before the conv** (the window loaded into registers
+  at entry, f_b and the decay computed while it is in flight, the conv and
+  l2 sums after): slower in both builds (S +0.2-0.4 µs, R +0.5-0.8).
+  Reverted.
+- Gaps between graph nodes around these kernels are 0.15 µs each.
+
+## Numerics beyond the check's 4 rows
+
+loop/d/check runs 4 rows, which never reaches the kda register build (≥ 26
+rows), the 4-slot MLA tier (≥ 16) or larger mla_prep / absorb batches. The
+check's 4 rows tiled to 20 and to 36 rows, teacher-forced 640 steps on TP8,
+main's d-l4-tp8 against this branch's (after f8bd7e6): top-1 1.0000, relRMS
+max 0.00000 over every kept row-step, 8 ranks agreeing, at both. (Run
+loop/d/ranks with an absolute OUT: the ranks run on other hosts.)
