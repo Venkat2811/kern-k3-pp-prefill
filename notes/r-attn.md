@@ -112,15 +112,14 @@ Attention floor (the rank's latent rows once, 1152 B a position): 10.3 /
 
 ## Done table (rank 0 busy µs a call in the step, nsys; floors from roofline/decode.md)
 
-A/B shapes, rows × 8k (and 32 × 32k), after 41d420d (kda before its
-ROWS_PER_ITER change: 64 rows is ~1.4 µs lower with it):
+A/B shapes, rows × 8k (and 32 × 32k), the branch at 6029a75:
 
 | kernel | 1 | 8 | 32 | 64 | 32 × 32k | floor (1 / 8 / 32 / 64 / 32×32k) | main (roofline) |
 |---|---|---|---|---|---|---|---|
-| kda_core | 5.89 | 6.34 | 11.17 | 20.75 | 11.15 | 0.29 / 1.87 / 7.29 / 14.52 / 7.29 | 9.5 / 9.6 / 12.2 / 22.8 / 12.2 |
-| mla_attn (DSL) | 8.82 | 10.70 | 16.38 | 27.02 | 36.20 | 0.42 / 2.48 / 7.36 / 12.99 / 22.80 | 8.8 / 10.5 / 27.2 / 48.1 / 43.7 |
-| mla_absorb | 5.10 | 4.90 | 6.00 | 7.81 | 5.99 | 1.72 (12.6 MB) | 6.5 / 6.3 / 7.9 / 10.1 / 7.8 |
-| mla_prep | 1.63 | 1.56 | 1.62 | 1.93 | 1.62 | launch | 3.5 / 3.1 / 3.1 / 3.5 / 3.0 |
+| kda_core | 5.65 | 6.11 | 10.90 | 20.59 | 10.90 | 0.29 / 1.87 / 7.29 / 14.52 / 7.29 | 9.5 / 9.6 / 12.2 / 22.8 / 12.2 |
+| mla_attn (DSL, main's grid) | 8.58 | 10.60 | 27.29 | 50.07 | 43.79 | 0.42 / 2.48 / 7.36 / 12.99 / 22.80 | 8.8 / 10.5 / 27.2 / 48.1 / 43.7 |
+| mla_absorb | 4.79 | 4.89 | 6.03 | 8.37 | 5.99 | 1.72 (12.6 MB) | 6.5 / 6.3 / 7.9 / 10.1 / 7.8 |
+| mla_prep | 1.63 | 1.59 | 1.57 | 2.91 | 1.58 | launch | 3.5 / 3.1 / 3.1 / 3.5 / 3.0 |
 
 Bench shapes (8 / 24 / 36 rows × 64k, 48 × 128k): kda 6.45 / 9.15 / 11.65 /
 13.68; DSL 21.9 / 46.7 / 65.0 / 160.9 (floors 10.3 / 31 / 46 / 123);
