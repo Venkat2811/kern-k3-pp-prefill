@@ -6,20 +6,16 @@ Target: `qkvg`, `front`, `wfu`, `q_b`, `lm_head` (f32 out, `cublas_bf16_tn_f32`)
 
 ## State (rebased on main d85613c)
 
-Offered on this branch, each bit-identical: dbedd6a (own split-K GEMM for qkvg / front at 1-32 rows, -0.54% vs
-main), 2603ca7 (bf16 projections over the rows rounded up to 8: the bench even, 1 row -1.3%, 4 rows -0.3%),
-499159d (our front GEMM pins sh_down in L2 for after the MoE: -0.11%).
-
-
 Merged on main (95bc0b0): the closing add's hints, the all-reduces' loads, the o_proj evict_last pin (3.488 ->
-3.405). On this branch, for the orchestrator: dbedd6a, our own split-K GEMM for qkvg / front at 1-32 rows.
-Against main d85613c, same lease, 3 rounds each: **3.3873 -> 3.3690 ms/step (-0.54%)**; 8 / 16 / 24 rows -12..-33
-us a step, 36 / 48 within +-5. loop/d/check PASS, bit-identical.
+3.405). Offered on this branch, each bit-identical (loop/d/check PASS), against main d85613c in one lease:
+- dbedd6a: our own split-K GEMM for qkvg / front at 1-32 rows: 3.3873 -> 3.3690 ms/step (-0.54%, 3 rounds); 8 /
+  16 / 24 rows -12..-33 us a step, 36 / 48 within +-5.
+- 2603ca7: D's bf16 projections over the rows rounded up to 8: the bench even, 1 row -1.3%, 4 rows -0.3%.
+- 499159d: our front GEMM pins sh_down in L2 for after the MoE: 3.3653 -> 3.3617 (-0.11%, 3 rounds).
 Launches run per step: main's minus one per qkvg / front call at 1-32 rows (cuBLAS's splitKreduce_kernel gone);
 loop/count reads 20.4 a layer against main's 13.7 (it counts the four `when` buckets of gemm_t6400 / gemm_t6016,
-of which one runs; a single bucket loses the whole gain, see below).
-Step p50 at the round's A/B shapes, main 01d6dc5 -> this branch before the rebase (prof8, same lease): 1 x 8k
-2.02 -> 1.95 ms, 8 x 8k 2.52 -> 2.43, 32 x 8k 3.70 -> 3.61, 64 x 8k 4.76 -> 4.65, 32 x 32k 3.78 -> 3.72.
+of which one runs; a single bucket loses the whole gain, see below; three buckets (16 / 24 / 32) would cost ~1 us
+weighted, the 8-row bucket).
 
 ## The table (rank 0, nsys critical path, us a call, main d85613c -> this branch 499159d, ratio to decode.md's HBM floor)
 
@@ -65,6 +61,9 @@ The named limits of what is not within ~1.15x:
   chain a 64-row tile (23 us vs 16.7); kept on cuBLAS.
 - `w_dn` (layer 0 only, after situ), `lm_head` (1 call, 280 MB: the closing add hints the first 96 MB).
 
+Not tried, for a next session: sh_down (and o_proj) computed inside the all-reduce after them (r-ar's kernels, a
+proposal: -1 launch a layer each); qkvg / front at 33-48 rows need a kernel whose A stages do not crowd the weight
+ring (at BN 40 / 48 a 64-row tile keeps only 4 stages at three CTAs an SM).
 
 ## Tools (work/, not committed)
 
@@ -128,9 +127,16 @@ for o_proj and sh_down, nothing for lat_up.
    3.4090 (A/B, -0.25%), o_proj -1.0..-1.3 us a call. Bit-identical x3. Demoting before the loads: front +0.7 us
    a call (3.4105); demoting in the next ar_finalize_rms (pinned through front and the MoE): no gain (3.4185).
    r-ar: two more params on each of your all-reduces (pf2 on finalize, dm on attnres).
-4. **1ba6abe** qkvg / front at 1-32 rows: our own GEMM (`source/k3_gemm_f32.cu`), cuBLAS's split-K order with the
-   reduce in the same launch (cluster of the three splits, DSMEM push, one barrier): 3.4120 -> 3.3995 (A/B,
-   -0.37%). Bit-identical (harness every m 1..48, three seeds; d/check). See "Own f32 GEMM" below.
+4. **dbedd6a** (was 1ba6abe before the rebase) qkvg / front at 1-32 rows: our own GEMM (`source/k3_gemm_f32.cu`),
+   cuBLAS's split-K order with the reduce in the same launch (cluster of the three splits, DSMEM push, one
+   barrier): 3.4120 -> 3.3995 (A/B, -0.37%); rebased, 3.3873 -> 3.3690 vs main d85613c. Bit-identical (harness
+   every m 1..48, three seeds; d/check). See "Own f32 GEMM" below.
+5. **2603ca7** D's bf16 projections (o_proj, sh_down, lat_up, wgu, w_dn) pass m = ceil(tokens / 8) * 8: cuBLAS's
+   1-7-row kernels read L2 at 0.6-0.7x its 8-row one, same bits (work/h/m1.cu). 1 row 1.828 -> 1.804 ms.
+6. **499159d** our front GEMM ends with one cp.async.bulk.prefetch.L2 a CTA at evict_last over its share of the
+   layer's sh_down weight; the next of our GEMMs demotes it before its wait: -0.11%; sh_down 3.7 -> 2.7 us a call
+   at 8 / 24 rows. Issued from warps 2-3 before the epilogue instead (hints a line), front paid 1 us a call (no net
+   gain).
 
 Tried and dropped (A/B in one lease each, ms/step):
 - sh_down before FC1 with its weight appended to front's (one range for the AR to load): 3.429 vs 3.422. Likely
@@ -152,9 +158,6 @@ Tried and dropped (A/B in one lease each, ms/step):
 - wfu with our GEMM (2 splits, block 56): bit-identical, slower than cuBLAS.
 - the f32 projections over the rows rounded up to 8 too (wfu / q_b 1-row cuBLAS kernels are 0.75x their 8-row
   rate from L2, bit-identical; our GEMM's buckets unchanged): 1 row +5 us, the bench even (3.3690 vs 3.3680).
-- sh_down pinned at evict_last by our front GEMM's idle warps after its mainloop (prefetch hints, which survive
-  the MoE stream when given time), demoted by the next of our GEMMs before its wait: 3.3615 vs 3.3625 (head), the
-  no-pin build with the same arguments 3.3680: nothing measurable.
 - o_proj kernel holding its whole slice, second try with A boxes sized to the rows and a 12-deep A ring: still
   6.6 vs 4.6 us after a 9 us PDL predecessor (the dependent 96-MMA chain and the post-wait work, not A).
 - one build for 1-32 rows (run-time N, A box of 32 rows; loop/count 14.6 a layer instead of 19.7): 3.4185 vs
