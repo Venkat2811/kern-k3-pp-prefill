@@ -232,11 +232,15 @@ Before that, as a dependent of FC2:
   `"pdl": True` on both launches in gen_stage.py. Against HEAD in one lease, 3 interleaved rounds:
   ar_finalize alone 3.4373 -> 3.4183 ms/step (-0.55%), both 3.4380 -> 3.4207 (-0.5%); loop/d/check
   bit-identical for both (run it 3 times before merging: Lamport kernels).
-- **For r-attn: the same on `kda_core`, `mla_prep`, `mla_absorb`, `dcp_exchange` is not safe as is.**
-  With griddepcontrol.wait before each one's entry trigger and `pdl: true` (on top of the two AR
-  kernels): 3.4347 -> 3.4143 ms/step, but loop/d/check FAILs (3 extra confident flips, max relRMS
-  0.104), while the AR pair alone is bit-identical. One of the four misbehaves as a programmatic
-  dependent (round 1 saw the same on `land_add2_attnres_rms`); not bisected further. Worth ~-0.14%.
+- **For r-attn: PDL on `kda_core`, `mla_prep`, `mla_absorb` drifts; on `dcp_exchange` it is clean.** With
+  griddepcontrol.wait at entry (before any memory access) and `pdl: true`, loop/d/check: `kda_core` alone
+  12 flips vs main (relRMS max 1.1%), `mla_prep` + `mla_absorb` 124 flips (median 1.0%), both still inside
+  the band; `dcp_exchange` alone bit-identical. Together with the AR pair: 3.4347 -> 3.4143 and a FAIL.
+  All three drifting kernels follow a cuBLAS `gemm_f32` (GEMM + split-K reduce): waiting on that pair
+  as a programmatic dependent apparently does not always see its output. `moe_front` follows the same
+  kind of call and is a programmatic dependent since `939a424`: 6 of 6 loop/d/check runs and
+  teacher-forced logits at 8 / 16 / 24 / 36 / 48 rows are bit-identical to main (a stale front row would
+  change routing and show at once). Why it differs from kda_core is not understood: keep an eye on it.
 - **EP balance (largest MoE lever, outside the fixed layout).** Simulated on the dumped real routing
   (`work/epsim.py`, 64 rows x 160 steps x 15 layers; a replicated expert goes to the holder with fewer
   touched experts so far, which every rank can compute from the same picks): busiest rank's touched
