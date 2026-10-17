@@ -187,8 +187,9 @@ __device__ __forceinline__ unsigned long long merge32(unsigned long long v, int 
 }
 
 #define SORT_WARPS (EXPERTS / 32)
-#define MERGE_WARPS (SORT_WARPS / 2)
-static_assert(EXPERTS % 32 == 0 && SORT_WARPS % 2 == 0 && SORT_WARPS <= 31, "a warp of experts each, merged pairwise");
+#define QUANT_WARP0 (SORT_WARPS - QUANT_THREADS / 32)
+static_assert(EXPERTS % 32 == 0 && TOPK <= SORT_WARPS && SORT_WARPS <= 31 && QUANT_WARP0 > 0,
+              "a warp of experts each, at least TOPK of them; a warp left for the SiTU, the latent's after warp 0");
 
 extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
     const float* __restrict__ S, const float* __restrict__ bias, const __nv_bfloat16* __restrict__ rs,
@@ -197,8 +198,8 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
     int* __restrict__ cta_limit, int* __restrict__ num_non_exiting, int* __restrict__ total_padded,
     int* __restrict__ route_map, int* __restrict__ exp2perm, int first, int T) {
   __shared__ float s_sig[EXPERTS];
-  __shared__ unsigned long long s_list[2][SORT_WARPS][TOPK];
-  __shared__ int s_last;
+  __shared__ unsigned long long s_max[32], s_cand[EXPERTS], s_tau;
+  __shared__ int s_n, s_last;
 
   const int b = blockIdx.x, t = threadIdx.x, warp = t / 32, lane = t % 32;
   asm volatile("griddepcontrol.launch_dependents;");
@@ -206,8 +207,47 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
   if (warp < SORT_WARPS) {
     const float sg = 1.0f / (1.0f + expf(-row[t]));
     s_sig[t] = sg;
-    const unsigned long long v = sort32((unsigned long long)ord_f32(sg + bias[t]) << 32 | (u32)~t, lane);
-    if (lane < TOPK) s_list[0][warp][lane] = v;
+    const unsigned long long key = (unsigned long long)ord_f32(sg + bias[t]) << 32 | (u32)~t;
+    unsigned long long m = key;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) m = max(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if (lane == 0) s_max[warp] = m;
+    if (t == 0) s_n = 0;
+    asm volatile("bar.sync 2, %0;" ::"n"(SORT_WARPS * 32));
+    // tau, the 16th largest warp maximum: at least 16 keys are >= tau, so the top 16 are among them
+    if (warp == 0) {
+      const unsigned long long v = sort32(lane < SORT_WARPS ? s_max[lane] : 0ull, lane);
+      if (lane == TOPK - 1) s_tau = v;
+    }
+    asm volatile("bar.sync 2, %0;" ::"n"(SORT_WARPS * 32));
+    const bool in = key >= s_tau;
+    const unsigned ballot = __ballot_sync(0xffffffffu, in);
+    int at = 0;
+    if (lane == 0 && ballot) at = atomicAdd(&s_n, __popc(ballot));
+    at = __shfl_sync(0xffffffffu, at, 0);
+    if (in) s_cand[at + __popc(ballot & ((1u << lane) - 1))] = key;
+    asm volatile("bar.sync 2, %0;" ::"n"(SORT_WARPS * 32));
+    if (warp == 0) {
+      // the candidates (in no order) 32 at a time: each chunk sorted, its top 16 merged into the running top 16
+      const int n = s_n;
+      unsigned long long top = 0;
+      for (int c = 0; c < n; c += 32) {
+        const unsigned long long v = sort32(c + lane < n ? s_cand[c + lane] : 0ull, lane);
+        const unsigned long long r = __shfl_sync(0xffffffffu, v, 31 - lane);
+        top = c == 0 ? v : merge32(lane < TOPK ? top : r, lane);
+      }
+      if (lane < TOPK) {
+        const int e = (int)~(u32)top;
+        const float sg = s_sig[e];
+        float den = sg;
+#pragma unroll
+        for (int off = TOPK / 2; off > 0; off >>= 1) den += __shfl_xor_sync(0x0000ffffu, den, off);
+        wts[b * TOPK + lane] = (sg / (den + 1e-20f)) * __bfloat162float(rs[0]);
+        idx[b * TOPK + lane] = e;
+      }
+    } else if (warp >= QUANT_WARP0) {
+      quant8(row + EXPERTS, q + (long long)b * LATENT, sf + (long long)b * (LATENT / 32), t - QUANT_WARP0 * 32);
+    }
   } else {
     for (int k = t - SORT_WARPS * 32; k < SITU_THREADS; k += THREADS - SORT_WARPS * 32) {
       const float4 g = reinterpret_cast<const float4*>(row + EXPERTS + LATENT)[k];
@@ -217,31 +257,6 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
       o[1] = __floats2bfloat162_rn(situ_f(g.z, u.z), situ_f(g.w, u.w));
       reinterpret_cast<uint2*>(act + (long long)b * SH)[k] = *reinterpret_cast<const uint2*>(o);
     }
-  }
-  __syncthreads();
-  if (warp < MERGE_WARPS) {
-    // the warps' lists merged pairwise, 28 -> 14 -> 7 -> 4 -> 2 -> 1 (an odd one out merges with nothing)
-    int n = SORT_WARPS, from = 0;
-    for (; n > 1; n = (n + 1) / 2, from ^= 1) {
-      if (warp < (n + 1) / 2) {
-        const int a = 2 * warp, c = 2 * warp + 1;
-        unsigned long long v = lane < TOPK ? s_list[from][a][lane] : c < n ? s_list[from][c][31 - lane] : 0ull;
-        v = merge32(v, lane);
-        if (lane < TOPK) s_list[from ^ 1][warp][lane] = v;
-      }
-      asm volatile("bar.sync 1, %0;" ::"n"(MERGE_WARPS * 32));
-    }
-    if (warp == 0 && lane < TOPK) {
-      const int e = (int)~(u32)s_list[from][0][lane];
-      const float sg = s_sig[e];
-      float den = sg;
-#pragma unroll
-      for (int off = TOPK / 2; off > 0; off >>= 1) den += __shfl_xor_sync(0x0000ffffu, den, off);
-      wts[b * TOPK + lane] = (sg / (den + 1e-20f)) * __bfloat162float(rs[0]);
-      idx[b * TOPK + lane] = e;
-    }
-  } else if (warp < MERGE_WARPS + QUANT_THREADS / 32) {
-    quant8(row + EXPERTS, q + (long long)b * LATENT, sf + (long long)b * (LATENT / 32), t - MERGE_WARPS * 32);
   }
 
   __syncthreads();
