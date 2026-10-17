@@ -4,6 +4,13 @@ Kernels: `k3_kda_core`, MLA (`k3_mla_prep`, `k3_mla_absorb_tc` (`_mma` under `--
 `mla_decode_h96_p64` and its grid), the DCP exchange (`k3_dcp`).
 Previous lane notes: `notes/d-attn.md` (round 1, every idea tried there).
 
+## Status (06:35 UTC): the branch vs main 60f4a4d: 3.233 -> 3.214 ms/step (-0.6%), every shape faster
+
+One lease, 3 rounds (`work/ab.sh`, main's manifest from `git archive main`): 3.232 / 3.232 / 3.235 →
+3.215 / 3.213 / 3.213. On it beyond main: moe_front's bitonic top-k (f285eb9, bit-identical), the tcgen05
+absorb (06bafcf, bit-identical), k3_mla_decode from 24 rows (4ebcfd9; numerics at 36 rows in the commit).
+loop/d/check PASS (bit-identical: its 4 rows take the DSL), P manifests byte-identical to main's.
+
 ## Status (06:10 UTC): k3_mla_decode in the step from 24 rows, -0.19%
 
 4ebcfd9: D's MLA attention runs on our kernel (`source/k3_mla_decode.cu`) from 24 rows, the DSL below (one
@@ -82,6 +89,7 @@ next op was taken.
 | rebased on main 95bc0b0; slot tiers reverted (skewed batches) | 13.7 | **3.386 vs main 3.414** (-0.84%, same lease, 2 rounds) |
 | absorb on tcgen05, a block a head (697a625; vs 68ebced) | 13.7 | 3.367 / 3.368 vs 3.369 / 3.369 (same lease, 2 rounds) |
 | rebased on main 21a9174 (absorb on tcgen05 + the fp8 cast) | 13.7 | **3.294 / 3.293 vs main 3.295 / 3.295** (same lease, 2 rounds; check bit-identical) |
+| rebased on main 60f4a4d; moe_front top-k (f285eb9); k3_mla_decode from 24 rows (4ebcfd9) | 20.7 (main 20.4) | **3.214 vs main 3.233** (same lease, 3 rounds) |
 
 Launches counted 13.7 a layer against main's 12.9: kda_core's second `when`
 launch (S / R builds); one of them runs, so executed launches are unchanged.
