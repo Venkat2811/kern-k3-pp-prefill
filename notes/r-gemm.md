@@ -4,13 +4,17 @@ Target: `qkvg`, `front`, `wfu`, `q_b`, `lm_head` (f32 out, `cublas_bf16_tn_f32`)
 `lat_up`, `wgu`, `w_dn` (bf16 out, `cublaslt_bf16_tn`). Check `loop/d/check loop/out/d-l4-tp8.json`, bench
 `loop/d/bench loop/out/d-l16-tp8.json`. Main 01d6dc5: 12.9 launches/layer, 3.488 ms/step (base-r3).
 
-## State (1ba6abe)
+## State (rebased on main d85613c)
 
-D weighted cost, same-lease A/B: main 3.484 -> 3.40 ms/step (-2.4%), every commit bit-identical vs main.
+Merged on main (95bc0b0): the closing add's hints, the all-reduces' loads, the o_proj evict_last pin (3.488 ->
+3.405). On this branch, for the orchestrator: dbedd6a, our own split-K GEMM for qkvg / front at 1-32 rows.
+Against main d85613c, same lease, 3 rounds each: **3.3873 -> 3.3690 ms/step (-0.54%)**; 8 / 16 / 24 rows -12..-33
+us a step, 36 / 48 within +-5. loop/d/check PASS, bit-identical.
 Launches run per step: main's minus one per qkvg / front call at 1-32 rows (cuBLAS's splitKreduce_kernel gone);
-loop/count reads 19.7 a layer (it counts the four `when` buckets of gemm_t6400 / gemm_t6016, of which one runs).
-Step p50 at the round's A/B shapes, main -> head (prof8, same lease): 1 x 8k 2.02 -> 1.95 ms, 8 x 8k 2.52 -> 2.43,
-32 x 8k 3.70 -> 3.61, 64 x 8k 4.76 -> 4.65, 32 x 32k 3.78 -> 3.72.
+loop/count reads 20.4 a layer against main's 13.7 (it counts the four `when` buckets of gemm_t6400 / gemm_t6016,
+of which one runs; a single bucket loses the whole gain, see below).
+Step p50 at the round's A/B shapes, main 01d6dc5 -> this branch before the rebase (prof8, same lease): 1 x 8k
+2.02 -> 1.95 ms, 8 x 8k 2.52 -> 2.43, 32 x 8k 3.70 -> 3.61, 64 x 8k 4.76 -> 4.65, 32 x 32k 3.78 -> 3.72.
 
 ## The table (rank 0, nsys critical path, us a call, main -> head, ratio to the HBM floor of decode.md)
 
@@ -141,7 +145,11 @@ Tried and dropped (A/B in one lease each, ms/step):
   at 36 rows. qkvg / front from 33 rows stay on cuBLAS.
 - our CTAs' idle warps 2-3 loading the rest of their weight slice before griddepcontrol.wait (real loads): +60 us
   at 8-24 rows (3.4415 vs 3.4000), with or without the closing add's hints: the loads race the TMA stream for the
-  same bytes.
+  same bytes. Stopped when griddepcontrol.wait returns (an smem flag): neutral (3.3945 vs 3.3965), and worse
+  without the closing add's hints (3.4065): our CTAs are not resident early enough for it to matter.
+- prefetching K-major (line t of every row and split before line t + 1, so every CTA's first blocks warm evenly)
+  instead of in address order: worse (hints 15.9 vs 14.3 us after, loads too slow to issue): DRAM page locality
+  matters more than CTA balance.
 - o_proj by a kernel holding its whole 192 KB weight slice in shared memory, requested before
   griddepcontrol.wait (work/h/k3_gemm_pre.cu, bit-identical 1..64 rows): 8.6 vs 5.2 us alone, 7.1 vs 4.7 after a
   9 us PDL predecessor: A's 64-row boxes through a 3-deep ring after the wait cost more than the preload saves.
