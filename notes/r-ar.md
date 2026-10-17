@@ -219,6 +219,7 @@ window's, not the row's.
 | L2_INFLIGHT 6 / 10 MB, AR_GRACE_NS 0 (with 8 MB) | 3.273-3.275 -> 3.278 / 3.281-3.291 / 3.276-3.279 | no |
 | ar_finalize's routed latent summed before griddepcontrol.wait (fc2 is two kernels back) | 3.272-3.275 -> 3.270-3.271 | yes |
 | the closing add's prefetch blocks pass griddepcontrol.wait before their hints | 3.275-3.277 -> 3.270-3.271 | yes |
+| the closing add's prefetch cap again, now after the wait: 8 / 16 / 24 / 32 MB | 3.268-3.269 / 3.267-3.273 / 3.269-3.274 / 3.270-3.271 | 16 MB (flat) |
 | no push spread at all / PUSH_RUN 64 / 256 (one-shot) | 3.276-3.277 -> 3.278-3.279 (8 rows +10 us) / 3.278-3.280 / 3.278 | no: noise |
 | embed_rms_plan's split plan in block B (was: warp 0 of every row block, before the row's norm) | embed alone 4.37-5.14 -> 2.97-3.64 us, the same outputs and splits; step 3.284 -> 3.282 | yes |
 | the mix's norm from the candidates' pairwise dots (MIX_GRAM: the snapshots' scores and pair dots in one reduction before the row is in, the row's score and dots with the snapshots in one after: one reduction after the data instead of two), attention all-reduce | nb 1 / 2, 1-64 rows: -0.1..-0.4 us (nb 2 at 1-8 rows +0.1); 0.17-0.46% of outputs move, max rel 0.014 (1-2 bf16 ulp: the norm of the f32 mix, not of its bf16 rounding) | 3.267 / 3.266 -> 3.266 / 3.271 | no: flat, and it moves outputs |
@@ -248,3 +249,12 @@ Note on checking: loop/d/check runs 4 rows, i.e. only the one-shot path. Every t
 harness instead: outputs at 8-64 rows bit-for-bit equal to the variant before on every rank (no DIFF in any rank's
 log). The 16-layer bench only runs nb 1-2 (attnres calls: 13 at nb 1, 4 at nb 2), so work for many snapshots does
 not show in the score.
+
+## Not pursued: the closing add folded into the MoE all-reduce
+
+latent_norm = rms(sum_r latent_r) * gamma feeds only lat_up, and the rms is a scalar a row, so lat_up(latent_norm) =
+s * sum_r W_up (gamma . latent_r): each rank could run lat_up on its own partial before the exchange, the exchange
+would carry [latent | W_up partial | shared] (17920 wide, for the latent's sum of squares and the two sums), and the
+closing add (prefix2 + s * y + shared, the next mix and norm) would be its epilogue. But the routed finalize then needs
+its own launch before lat_up (fc2's rows are permuted by expert), so the launches stay at five a MoE layer, the
+message grows 67%, and the GEMM sees bf16 partials instead of the rounded sum (a numerics change). Not worth it.
