@@ -202,8 +202,14 @@ us per call (harness, 8192 positions a member, the plan's splits):
   length, split count, lse and first four splits' o loaded before this one merges; 128 registers,
   bit-identical): none moved 24-48 rows. bf16 partials (the Cake path's) would halve the reads: the
   attention's output format, not the exchange's. Caveat: the harness writes the partials once at
-  setup; in the step the attention writes them just before, so they sit in L2 and the step's merge
-  phase may be faster than the harness's.
+  setup; rewriting them just before each call (as the attention does in the step) gives the same
+  times (`X_DCP_HOT`: 10.3 / 10.0 / 11.0 / 12.2 / 15.6 / 20.1 / 23.0 us at 1-64 rows).
+- Nsight Compute on the merge phase alone (24 rows, its pushes to local memory, one GPU): latency-
+  bound, L1TEX scoreboard 47% of the stalls at 16 warps an SM (25% occupancy: 94-128 registers and
+  the v-up's 64 KB W stage allow two blocks an SM), SMs active 56% of the elapsed cycles (the
+  blocks with 3 items against 2), DRAM 19% (1.5 TB/s, ncu's L2 flushed). More warps need a smaller
+  W stage and fewer registers, and room left for the o_proj GEMM launched behind it (grid 304 took
+  that room: step slower). Not done.
 - Left: at 36-64 rows the push of R x 96 records of 1 KB (5.4 MB at 64 rows, 7.7 us at the
   all-to-all rate) and two merge rounds; at 1-24 rows the merge chain (load lse, weights, o, push)
   then the v-up. Applying W_UV before the exchange would cut the bytes 4x but needs every head's
