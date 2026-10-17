@@ -41,6 +41,7 @@ next op was taken.
 | mla_prep fast path at TP8 (41d420d) | 13.9 | 3.436 (vs 3.441) |
 | kda ROWS_PER_ITER 1 / 2 (f8bd7e6), copy issue from 16 threads | 13.9 | 3.431 (vs 3.433) |
 | rebased on main 95bc0b0; slot tiers reverted (skewed batches) | 13.7 | **3.386 vs main 3.414** (-0.84%, same lease, 2 rounds) |
+| absorb on tcgen05, a block a head (697a625; vs 68ebced) | 13.7 | 3.367 / 3.368 vs 3.369 / 3.369 (same lease, 2 rounds) |
 
 Launches counted 13.7 a layer against main's 12.9: kda_core's second `when`
 launch (S / R builds); one of them runs, so executed launches are unchanged.
@@ -188,6 +189,9 @@ Named limits for what is not within 1.15x:
   = launch + one HBM round trip + 12.6 MB at 7.3 TB/s in one wave; the MMA
   ~0.4 µs a 16-row tile on top. Only overlapping it with q_b (PDL; round 1:
   no gain, cuBLAS triggers no early launch) could hide the stream.
+  After 697a625 (tcgen05, below): 4.96 / 4.64 / 4.58 / 4.80 / 5.09 / 5.12 /
+  5.44 µs at 1 / 8 / 16 / 24 / 36 / 48 / 64 rows, one GPU: the load plus
+  ~0.9-1.7 µs of the last column group's MMA, TMEM read and stores.
 - **mla_prep**: one launch, one L2 round trip, ≤ 0.2 µs of bytes: the launch floor.
 
 ## Tried after the done table
@@ -430,3 +434,28 @@ math, TMEM O, bf16 P) to write and tune from PTX, more than this session.
   would remove ~10% of the R build's ~1200 instructions a thread; the m / aq
   chains are sequential sums and do not pair without reordering them. At
   48 rows that is worth ≲ 0.3 µs a call: not attempted.
+
+## mla_absorb on tcgen05 (697a625)
+
+- **mma.sync on GB300** (`work/mma/hmma.cu`): m16n8k16 bf16 → f32 peaks at
+  ~2030 flop/clk/SM (596 TF), a quarter of tcgen05's 8190; a dependent chain
+  issues one every ~22 cycles. Absorb's 48-row tiles were ~1.2 µs of that
+  throughput plus three serial tile chains: 6.66 µs against 3.7 of loads.
+- **A kernel that uses TMEM is resident one block an SM** (`work/mma/occk.cu`:
+  cudaOccupancy gives 1 for a 256-thread kernel with only a 64-column
+  tcgen05.alloc, 8 without; EIATTR AT_ENTRY_FRAGMENT_TMEM). A hybrid that kept
+  main's mma.sync path below 17 rows in the same kernel ran it at 8 µs (one
+  block an SM instead of three). So the tcgen05 build is a block a head: 96
+  blocks, W_UK's 128 KB a head by 8 TMA boxes (64 columns x 128 rows, 128 B
+  swizzle: the MN-major SW128 atoms the A descriptor reads, LBO = the 16 KB
+  box, SBO = 1 KB), q once a head (main loaded it 4x), D^T in TMEM (M = 128
+  columns, N = rows to 16), four groups pipelined behind their boxes.
+- Bit-identical to mma.sync at 1-64 rows (every output byte), and
+  loop/d/check bit-identical vs main. One GPU, µs at 1 / 8 / 16 / 24 / 36 /
+  48 / 64 rows: 4.64 4.77 4.96 5.63 6.34 6.66 7.49 → 4.96 4.64 4.58 4.80 5.09
+  5.12 5.44. 1 row loses 0.3 µs: the last group's commit → TMEM read →
+  stores is longer than one mma.sync tile, and 96 blocks pull 128 KB each.
+- The fp8 query (`--kv fp8`) keeps k3_mla_absorb_mma: its e4m3 casts without
+  saturation are software (16.4 µs at 48 rows in either build); a cast by
+  `cvt.rn.satfinite` with a NaN fix-up past 448 would be the same bits and
+  hardware speed. Not D's bench: noted, not done.
