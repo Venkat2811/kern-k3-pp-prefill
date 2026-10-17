@@ -142,42 +142,52 @@ sha256 = "294904766b0a807501ef596c0698dfa819713085d5510981f427b30c8ef77920"
 source = "source/k3_mla_absorb_tc.cu"
 
 [kernels."k3_kda_core+KDA_CONV=1"]
-sha256 = "c660d3fc935aabff7a2ab3ce70c18445c492611b71dac67add576baf85dd1637"
+sha256 = "92dd3a341f7651dbe7ce50dc5258d180a0492cf0b7a416900f3789228bf759d7"
 source = "source/k3_kda_core.cu"
 defines = { KDA_CONV = 1 }
 
 [kernels."k3_kda_core+KDA_CONV=1+KDA_SMEM_STATE=1+ROWS_PER_ITER=1"]
-sha256 = "43e7700b231ac0ac99a2dbbf3f080b5f7d498ff5d99922557ad15aae9055aa69"
+sha256 = "c034a55f66779ed94d0c9e7e0f29dc04ab94c9ac3fe77b4d1a27271c51b086f9"
 source = "source/k3_kda_core.cu"
 defines = { KDA_CONV = 1, KDA_SMEM_STATE = 1, ROWS_PER_ITER = 1 }
 
 [kernels."k3_kda_core+KDA_CONV=1+KDA_MINB=4+ROWS_PER_ITER=2"]
-sha256 = "d793cd7507ba65af610532a3be931ff9462a889d69641808d5a27b2f088c2cac"
+sha256 = "9b810ac0feb9abcfcd710200a401edb41e4b37b5048015fcd9bf459a778d8983"
 source = "source/k3_kda_core.cu"
 defines = { KDA_CONV = 1, KDA_MINB = 4, ROWS_PER_ITER = 2 }
 
+[kernels."k3_kda_core+KDA_CONV=1+KDA_PDL=1+KDA_SMEM_STATE=1+ROWS_PER_ITER=1"]
+sha256 = "3b5cee4e3b53abc419c6ca5a3ba876ed99cee6abd461b7347e866ea187691582"
+source = "source/k3_kda_core.cu"
+defines = { KDA_CONV = 1, KDA_PDL = 1, KDA_SMEM_STATE = 1, ROWS_PER_ITER = 1 }
+
+[kernels."k3_kda_core+HEADS=12+KDA_CONV=1+KDA_PDL=1+KDA_SMEM_STATE=1+LDS=6400+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400"]
+sha256 = "6959515f34ce5511de91684bd5076dd8071194987ba825b9fc93bfc3c213afdb"
+source = "source/k3_kda_core.cu"
+defines = { HEADS = 12, KDA_CONV = 1, KDA_PDL = 1, KDA_SMEM_STATE = 1, LDS = 6400, ROWS_PER_ITER = 1, WSM_FA = 12, WSM_LDS = 6400 }
+
 [kernels."k3_kda_core+HEADS=12+KDA_CONV=1+KDA_SMEM_STATE=1+LDS=6400+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400"]
-sha256 = "92df459c5c3ef223433c2456c2ad18ade9853c4b3bef1836d04fc8827c0a569b"
+sha256 = "819b3fd2cb56e900303a317032175a8bcb6044cb149ee36ef36a093e408bec55"
 source = "source/k3_kda_core.cu"
 defines = { HEADS = 12, KDA_CONV = 1, KDA_SMEM_STATE = 1, LDS = 6400, ROWS_PER_ITER = 1, WSM_FA = 12, WSM_LDS = 6400 }
 
 [kernels."k3_kda_core+HEADS=12+KDA_CONV=1+KDA_MINB=4+LDS=6400+ROWS_PER_ITER=2+WSM_FA=12+WSM_LDS=6400"]
-sha256 = "9c8b9e33ea1073758d0fd38347a66a834a704e1c26b04b85b5d8ab26149733f8"
+sha256 = "ec1f9574d83e07211810d17e3718b5b5f7a0cb008c44741b731314771af735db"
 source = "source/k3_kda_core.cu"
 defines = { HEADS = 12, KDA_CONV = 1, KDA_MINB = 4, LDS = 6400, ROWS_PER_ITER = 2, WSM_FA = 12, WSM_LDS = 6400 }
 
 [kernels."k3_kda_core+CONV_TAP_MAJOR=1+HEADS=12+KDA_CONV=1+KDA_SMEM_STATE=1+LDS=6400+LINE_GUARD=1+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400"]
-sha256 = "472378a6fba4f59d55f757a0f5afb0fa7e8d352d8e42547d0eabae1b2ec26c13"
+sha256 = "64aad0b2da69f8ee45652e35c0abaff1bc5de541d061449a9fddf6a1628e94d6"
 source = "source/k3_kda_core.cu"
 defines = { CONV_TAP_MAJOR = 1, HEADS = 12, KDA_CONV = 1, KDA_SMEM_STATE = 1, LDS = 6400, LINE_GUARD = 1, ROWS_PER_ITER = 1, WSM_FA = 12, WSM_LDS = 6400 }
 
 [kernels."k3_kda_core+CONV_TAP_MAJOR=1+HEADS=12+KDA_CONV=1+KDA_MINB=4+LDS=6400+LINE_GUARD=1+ROWS_PER_ITER=2+WSM_FA=12+WSM_LDS=6400"]
-sha256 = "e7a63ae92c5f81d6434b8a04e85c5a182227967c8b06e9c3221e6be870de85d3"
+sha256 = "19fd3cdd31553e35dc38b38452f17f89a2338d73512cc66624a2d8fdb3a59b54"
 source = "source/k3_kda_core.cu"
 defines = { CONV_TAP_MAJOR = 1, HEADS = 12, KDA_CONV = 1, KDA_MINB = 4, LDS = 6400, LINE_GUARD = 1, ROWS_PER_ITER = 2, WSM_FA = 12, WSM_LDS = 6400 }
 
 [kernels."k3_kda_core+HEADS=12+KDA_CONV=1+LDS=6400+WSM_FA=12+WSM_LDS=6400"]
-sha256 = "4bff3d9d596b42aed1bc6213d82e0938b22098cc53c19c56be7f6e6c12a30a54"
+sha256 = "df31c34aa46e4ec8a819f43364dfadd21d455304d3fd9ad4cb31529eeeaad60c"
 source = "source/k3_kda_core.cu"
 defines = { HEADS = 12, KDA_CONV = 1, LDS = 6400, WSM_FA = 12, WSM_LDS = 6400 }
 
@@ -224,7 +234,7 @@ source = "source/k3_kda_rec.cu"
 defines = { K12_LD = 49408 }
 
 [kernels."k3_kda_core+CONV_TAP_MAJOR=1+HEADS=12+KDA_CONV=1+LDS=6400+LINE_GUARD=1+WSM_FA=12+WSM_LDS=6400"]
-sha256 = "be7abb8f6c6d8bc064264397681d5d5cae4b1ba821129933089f578602356bfa"
+sha256 = "4e48ace9c94857819045c632cfb66bd041d4810313b74a55b3bbf1e6fd75fe14"
 source = "source/k3_kda_core.cu"
 defines = { CONV_TAP_MAJOR = 1, HEADS = 12, KDA_CONV = 1, LDS = 6400, LINE_GUARD = 1, WSM_FA = 12, WSM_LDS = 6400 }
 

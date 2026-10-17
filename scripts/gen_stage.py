@@ -522,13 +522,17 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                        "in buffer<f32>", "in buffer<f32>", "inout state", "in buffer<i32>", "i64", "out buffer<bf16>",
                        "i32", "in buffer<i32>", "i32"],
             # a batch whose blocks fit two an SM takes the build that copies the state into shared memory
-            # at entry; a larger one the register build, four an SM (k3_kda_core.cu)
+            # at entry, a programmatic dependent of the projection (ours there, which lets it on at entry): its
+            # cache and weight loads go out under the projection's tail; a larger one the register build, four
+            # an SM (k3_kda_core.cu)
             "impl": {"launches": [
                 launch("k3_kda_core", "kern_k3_kda_core", grid=[T, hl, 1], smem=smem, when={"var": T, **when},
                        defines={"KDA_CONV": 1, **(kda_defs or {}), **defs,
-                                **({"LDS": kfused, "WSM_LDS": kfused, "WSM_FA": hl} if kfused else {})})
-                for defs, smem, when in (({"KDA_SMEM_STATE": 1, "ROWS_PER_ITER": 1}, KDA_STATE_SMEM, {"max": kda_smem_rows}),
-                                         ({"KDA_MINB": 4, "ROWS_PER_ITER": 2}, 0, {"min": kda_smem_rows + 1}))]},
+                                **({"LDS": kfused, "WSM_LDS": kfused, "WSM_FA": hl} if kfused else {})}, **extra)
+                for defs, smem, when, extra in (
+                    ({"KDA_SMEM_STATE": 1, "ROWS_PER_ITER": 1, "KDA_PDL": 1}, KDA_STATE_SMEM, {"max": kda_smem_rows},
+                     {"pdl": True}),
+                    ({"KDA_MINB": 4, "ROWS_PER_ITER": 2}, 0, {"min": kda_smem_rows + 1}, {}))]},
         },
         "mla_attn": cake_attn_op(seqs_max) if fp8 else mla_attn_op(seqs_max, mla_split_max, reduce=not xchg,
                                                                     ours_from=MLA_OURS_FROM if xchg else None),

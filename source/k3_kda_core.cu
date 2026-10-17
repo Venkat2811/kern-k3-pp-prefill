@@ -246,7 +246,7 @@ extern "C" __global__ __launch_bounds__(128, KDA_MINB) void kern_k3_kda_core(
   const int b = blockIdx.x;
   const int h = blockIdx.y;
 #endif
-#if KDA_CONV
+#if KDA_CONV && !KDA_PDL
   // cuBLAS's GEMM behind this kernel launches as a programmatic dependent and waits on its own:
   // let it get its blocks onto the SMs now.
   asm volatile("griddepcontrol.launch_dependents;");
@@ -301,31 +301,42 @@ extern "C" __global__ __launch_bounds__(128, KDA_MINB) void kern_k3_kda_core(
                  ::"r"((unsigned)__cvta_generic_to_shared(sh_rec) + d * (KD * KD * 4 / KDA_BULKN)),
                  "l"(rec_src + d * (KD * KD * 4 / KDA_BULKN)), "r"(KD * KD * 4 / KDA_BULKN), "r"(bar) : "memory");
 #endif
+#if KDA_CONV
+  // the conv window (this row's cache line) and taps
+  const int c = base + d;
+#if CONV_TAP_MAJOR
+  bf16* win = reinterpret_cast<bf16*>(reinterpret_cast<char*>(conv_base) + (long long)conv_index[b] * conv_bytes) + c;
+#else
+  bf16* win = reinterpret_cast<bf16*>(reinterpret_cast<char*>(kda_base) + (long long)line_index[b] * line_bytes +
+                                      (long long)HEADS * KD * KD * 4) + c;
+#endif
+  bf16 w[3][3];
+  float k[3][4];
+#pragma unroll
+  for (int s = 0; s < 3; ++s) {
+    w[s][0] = win[s * CONV_STREAM], w[s][1] = win[s * CONV_STREAM + CONV_TAP], w[s][2] = win[s * CONV_STREAM + 2 * CONV_TAP];
+#pragma unroll
+    for (int t = 0; t < 4; ++t) k[s][t] = cw[(size_t)s * 4 * INNER + t * INNER + c];
+  }
+#endif
+  const float dtb = dt_bias[base + d], alog = a_log[h], gam = gamma_o[d];
+#if KDA_PDL
+  // Launched as a programmatic dependent of the projection: everything above reads the cache and the weights,
+  // everything below its output.
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
   const float wsm_beta = wsm_partial[(size_t)b * WSM_LDS + h];
   const float wsm_flow = wsm_partial[(size_t)b * WSM_LDS + WSM_FA + d];
-  const float dtb = dt_bias[base + d], alog = a_log[h], gam = gamma_o[d];
   const float gate_raw = gate_partial[(size_t)b * LDS + 3 * INNER + base + d];
 
   // ---- l2norm chain for q and k (all-bf16 chain, f32 sums) ----
 #if KDA_CONV
   bf16 qkv[3];
   {
-    const int c = base + d;
-#if CONV_TAP_MAJOR
-    bf16* win = reinterpret_cast<bf16*>(reinterpret_cast<char*>(conv_base) + (long long)conv_index[b] * conv_bytes) + c;
-#else
-    bf16* win = reinterpret_cast<bf16*>(reinterpret_cast<char*>(kda_base) + (long long)line_index[b] * line_bytes +
-                                        (long long)HEADS * KD * KD * 4) + c;
-#endif
-    bf16 w[3][3];
-    float x[3], k[3][4];
+    float x[3];
 #pragma unroll
-    for (int s = 0; s < 3; ++s) {
-      w[s][0] = win[s * CONV_STREAM], w[s][1] = win[s * CONV_STREAM + CONV_TAP], w[s][2] = win[s * CONV_STREAM + 2 * CONV_TAP];
-      x[s] = gate_partial[(size_t)b * LDS + s * INNER + c];
-#pragma unroll
-      for (int t = 0; t < 4; ++t) k[s][t] = cw[(size_t)s * 4 * INNER + t * INNER + c];
-    }
+    for (int s = 0; s < 3; ++s) x[s] = gate_partial[(size_t)b * LDS + s * INNER + c];
 #pragma unroll
     for (int s = 0; s < 3; ++s) {
       const bf16 xb = __float2bfloat16_rn(x[s]);
