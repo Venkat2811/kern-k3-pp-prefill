@@ -12,12 +12,14 @@ them in the TP8 / EP8 / DCP8 decode step. Main at the start: 3.486 ms/step weigh
   dependent fed by per-row flags, bit for bit cuBLASLt's), `fd69491` (sh_down reads each fragment once
   up to 24 rows: two warps x 32 rows; eight warps x 16 rows above, bit-identical), `3677977` (sh_down
   from 25 rows: four warps x 16 rows x every tile), `939a424` (sh_down merged into moe_front's grid,
-  moe_front a programmatic dependent of the front GEMM: one launch less a MoE layer, bit-identical).
+  moe_front a programmatic dependent of the front GEMM: one launch less a MoE layer, bit-identical),
+  `028c43a` (above 24 rows the shared-expert blocks multiply on tcgen05 into TMEM, bit-identical).
   moe_front 6.5-6.6 -> 5.5-5.6 us a call in the step at 8-64 rows (before sh_down moved beside it).
   D 16 layers weighted, against the commit before each in one lease: 3.4857 -> 3.4733 (moe_front
   top-k), 3.4690 -> 3.4665 (tau), 3.4710 -> 3.4540 (sh_down), 3.4497 -> 3.4403 (sh_down layout).
   HEAD (fd69491) against main in one lease, 3 rounds each: 3.4873 -> 3.4467 ms/step (-1.16%);
-  then 3.4413 -> 3.4393 (3677977) and 3.4460 -> 3.4380 (939a424): about -1.4% against main.
+  then 3.4413 -> 3.4393 (3677977), 3.4460 -> 3.4380 (939a424) and 3.4340 -> 3.4317 (028c43a): about
+  -1.5% against main.
   Launches 207 -> 192 a step, 12.9 -> 12.0 a layer (939a424).
 - FC1 / FC2: no variant, bucket or grid change beats main's pair (below); the remaining gap is the
   cubins' one CTA per SM (wave quantization, ~46 GB/s a CTA) and FC1's wait at entry.
@@ -70,6 +72,7 @@ Real text, teacher-forced (`work/dprof2.sh`, `work/mkrows.py` rows), 16-layer st
 | FC1 meas / floor (x) | 8.8 / 3.2 (2.75) | 28.1 / 20.4 (1.38) | 60.6 / 47.8 (1.27) | 72.9 / 57.6 (1.27) | 91.8 / 80.2 (1.14) | 105.9 / 93.4 (1.13) | cubin waves + entry wait |
 | FC2 meas / floor (x) | 5.4 / 1.6 (3.4) | 13.7 / 10.2 (1.34) | 29.1 / 23.9 (1.22) | 34.9 / 28.8 (1.21) | 43.8 / 40.1 (1.09) | 50.7 / 46.7 (1.09) | cubin waves |
 | moe_front now / est. floor | 5.9 / 4.3 | 5.6 / 4.3 | 5.5 / 4.3 | 5.6 / 4.3 | 5.6 / 4.3 | 5.7 / 4.3 | latency chain (below) |
+| moe_front + shared projection (`028c43a`, bench) | | 7.2 | 7.5 | | 11.1 | | 36 rows 8.3; see sh_down below |
 
 (1-row FC numbers are bench routing: 2.0 touched experts on rank 0 either way. 32 and 64 rows: touched
 counts from the first rows of the 64-row dump, the profile from its own 32 / 64-row file.)
@@ -203,6 +206,33 @@ the flags carry that ordering (noted in the commit and the kernel).
   equal), not the block size (HEAD's sh_down at 1024 threads: FC1 normal). With FC1 not PDL, merged and
   separate give the same FC1 (29.6 / 29.5 us): it was the PDL chain. Fixed by launching moe_front as a
   programmatic dependent too (above).
+- **Committed as `028c43a`: tcgen05 above 24 rows.** One thread issues 48 `tcgen05.mma.cta_group::1.kind::f16`
+  (M = 64 W rows, N = rows rounded to 8, K = 16) into 64 TMEM columns; operands K-major in 128-byte swizzle
+  atoms (8 rows x 64 k, SBO 1 KB, the descriptor advanced 32 B a K step inside an atom); warp w reads tile
+  w / 4 of TMEM lane quarter w % 4 (`32x32b.x8`; M = 64 puts D row 16 q + l in lane 32 q + l). Bit for bit
+  cuBLASLt at 1-64 rows in the harness (`work/umma`), teacher-forced logits byte-identical at 32 / 36 / 48.
+  What it took (harness stamps): the no-swizzle core-matrix layouts land the operands 3-5 us late (either
+  the global reads or the shared writes of a warp scatter over 8 lines; cp.async wants both contiguous),
+  the 128-byte swizzle lands them as fast as the pitched rows. One M = 64 MMA occupies the tensor pipe
+  ~25 ns whatever N (two interleaved accumulator chains take twice as long), and the issuing thread's
+  descriptor arithmetic must be constant offsets on a precomputed descriptor (else ~100 ns an MMA): 48
+  MMAs ~1.2 us at any row count, against mma.sync's 1.4 us at 8 rows and 2.6 at 36. In the step: 3.4340
+  -> 3.4317 ms/step; moe_front 9.1 -> 8.3 us at 36 rows, unchanged at 48 (11.1).
+- Tried on `028c43a`, not better:
+  - Wsh stored as the swizzled shared-memory images (a load-time derive kernel), the row blocks writing their
+    SiTU rows into one image, the blocks fetching both by `cp.async.bulk` (12 x 8 KB, mbarrier tx counts)
+    and tcgen05 at every row count: bit-identical, 5.9-6.0 us at 8-48 rows in the harness (HEAD 5.4-7.8),
+    but in the step moe_front +0.6 us at 8 / 24 rows (-0.7 at 48): 3.4327 -> 3.4353. The same images
+    gathered by cp.async into the pitched rows with mma.sync up to 24 rows: 3.4347 -> 3.4330, noise; not
+    worth a second weight layout. Probably the bulk copies' 11 MB burst slows the row blocks' L2 round trips.
+  - At 41+ rows (48 + 112 blocks > 152 SMs: 8 shared-expert blocks wait for a second wave) a grid of 152
+    (`when`) with row blocks 0..7 taking the leftover column tiles after their row: moe_front 11.1 -> 12.4
+    us at 48 rows with the weights prefetched at entry (they queue ahead of the row's own loads), 11.4 with
+    the prefetch from the SiTU warps after publishing. The second wave is not what costs at 48 rows.
+- Tried on `939a424`: the shared-expert blocks land the SiTU rows themselves from the f32 front rows (no
+  flags, no `sh_ready`, row blocks without SiTU warps): bit-identical, but 3.4350 -> 3.4757 ms/step
+  (+1.2%), the loss growing with rows (+0.05 ms at 24-36, +0.1 at 48): each of the 112 blocks reads T x
+  6 KB of f32 gate | up instead of T x 1.5 KB of bf16 rows (24 MB of L2 reads at 36 rows).
 - Verification caveat: main itself gave different logits at 24 rows teacher-forced across two leases
   once (48 rows reproducible); compare a candidate against main run in the same batch.
 
