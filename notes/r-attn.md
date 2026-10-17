@@ -4,6 +4,18 @@ Kernels: `k3_kda_core`, MLA (`k3_mla_prep`, `k3_mla_absorb_mma`, the DSL
 `mla_decode_h96_p64` and its grid), the DCP exchange (`k3_dcp`).
 Previous lane notes: `notes/d-attn.md` (round 1, every idea tried there).
 
+## Status (02:57 UTC): lane closed
+
+Branch vs main 95bc0b0: D 3.414 → 3.386 ms/step (-0.84%), bit-identical
+(loop/d/check, and teacher-forced at 20 / 36 rows), launches 12.9 → 13.7 a
+layer counted (kda_core's two `when` builds; one runs). What moved:
+kda_core (9.2 → 5.7 µs at 8 rows, 14.0 → 13.0 at 48), absorb (6.05 → 4.8),
+mla_prep (3.1 → 1.6). The MLA slot tiers were reverted (skewed batches).
+Every kernel's remaining gap is named in "Done table" with its ablation /
+ncu numbers; the DSL attention is a closed prebuilt; k3_dcp is r-comm's.
+Every other D op belongs to another run and P is closed this round, so no
+next op was taken.
+
 ## State
 
 | | launches/layer (d-l16-tp8) | D weighted (A/B, same lease) |
@@ -239,7 +251,16 @@ overlapping its stream (register build), as the done table says.
    The exchange (r-comm's k3_dcp) would read a long row's partials from B's
    workspace. Costs one more launch a MLA layer and a contract change in
    k3_dcp; worth it only if real batches' long rows are rare and short rows
-   many.
+   many. A variant that leaves k3_dcp alone: B over every row with 12
+   slots writing at acc_o + 4 splits (a static offset: the split stride is
+   512 floats), each long row's page table shifted by 4 x per tiles and its
+   length cut by as much (rows of <= 4 splits get length 0 in B, and B's
+   empty slots land at split indices the exchange never reads). It breaks
+   where B's per (ceil of the remaining tiles over S - 4) comes out below
+   the plan's per: B then writes fewer than S - 4 splits and the exchange,
+   which derives S from (seq_lens, bsk), merges a stale one. It needs the
+   plan to pick per so the remainder divides evenly, or the exchange to
+   take B's split count.
 - **absorb as a programmatic dependent** (pdl, W_UK's loads before
   griddepcontrol.wait, the query after): bit-identical, but absorb's busy
   time rises (8 rows 5.03 → 5.34 µs, 24 rows 5.80 → 6.21; its predecessor is
