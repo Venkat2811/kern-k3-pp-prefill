@@ -10,7 +10,41 @@ Rebased onto main 95bc0b0 (r-gemm's L2 loads in the exchanges, 3.411-3.416 ms/st
 commits on it were flat (3.418-3.420: 8-24 rows faster, 36/48 rows +20 us, the spread push delaying the idle
 blocks' weight loads); with the spread only below 33 rows, 3.404-3.405 (-0.2%).
 
-## Where it stands (03:25 UTC, rebased on main d85613c)
+## Where it stands (05:30 UTC, on main fd5c92c)
+
+Two commits on main fd5c92c (3.244-3.247 ms/step, same lease):
+- **6535bd6 one kernel entry per snapshot count** (`kern_k3_ar_attnres_rms_nb<N>`,
+  `kern_k3_land_add2_attnres_rms_nb<N>`, an op a count from `nb_op`): 3.235-3.236 (-0.3%), every shape faster or
+  equal, bit-identical (check x3, and the 16-layer manifest teacher-forced: logits and every rank's tokens
+  byte-identical). Worth more in the 93-layer step than in the bench: see "Cold code" below.
+- **ba3b52b `early` on ar_finalize_rms**: the routed latent is weighted before griddepcontrol.wait only when the
+  call before is not fc2 (the generator checks whether it takes `moe.fc2_out`). Today always 1 (sh_down sits
+  between): flat. It guards the merge with r-moe's branch, which moves sh_down out from between fc2 and this
+  all-reduce: without it the pre-wait read of fc2's output would race. A d-l4 copy with early = 0 checks
+  bit-identical.
+
+## Cold code: why nb >= 2 cost +6 us a call in the step (05:00 UTC)
+
+Per-call own time in the step (work/ar/percall.py: end minus the previous kernel's end, min over the ranks) put
+the attention all-reduce at 13.1-16.4 us a call in layers 12-15 against 7.0-9.0 in layers 1-11, at every shape.
+Layers 12-15 are the bench's nb = 2 calls. Bisected with timing-only manifests (call args edited):
+- nb 2 forced to 1 in layers 12-15: 7.4-8.7 us; nb 2 moved to layers 2-5: those slow, 12-15 fast. It is nb.
+- the kernel alone (harness, hot, spacer 3 us, --pf 86): nb 1 / 2 / 4 at 8 rows 12.42 / 12.56 / 13.66 us. Not
+  the arithmetic.
+- per-block globaltimer stamps written into an unused snapshot slot (blocks[3, 7]) and dumped from a
+  teacher-forced run (`--dump blocks`, work/ar/stamps.py), us from the first block's entry, nb 1 / nb 2:
+  push and clear done 2.3 / 2.9, the snapshots' scores 2.7 / 5.0, the row's data in 6.2-6.7 / 12.5, done
+  8.0 / 15.3; the idle blocks' push and clear (no nb in their code) 2.85 / 4.0 with the load window off. Every
+  phase slower, on every rank (the data comes late because the peers push late).
+- the same NB = 2 body behind its own extern "C" entry: **8.2-9.0 us** (from 13.5-16.2).
+The kernel was one function, a switch over nine inlined copies of its body (390 KB of SASS; the closing add
+128 KB). nb 1's copy sat right after the entry; nb 2's ~110 KB in. In the step the code is cold at every call
+(L2 holds weights between), and code far from the entry runs slowly. Code size past the entry did not show:
+the two-shot paths compiled out of the nb 1 entry (40 -> 30 KB) measured within noise per call (sum of the
+step's exchange calls 309 vs 318 us, outliers both ways). No other D kernel is shaped like that (largest
+entries: ar_finalize_rms 53 KB, dcp_exchange 38 KB, gemm_f32 23-25 KB, kda_core 20 KB).
+
+## Before that (03:25 UTC, rebased on main d85613c)
 
 12.9 launches/layer of mine unchanged (D 207 a step before r-attn's `when` variants). Same-lease A/B vs main
 95bc0b0 (3.407-3.417 ms/step), each step cumulative:
@@ -69,6 +103,12 @@ So the remaining distance is the fabric latency plus a bit-identical epilogue; I
   `work/ar/out/NAME.json`. `work/ar/abn.sh OUT ROUNDS M1.json M2.json ...`: D benches interleaved in one lease.
   main's manifest: generate from a main worktree (`$K3_LOOP_DATA/base/d-l16-tp8.json` predates kern's schema).
 - `work/ar/prof.sh OUT MANIFEST ROWS@CTX`: every rank under nsys (graph nodes), `work/ar/trace.py` per-kernel table.
+  Rank 0's k3_step exits non-zero after a capture, so its `nsys stats` is skipped: `work/ar/stats0.sh DIR...`
+  exports the missing ones in a 1-GPU lease. `work/ar/done.sh OUT MANIFEST AT...` all shapes in one lease,
+  `work/ar/multi.sh OUT AT M...` several manifests at one shape, `work/ar/percall.py DIR...` own time per call
+  by label. `work/ar/tf16.sh OUT M1 M2`: two 16-layer manifests teacher-forced, logits / tokens compared.
+- The first exchange of a bench step (l0.res_mlp) absorbs the last rank's lateness in starting its graph (the
+  others wait 50-230 us in it): its own time is right only with that rank in the trace, so export all 8.
 
 ## Measurements
 
