@@ -153,6 +153,7 @@ CAND_SMEM = NB_MAX * H * 2  # k3_ar_fused.cu: a row's snapshots prefetched into 
 LAND_CL = 4  # k3_ar_fused.cu: the closing add's row over a cluster of 4 blocks
 PF_PARAMS = ["in buffer<bf16>", "i64"]  # k3_ar_fused.cu: the next GEMM's weight, prefetched into L2
 PF_OPS = {"ar_attnres_rms", "ar_finalize_rms", "land_add2_attnres_rms_snap"}
+base_op = lambda op: op.rsplit("_nb", 1)[0]  # an op without its snapshot count (k3_ar_fused.cu: an entry a count)
 PF_MAX = 96 << 20  # of the GB300's 129 MB L2
 LAND_PF_MAX = 16 << 20  # the closing add's prefetch hints: their issue holds the grid the next GEMM waits on
 # ar_finalize_rms also loads the next o_proj's weight at evict_last; ar_attnres_rms after that o_proj demotes it
@@ -479,15 +480,6 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                        "in buffer<bf16>", "in buffer<f32>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32"],
             "impl": {"launches": [residual("kern_k3g_land_add2_attnres_rms")]},
         }} if chunk else {}),
-        # D's, a snapshot layer's too.
-        **({"land_add2_attnres_rms_snap": {
-            "params": ["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32",
-                       "inout buffer<bf16>", "in buffer<f32>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32",
-                       "i32", *PF_PARAMS],
-            "impl": {"launches": [launch("k3_ar_fused", "kern_k3_land_add2_attnres_rms",
-                                         grid=[LAND_CL * TP_AR_GRID, 1, 1], block=[1024 // LAND_CL, 1, 1],
-                                         cluster=[LAND_CL, 1, 1], smem=CAND_SMEM // LAND_CL, pdl=True)]},
-        }} if decode else {}),
         # P's closing add on its own, before a snapshot layer.
         **({"land_add2": {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32"],
@@ -728,13 +720,6 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         # The layer's two sums with their neighbours (source/k3_ar_fused.cu): the attention's with the
         # landing, mix and norm after it; the MoE's with the combine before it and the latent norm after.
         lamport_params = ["inout buffer<u8>", "in buffer<u64>", "inout buffer<i32>", "out buffer<i32>", "i32"]
-        ops["ar_attnres_rms"] = {
-            "params": ["in buffer<bf16>", *lamport_params, "in buffer<bf16>", "in buffer<bf16>", "in buffer<f32>",
-                       "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32", "i64", "i64",
-                       *PF_PARAMS, *PF_PARAMS],
-            "impl": {"launches": [launch("k3_ar_fused", "kern_k3_ar_attnres_rms", defines={"NRANKS": tp},
-                                         grid=[TP_AR_GRID, 1, 1], block=[1024, 1, 1], smem=CAND_SMEM, pdl=True)]},
-        }
         ops["ar_finalize_rms"] = {
             "params": ["in buffer<bf16>", "in buffer<i32>", "in buffer<f32>", "in buffer<bf16>", *lamport_params,
                        "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "i32", "i64", "i64", *PF_PARAMS,
@@ -764,6 +749,33 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 "params": ["in buffer<f32>", "out buffer<bf16>", "i32", "i32", "i32", "i32"],
                 "impl": {"launches": [launch("k3_land", "kern_k3_land", grid=per_row(n), block=[1024, 1, 1])]},
             }
+        return name
+
+    def nb_op(base, nb):
+        """k3_ar_fused.cu's residual rows with `nb` snapshots: an entry, so an op, a count. D's closing add
+        (land_add2_attnres_rms_snap, a snapshot layer's too) and, with the attention's all-reduce before
+        it, ar_attnres_rms."""
+        name = f"{base}_nb{nb}"
+        if name not in ops:
+            ops[name] = {
+                "land_add2_attnres_rms_snap": lambda: {
+                    "params": ["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32",
+                               "inout buffer<bf16>", "in buffer<f32>", "in buffer<bf16>", "out buffer<bf16>", "i32",
+                               "i32", *PF_PARAMS],
+                    "impl": {"launches": [launch("k3_ar_fused", f"kern_k3_land_add2_attnres_rms_nb{nb}",
+                                                 grid=[LAND_CL * TP_AR_GRID, 1, 1], block=[1024 // LAND_CL, 1, 1],
+                                                 cluster=[LAND_CL, 1, 1], smem=CAND_SMEM // LAND_CL, pdl=True)]},
+                },
+                "ar_attnres_rms": lambda: {
+                    "params": ["in buffer<bf16>", "inout buffer<u8>", "in buffer<u64>", "inout buffer<i32>",
+                               "out buffer<i32>", "i32", "in buffer<bf16>", "in buffer<bf16>", "in buffer<f32>",
+                               "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i64", "i64",
+                               *PF_PARAMS, *PF_PARAMS],
+                    "impl": {"launches": [launch("k3_ar_fused", f"kern_k3_ar_attnres_rms_nb{nb}",
+                                                 defines={"NRANKS": tp}, grid=[TP_AR_GRID, 1, 1], block=[1024, 1, 1],
+                                                 smem=CAND_SMEM, pdl=True)]},
+                },
+            }[base]()
         return name
 
     def situ_op(n):
@@ -1103,15 +1115,15 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             nonlocal closing
             if closing[0] == "ar" and not snapshot:
                 # the sum, the closing add (K1b's, no snapshot) and the mix in one launch
-                step(label, "ar_attnres_rms", closing[2], *lamport(), b("prefix2"), b("blocks"), sw, gamma, b("hidden"),
-                     b("normed"), i32(nb), i32(0), B, i64(ar_stage), i64(TP_TIMEOUT_NS))
+                step(label, nb_op("ar_attnres_rms", nb), closing[2], *lamport(), b("prefix2"), b("blocks"), sw, gamma,
+                     b("hidden"), b("normed"), i32(0), B, i64(ar_stage), i64(TP_TIMEOUT_NS))
                 closing = None
                 return
             summed_closing()
             _, p1, p2, two = closing
             if decode:
-                step(label, "land_add2_attnres_rms_snap", p1, p2, b("prefix2"), b("hidden"), i32(two), b("blocks"), sw,
-                     gamma, b("normed"), i32(nb), i32(snapshot), B)
+                step(label, nb_op("land_add2_attnres_rms_snap", nb), p1, p2, b("prefix2"), b("hidden"), i32(two),
+                     b("blocks"), sw, gamma, b("normed"), i32(snapshot), B)
             else:
                 step(label, "land_add2_attnres_rms", p1, p2, b("prefix2"), b("hidden"), i32(two), b("blocks"), sw,
                      gamma, b("normed"), i32(nb), B)
@@ -1221,8 +1233,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             proj(L + "o_proj", b("gated"), w("w_o"), o, H, inner_l)
             # attn_out landing + residual (or snapshot replace) + mix + norm → prefix2, normed
             if fused_ar:
-                step(L + "res_mlp", "ar_attnres_rms", o, *lamport(), b("hidden"), b("blocks"), w("sw_mlp"),
-                     w("gamma_post"), b("prefix2"), b("normed"), i32(nb_mlp), i32(int(snapshot)), B,
+                step(L + "res_mlp", nb_op("ar_attnres_rms", nb_mlp), o, *lamport(), b("hidden"), b("blocks"),
+                     w("sw_mlp"), w("gamma_post"), b("prefix2"), b("normed"), i32(int(snapshot)), B,
                      i64(ar_stage), i64(TP_TIMEOUT_NS))
             else:
                 attn_out = summed(L + "reduce_attn", o, b("hidden_partial"), {"mul": [T, H]})
@@ -1432,7 +1444,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 own = c["args"][1]
                 c["args"] += [pin or own, i64(size(pin) if pin else 0), pinned or own, i64(size(pinned) if pinned else 0)]
                 pinned, first = pin, first or c
-            if c["op"] in PF_OPS:
+            if base_op(c["op"]) in PF_OPS:
                 w = next(g["args"][1] for j, g in gemms if j > k)
                 c["args"] += [w, i64(min(size(w), LAND_PF_MAX if c["op"].startswith("land") else PF_MAX))]
             if c["op"] == "ar_finalize_rms":
@@ -1440,7 +1452,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 c["args"] += [g["args"][1], i64(size(g["args"][1]))] if g else [w, i64(0)]
                 if g:
                     last[j] = g["args"][1]
-            if c["op"] == "ar_attnres_rms":
+            if base_op(c["op"]) == "ar_attnres_rms":
                 j = max(j for j, _ in gemms if j < k)
                 c["args"] += [last[j], i64(size(last[j]))] if j in last else [w, i64(0)]
         if pinned:  # the step's last pin: the first of our GEMMs demotes it in the next replay

@@ -19,11 +19,12 @@
 // weight `pf2` at evict_last, which the kern_k3_ar_attnres_rms after that
 // o_proj puts back to evict_normal (`dm`).
 //
-//   kern_k3_ar_attnres_rms(const bf16* x, u8* lamport, const u64* lamport_peers, i32* state,
+//   kern_k3_ar_attnres_rms_nb<NB>(const bf16* x, u8* lamport, const u64* lamport_peers, i32* state,
 //       i32* err, int rank, const bf16* prefix, const bf16* blocks, const f32* sw,
-//       const bf16* gamma, bf16* prefix2, bf16* normed, int nb, int snapshot, int B,
+//       const bf16* gamma, bf16* prefix2, bf16* normed, int snapshot, int B,
 //       i64 stage_bytes, i64 timeout_ns, const u8* pf, i64 pf_bytes, const u8* dm, i64 dm_bytes)
-//     o_proj's partials x [B, H] summed, then k3_residual.cu's K1b (-DLAND_BF16) on the sum.
+//     o_proj's partials x [B, H] summed, then k3_residual.cu's K1b (-DLAND_BF16) on the sum
+//     with NB snapshots (0..KNB_MAX).
 //
 //   kern_k3_ar_finalize_rms(const bf16* fc2, const i32* exp2perm, const f32* wts,
 //       const bf16* shared, u8* lamport, const u64* lamport_peers, i32* state, i32* err,
@@ -34,16 +35,19 @@
 //     latent_norm = k3_land.cu's kern_k3_rms(latent sum, gamma), shared_sum the shared sum.
 //
 //   grid (KGRID, 1, 1) on every call of a group   block (1024, 1, 1)
-//   kern_k3_ar_attnres_rms: dynamic smem KCAND_BYTES (the row's snapshots, below)
+//   kern_k3_ar_attnres_rms_nb<NB>: dynamic smem KCAND_BYTES (the row's snapshots, below)
 //   `err` gets 1 + the rank whose data did not show within `timeout_ns`, then the kernel traps.
 //   `lamport` holds the three stages, then NRANKS handshake words (the first call's, below).
 //   `state` [8 + 2 * KGRID] starts zeroed: [6] the handshake done, [8 + 2b] block b's stage,
 //   [9 + 2b] the vectors it re-poisons next call.
 //
 // The residual rows around them:
-//   kern_k3_land_add2_attnres_rms   a layer's closing add, then the next layer's mix and norm: a row
-//                                   a cluster of LAND_CL blocks of 1024 / LAND_CL threads, dynamic
+//   kern_k3_land_add2_attnres_rms_nb<NB>   a layer's closing add, then the next layer's mix and norm:
+//                                   a row a cluster of LAND_CL blocks of 1024 / LAND_CL threads, dynamic
 //                                   smem KCAND_BYTES / LAND_CL; the blocks past LAND_CL * B prefetch `pf`
+// A snapshot count is an entry, not a switch in one: a call runs its own code from the entry on. In
+// the step every call fetches its instructions cold, and one kernel holding all nine counts (390 KB of
+// code) ran the counts far from its entry 5-6 us slower than nb 1.
 //   kern_k3_embed_rms(_plan)        the step's embedding gather and its first layer's norm
 //                                   (_plan: and the MLA split plan)
 // Every kernel here triggers its dependents at entry (griddepcontrol.launch_dependents): the
@@ -603,18 +607,7 @@ __device__ __forceinline__ void row_finish(const uint4* cand, const RowRegs& r, 
   row_mix_norm<NB>(cand, r, pv, sc, normed_row, t, s);
 }
 
-#define NB_DISPATCH(nb, call) \
-  switch (nb) {               \
-    case 0: call(0); break;   \
-    case 1: call(1); break;   \
-    case 2: call(2); break;   \
-    case 3: call(3); break;   \
-    case 4: call(4); break;   \
-    case 5: call(5); break;   \
-    case 6: call(6); break;   \
-    case 7: call(7); break;   \
-    default: call(8); break;  \
-  }
+#define NB_ENTRIES(entry) entry(0) entry(1) entry(2) entry(3) entry(4) entry(5) entry(6) entry(7) entry(8)
 
 // ---------------------------------------------------------------- attention all-reduce + K1b
 template <int NB>
@@ -681,19 +674,19 @@ __device__ __forceinline__ void ar_attnres_rms(const uint4* __restrict__ x, uint
   lamport_close(l, state, err, fail);
 }
 
-extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_attnres_rms(
-    const uint4* __restrict__ x, uint8_t* lamport, const unsigned long long* lamport_peers, int* state, int* err,
-    int rank, const bf16_t* __restrict__ prefix, const bf16_t* __restrict__ blocks, const float* __restrict__ sw,
-    const bf16_t* __restrict__ gamma, bf16_t* __restrict__ prefix2, bf16_t* __restrict__ normed, int nb, int snapshot,
-    int B, long long stage_bytes, long long timeout_ns, const uint8_t* __restrict__ pf, long long pf_bytes,
-    const uint8_t* __restrict__ dm, long long dm_bytes) {
-  extern __shared__ uint4 cand[];
-  __shared__ RowSmem s;
-#define AR_ATTNRES(NB)                                                                                                \
-  ar_attnres_rms<NB>(x, lamport, lamport_peers, state, err, rank, prefix, blocks, sw, gamma, prefix2, normed, snapshot, \
-                     B, stage_bytes, timeout_ns, pf, pf_bytes, dm, dm_bytes, cand, s)
-  NB_DISPATCH(nb, AR_ATTNRES)
-}
+#define AR_ATTNRES_ENTRY(NB)                                                                                      \
+  extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_attnres_rms_nb##NB(                         \
+      const uint4* __restrict__ x, uint8_t* lamport, const unsigned long long* lamport_peers, int* state, int* err, \
+      int rank, const bf16_t* __restrict__ prefix, const bf16_t* __restrict__ blocks, const float* __restrict__ sw, \
+      const bf16_t* __restrict__ gamma, bf16_t* __restrict__ prefix2, bf16_t* __restrict__ normed, int snapshot,   \
+      int B, long long stage_bytes, long long timeout_ns, const uint8_t* __restrict__ pf, long long pf_bytes,       \
+      const uint8_t* __restrict__ dm, long long dm_bytes) {                                                         \
+    extern __shared__ uint4 cand[];                                                                                 \
+    __shared__ RowSmem s;                                                                                           \
+    ar_attnres_rms<NB>(x, lamport, lamport_peers, state, err, rank, prefix, blocks, sw, gamma, prefix2, normed,     \
+                       snapshot, B, stage_bytes, timeout_ns, pf, pf_bytes, dm, dm_bytes, cand, s);                  \
+  }
+NB_ENTRIES(AR_ATTNRES_ENTRY)
 
 // ---------------------------------------------------------------- K1d
 // k3_residual.cu's K1c on bf16 partials then K1a: hidden = bf16(prefix2 + p1 + (two ? p2 : 0))
@@ -820,19 +813,20 @@ __device__ __forceinline__ void land_add2_attnres_rms(const bf16_t* __restrict__
   }
 }
 
-extern "C" __global__ void __launch_bounds__(LT, 1) kern_k3_land_add2_attnres_rms(
-    const bf16_t* __restrict__ p1, const bf16_t* __restrict__ p2, const bf16_t* __restrict__ prefix2,
-    bf16_t* __restrict__ hidden, int two, bf16_t* __restrict__ blocks, const float* __restrict__ sw,
-    const bf16_t* __restrict__ gamma, bf16_t* __restrict__ normed, int nb, int snapshot, int B,
-    const uint8_t* __restrict__ pf, long long pf_bytes) {
-  extern __shared__ uint4 cand[];
-  __shared__ LandSmem s;
-  asm volatile("griddepcontrol.launch_dependents;");
-  // the idle blocks' hints after lat_up (the kernel before) is done: not on top of its own weight stream
-  if ((int)blockIdx.x >= LAND_CL * B) return grid_wait(), l2_prefetch(pf, pf_bytes, LAND_CL * B);
-#define LAND(NB) land_add2_attnres_rms<NB>(p1, p2, prefix2, hidden, two, blocks, sw, gamma, normed, snapshot, cand, s)
-  NB_DISPATCH(nb, LAND)
-}
+// the idle blocks' hints after lat_up (the kernel before) is done: not on top of its own weight stream
+#define LAND_ENTRY(NB)                                                                                           \
+  extern "C" __global__ void __launch_bounds__(LT, 1) kern_k3_land_add2_attnres_rms_nb##NB(                    \
+      const bf16_t* __restrict__ p1, const bf16_t* __restrict__ p2, const bf16_t* __restrict__ prefix2,        \
+      bf16_t* __restrict__ hidden, int two, bf16_t* __restrict__ blocks, const float* __restrict__ sw,         \
+      const bf16_t* __restrict__ gamma, bf16_t* __restrict__ normed, int snapshot, int B,                      \
+      const uint8_t* __restrict__ pf, long long pf_bytes) {                                                    \
+    extern __shared__ uint4 cand[];                                                                            \
+    __shared__ LandSmem s;                                                                                     \
+    asm volatile("griddepcontrol.launch_dependents;");                                                         \
+    if ((int)blockIdx.x >= LAND_CL * B) return grid_wait(), l2_prefetch(pf, pf_bytes, LAND_CL * B);            \
+    land_add2_attnres_rms<NB>(p1, p2, prefix2, hidden, two, blocks, sw, gamma, normed, snapshot, cand, s);     \
+  }
+NB_ENTRIES(LAND_ENTRY)
 
 // ---------------------------------------------------------------- MoE finalize + all-reduce + latent rms
 // A row's exchange: the latent's KLATV vectors, then the shared expert's KVEC.
