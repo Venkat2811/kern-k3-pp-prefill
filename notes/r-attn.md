@@ -634,6 +634,26 @@ What each step found:
   between lane halves (smem again; tcgen05.cp from smem with the warpx2 replication saves only the A
   re-reads, ~16 KB a tile).
 
+- **v5: Q K^T at N 256** (256-position steps, P 32 KB, rings 4 + 3 pair slots; `work/md/v5.cu`, not
+  committed): correct, slower (36 x 8k 96.8 µs). Its MMA issue per 128 positions drops to 1.47 µs, but with
+  Q 72 + P 32 KB fixed only 112 KB of ring is left: 45 µs of the 83 a call wait for K and V (NK 3 / 4 / 5
+  pair slots: 96.1 / 97.8 / 105.8 µs).
+- Per-call fixed costs (`-DMLA_PROF`, 1 x 1k): setup (barrier init, two cluster barriers, TMEM alloc, the
+  seq_lens / bsk loads) ~1.0 µs, epilogue 1.3 µs in CTA 0 (128 KB of f32 o, a row a thread: 32 rows an
+  instruction), Q and the first page ~1.5 µs, then the chain of one tile.
+
+**The named limit for mla_attn's tile rate** (done means 2): a CTA pair's SS MMAs at the shapes 96 heads allow
+(heads as M: pair M 128, 64 rows a CTA, N 128 / 256) read (64 + N/2) x 32 B a CTA an instruction, 96-128
+B/clk of the SM's 128 B/clk shared memory; with the KV landing (TMA writes, 136 KB a tile) and P the tile
+needs 360-392 KB a CTA, 1.45-1.6 µs at 128 B/clk, and the data in flight is capped by the 137 KB left after
+Q. Every variant here hits one or the other (v4: 126 B/clk measured; v3 / v5: ring capacity x latency). The
+DSL's 1.70 µs a tile is within 1.1x of the 1.53 µs HBM share a pair when all 76 pairs stream; what separates
+it from the floor at the bench shapes is per launch (~7 µs: setup, Q, the first page, the split's chain,
+the f32 partial) and the wave quantization of uniform splits (48 x 16k: 144 items on 76 pairs = 86 tiles of
+makespan vs 81). Heads as M pads 96 to 128 rows (the A reads of CTA 1's last 32 rows are 1/8 of the Q K^T
+traffic); positions as M (pair M 256, N 96) reads ~112 B/clk at Q K^T but needs a cross-lane softmax per
+head and the P exchange between CTAs: not a smaller bound.
+
 Where next (the bound is shared memory bytes a tile, ~128 B/clk):
 1. Q K^T at N 256 (256-position tiles, each CTA two pages): the Q re-reads halve, -36 KB per 128 positions;
    TMEM is then exactly full (S 2 x 128 + O 256). Splits stay in 128-position tiles (a last half tile masked).
