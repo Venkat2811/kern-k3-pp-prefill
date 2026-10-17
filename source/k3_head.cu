@@ -91,7 +91,9 @@ extern "C" __global__ void __launch_bounds__(THREADS) kern_k3_head_argmax(
   __syncthreads();
 
   if (s_last && t < 32) {
-    __threadfence_system();
+    // the row's other blocks' keys, read past their count: an acquire at GPU scope (every block's own system
+    // fence already put its copies out before it counted, so the key pushed below follows them anyway)
+    __threadfence();
     u64 k = t < PARTS ? __ldcg(pkey + b * PARTS + t) : 0ull;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) k = max(k, __shfl_xor_sync(0xffffffffu, k, o));
