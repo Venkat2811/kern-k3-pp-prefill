@@ -880,11 +880,11 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
     s_w[t / TOPK][t % TOPK] = wts[(row0 + t / TOPK) * TOPK + t % TOPK];
   }
   const Lamport l = lamport_open(lamport, lamport_peers, state, err, rank, tot, stage_bytes, timeout_ns);
-  const auto routed = [&] { return finalize(fc2, s_e2p[row - row0], s_w[row - row0], c); };
-  uint4 v = early && i >= 0 && c < KLATV ? routed() : make_uint4(0u, 0u, 0u, 0u);
+  // griddepcontrol.wait returns at once the second time
+  if (!early) grid_wait();
+  uint4 v = i >= 0 && c < KLATV ? finalize(fc2, s_e2p[row - row0], s_w[row - row0], c) : make_uint4(0u, 0u, 0u, 0u);
   grid_wait();
   if (i >= 0 && c >= KLATV) v = shared[(long long)row * KVEC + c - KLATV];
-  if (!early && i >= 0 && c < KLATV) v = routed();
   // From TWO_SHOT_ROWS rows the sum runs as two shots: every row goes to its owner (row % NRANKS) only, the
   // owner sums it and gathers the sum to the others (gather_share), 2 x 7/8 of a partial out of each rank
   // instead of 7.
