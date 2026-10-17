@@ -98,7 +98,7 @@ int main(int argc, char** argv) {
     CK(cudaMemcpy(lens, hl.data(), BMAX * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(bsk, hb.data(), BMAX * 4, cudaMemcpyHostToDevice));
     CK(cudaMemset(o, 0, on * 4)); CK(cudaMemset(ro, 0, on * 4)); CK(cudaMemset(lse, 0, ln * 4)); CK(cudaMemset(rlse, 0, ln * 4));
-    kern_k3_mla_decode<<<dim3(2, sh.rows, SPLIT_MAX), THREADS, SMEM_BYTES, st>>>(qm, km, (const uint8_t*)kv, table, lens, bsk, o, lse, SPLIT_MAX, MAXP, scale_log2);
+    kern_k3_mla_decode<<<dim3(2, sh.rows, SPLIT_MAX), THREADS, SMEM_BYTES, st>>>(qm, km, table, lens, bsk, o, lse, SPLIT_MAX, MAXP, scale_log2);
     reference<<<dim3(HEADS, SPLIT_MAX, sh.rows), 256, 128 * 1024, st>>>(q, kv, table, lens, bsk, ro, rlse, scale_log2);
     CK(cudaStreamSynchronize(st));
     std::vector<float> a(on), r(on), al(ln), rl(ln);
@@ -114,17 +114,17 @@ int main(int argc, char** argv) {
     {
       unsigned long long z[32] = {}, h[32];
       cudaMemcpyToSymbol(mla_prof, z, sizeof z);
-      kern_k3_mla_decode<<<dim3(2, sh.rows, SPLIT_MAX), THREADS, SMEM_BYTES, st>>>(qm, km, (const uint8_t*)kv, table + BMAX * MAXP, lens, bsk, o, lse, SPLIT_MAX, MAXP, scale_log2);
+      kern_k3_mla_decode<<<dim3(2, sh.rows, SPLIT_MAX), THREADS, SMEM_BYTES, st>>>(qm, km, table + BMAX * MAXP, lens, bsk, o, lse, SPLIT_MAX, MAXP, scale_log2);
       cudaStreamSynchronize(st);
       cudaMemcpyFromSymbol(h, mla_prof, sizeof h);
-      const char* nm[11] = {"mma:s_empty", "mma:kfull", "mma:pfull", "mma:vfull", "smx:sfull", "smx:odone", "smx:ldS", "mma:total", "smx:compute", "smx:sincepre", "rescales"};
-      for (int c = 0; c < 2; ++c) { printf("  cta %d:", c); for (int i = 0; i < 11; ++i) if (h[16 * c + i]) printf(" %s %.2f", nm[i], h[16 * c + i] / 1940.0); printf(" (us)\n"); }
+      const char* nm[16] = {"mma:s_empty", "mma:kfull", "mma:pfull", "mma:vfull", "smx:sfull", "smx:odone", "smx:ldS", "mma:total", "smx:compute", "smx:sincepre", "rescales", "@tmem_ready", "@q_full", "@staged", "@last_O", "@epilogue_done"};
+      for (int c = 0; c < 2; ++c) { printf("  cta %d:", c); for (int i = 0; i < 16; ++i) if (h[16 * c + i]) printf(" %s %.2f", nm[i], h[16 * c + i] / 1940.0); printf(" (us)\n"); }
     }
 #endif
     cudaGraph_t g; cudaGraphExec_t ge;
     CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal));
     for (int l = 0; l < LAUNCHES; ++l)
-      kern_k3_mla_decode<<<dim3(2, sh.rows, SPLIT_MAX), THREADS, SMEM_BYTES, st>>>(qm, km, (const uint8_t*)kv, table + (size_t)l * BMAX * MAXP, lens, bsk, o,
+      kern_k3_mla_decode<<<dim3(2, sh.rows, SPLIT_MAX), THREADS, SMEM_BYTES, st>>>(qm, km, table + (size_t)l * BMAX * MAXP, lens, bsk, o,
                                                                                     lse, SPLIT_MAX, MAXP, scale_log2);
     CK(cudaStreamEndCapture(st, &g)); CK(cudaGraphInstantiate(&ge, g, 0));
     cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
