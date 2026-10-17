@@ -27,7 +27,8 @@ blocks' weight loads); with the spread only below 33 rows, 3.404-3.405 (-0.2%).
 - push spread over every block in the one-shot only: 3.273-3.274
 - ar_finalize's routed latent before the wait: 3.270-3.271
 - the closing add's prefetch after the wait: -0.17% (3.275-3.277 -> 3.270-3.271 on another lease)
-= main d85613c 3.373 -> 3.270 (-3.0%). **Offer: the branch at its head** (15 commits on d85613c).
+= main d85613c 3.373 -> 3.270 (-3.0%). **Offer: the branch at its head** (on main 21a9174: the 8 commits after it,
+-0.8% vs 21a9174's ~3.29). Head e993cad alone: loop/d/bench 3.267 ms/step weighted, loop/d/check x3 PASS bit-identical.
 All bit-identical vs main (loop/d/check x3; two-shot paths in the harness).
 
 Each kernel's own time in the step (work/ar/own.py: per call, its end minus the previous kernel's end, the
