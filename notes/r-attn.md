@@ -4,6 +4,14 @@ Kernels: `k3_kda_core`, MLA (`k3_mla_prep`, `k3_mla_absorb_tc` (`_mma` under `--
 `mla_decode_h96_p64` and its grid), the DCP exchange (`k3_dcp`).
 Previous lane notes: `notes/d-attn.md` (round 1, every idea tried there).
 
+## Status (06:50 UTC): rebased on main e343e79; k3_mla_decode -0.2% against it
+
+Main took this branch to 8319034 (moe_front, absorb). Rebased on e343e79, what main does not have is
+k3_mla_decode from 24 rows (bf85a21): one lease, 3 rounds, 3.209 / 3.210 / 3.211 → 3.203 / 3.205 / 3.202
+ms/step, 24 / 36 / 48 rows x 64k -10..-20 µs a step, 36 x 128k -12, 8 / 16 rows the DSL (unchanged).
+loop/d/check PASS bit-identical (4 rows: the DSL); 36 rows teacher-forced on the rebased trees: main vs
+oracle top-1 0.9219, relRMS median 0.01819 max 0.10223, 18 confident; this 0.9238, 0.01830, 0.10247, 18.
+
 ## Status (06:35 UTC): the branch vs main 60f4a4d: 3.233 -> 3.214 ms/step (-0.6%), every shape faster
 
 One lease, 3 rounds (`work/ab.sh`, main's manifest from `git archive main`): 3.232 / 3.232 / 3.235 →
