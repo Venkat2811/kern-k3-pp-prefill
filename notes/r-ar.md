@@ -25,7 +25,8 @@ blocks' weight loads); with the spread only below 33 rows, 3.404-3.405 (-0.2%).
 - two-shot from 14 rows (was 20): 3.299 vs 3.300-3.302 before the in-flight change (16 rows -5..-10 us)
 - embed_rms_plan's plan in block B: 3.282-3.284 (vs 3.284-3.285)
 - push spread over every block in the one-shot only: 3.273-3.274
-= main d85613c 3.373 -> 3.273 (-3.0%). **Offer: the branch at its head** (13 commits on d85613c).
+- ar_finalize's routed latent before the wait: 3.270-3.271
+= main d85613c 3.373 -> 3.270 (-3.0%). **Offer: the branch at its head** (14 commits on d85613c).
 All bit-identical vs main (loop/d/check x3; two-shot paths in the harness).
 
 Each exchange's own time in the step (work/ar/own.py: per call, end minus the previous kernel's end, the minimum
@@ -195,6 +196,9 @@ window's, not the row's.
 | the closing add's second partial (the MoE sum, two kernels back) loaded before griddepcontrol.wait | 3.300-3.302 -> 3.301-3.304 | no |
 | two-shot from 14 rows (harness: attn wins from 12, MoE from 14, loses at 10-12) | 3.300-3.302 -> 3.299 (16 rows -5..-10 us) | yes |
 | push spread (runs over all 152 blocks) below 14 rows only, i.e. one-shot only / at every row count / AR_GRACE_NS 250 | 3.290-3.293 -> 3.283 / 3.292-3.294 / 3.291 | one-shot only |
+| L2_INFLIGHT 6 / 10 MB, AR_GRACE_NS 0 (with 8 MB) | 3.273-3.275 -> 3.278 / 3.281-3.291 / 3.276-3.279 | no |
+| ar_finalize's routed latent summed before griddepcontrol.wait (fc2 is two kernels back) | 3.272-3.275 -> 3.270-3.271 | yes |
+| no push spread at all / PUSH_RUN 64 / 256 (one-shot) | 3.276-3.277 -> 3.278-3.279 (8 rows +10 us) / 3.278-3.280 / 3.278 | no: noise |
 | embed_rms_plan's split plan in block B (was: warp 0 of every row block, before the row's norm) | embed alone 4.37-5.14 -> 2.97-3.64 us, the same outputs and splits; step 3.284 -> 3.282 | yes |
 | land's mix norm from the candidates' pairwise dots (one cluster reduction after the wait instead of two) | | not retried: -0.09% in round 3's first session, and the only change here that would move outputs (0.1-0.4% by 1-2 ulp) |
 
