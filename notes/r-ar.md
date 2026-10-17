@@ -17,11 +17,33 @@ Two commits on main fd5c92c (3.244-3.247 ms/step, same lease):
   `kern_k3_land_add2_attnres_rms_nb<N>`, an op a count from `nb_op`): 3.235-3.236 (-0.3%), every shape faster or
   equal, bit-identical (check x3, and the 16-layer manifest teacher-forced: logits and every rank's tokens
   byte-identical). Worth more in the 93-layer step than in the bench: see "Cold code" below.
-- **ba3b52b `early` on ar_finalize_rms**: the routed latent is weighted before griddepcontrol.wait only when the
-  call before is not fc2 (the generator checks whether it takes `moe.fc2_out`). Today always 1 (sh_down sits
-  between): flat. It guards the merge with r-moe's branch, which moves sh_down out from between fc2 and this
-  all-reduce: without it the pre-wait read of fc2's output would race. A d-l4 copy with early = 0 checks
-  bit-identical.
+- **ba3b52b + 27a664e `early` on ar_finalize_rms**: the routed latent is weighted before griddepcontrol.wait
+  only when the call before is not fc2 (the generator checks whether it takes `moe.fc2_out`); else the kernel
+  waits first (one weighting site, the second wait returns at once). Today always 1 (sh_down sits between):
+  flat. It guards the merge with r-moe's branch, which moves sh_down out from between fc2 and this all-reduce:
+  without it the pre-wait read of fc2's output would race. A d-l4 copy with early = 0 checks bit-identical.
+
+## Done table
+
+ba3b52b (27a664e runs the same path), nsys, all 8 ranks. Own time = the last-arriving rank's: end minus the
+previous kernel's end, us a call; the mean over ranks in brackets, the rest of it waiting for later ranks.
+
+| call | 1 x 8k | 8 x 8k | 32 x 8k | 64 x 8k | 32 x 32k | 8 x 64k | 48 x 64k | floor | ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| ar_attnres_rms (nb 1 / 2) | 8.9 / 9.2 | 8.2 / 8.5 | 7.9 / 7.9 | 9.1 / 9.3 | 7.9 / 7.9 | 8.3 / 8.3 | 9.2 / 9.1 | 3.9 | 2.0-2.4 |
+| ar_finalize_rms | 9.0 (13.8) | 8.1 (19.1) | 8.2 (25.0) | 9.5 (25.9) | 8.3 (25.7) | 8.3 (18.1) | 8.9 (26.2) | ~4.2 | 1.9-2.3 |
+| land_add2 (nb 1 / 2) | 3.0 / 2.9 | 3.1 / 3.1 | 3.6 / 3.7 | 4.0 / 5.1 | 3.5 / 3.6 | 3.0 / 3.2 | 3.8 / 4.0 | ~1.6 | 1.9-3.2 |
+
+Floors: the exchanges' is decode.md's empty 8-rank one-shot (3.90 us) plus the bytes (<= 0.3 us at 64 rows over
+the two-shot); the closing add's the step's shortest kernel (1.63 us, launch and drain) since its bytes are
+<= 1.6 us at 64 rows and under the PDL overlap. Named limits (stamps in the step, "Cold code" and "The floor at
+1-8 rows" below): an exchange after its GEMM ends = x's load and the push ~1.1 us, the slowest peer's data
+~3.4-4 us (fabric latency: the floor itself), the row epilogue ~1.5 us (two dependent block reductions: the
+mix's softmax needs the row's score, its norm the mix; the one-reduction form moves bits and measured flat),
+then the load window's 0.5 us grace and drain (the next GEMM's weight into L2: a step win of 2.4%, not this
+kernel's work). ar_finalize_rms's mean over ranks is 1.6-3x its own time: the EP skew of the MoE before it.
+The closing add: the add -> score -> mix -> norm chain over a cluster of 4 (two cluster reductions) and its
+16 MB of next-weight hints; at 64 rows nb 2 its snapshot reads add ~1 us.
 
 ## Cold code: why nb >= 2 cost +6 us a call in the step (05:00 UTC)
 
@@ -37,6 +59,14 @@ Layers 12-15 are the bench's nb = 2 calls. Bisected with timing-only manifests (
   8.0 / 15.3; the idle blocks' push and clear (no nb in their code) 2.85 / 4.0 with the load window off. Every
   phase slower, on every rank (the data comes late because the peers push late).
 - the same NB = 2 body behind its own extern "C" entry: **8.2-9.0 us** (from 13.5-16.2).
+**At production's snapshot counts.** The 93-layer step runs nb 1-8 (a snapshot every ATTN_RES_BLOCK layers);
+the bench only 1-2. Timing-only manifests with nb = min(8, 1 + layer / 2) over the 16 layers (main's call args
+edited; the head's generated with a temporary generator hack), 8 x 64k, one lease, own time a call:
+attention all-reduce at nb 2-8 main 13.9-24.4 us, head 8.1-10.3; closing add at nb 3-8 main 3.4-11.4 us
+(5-11 from nb 6), head 3.3-4.5. Summed over the 16 layers: all-reduces 264 -> 138 us, closing adds 112 ->
+63 us, ~11 us a layer: ~1 ms of the 93-layer step. This is likely most of decode.md's production gap for these
+kernels (land 6.3-7.3 us a call and ar_attnres 12.5 us there, against ~3 and ~8 in the 16-layer bench).
+
 The kernel was one function, a switch over nine inlined copies of its body (390 KB of SASS; the closing add
 128 KB). nb 1's copy sat right after the entry; nb 2's ~110 KB in. In the step the code is cold at every call
 (L2 holds weights between), and code far from the entry runs slowly. Code size past the entry did not show:
