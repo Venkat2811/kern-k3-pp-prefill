@@ -651,7 +651,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                        *["out buffer<i32>"] * 6, "in buffer<bf16>", "out buffer<bf16>", "in buffer<u8>", "in buffer<u8>",
                        "i32", "i32"],
             "impl": {"launches": [{**launch("k3_moe_front", "kern_k3_moe_front", grid=[{"add": [T, H // 64]}, 1, 1],
-                                            block=[1024, 1, 1], smem=2 * 64 * (sh_l * 2 + 16) + 64 * 64 * 2,
+                                            block=[1024, 1, 1], smem=1024 + 2 * sh_l * 128 + 64 * 64 * 2,
                                             defines={"EXPERTS": experts, "LDS": front, "SH": sh_l, "STRIDE": tp}),
                                    "pdl": True}]},
         }} if front else {}),

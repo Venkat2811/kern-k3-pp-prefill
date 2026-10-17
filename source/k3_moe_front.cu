@@ -209,34 +209,25 @@ static_assert(EXPERTS % 32 == 0 && TOPK <= SORT_WARPS && SORT_WARPS <= 31 && QUA
 // ---- blocks T .. T + NSH / 64 - 1: the shared expert's down projection ----
 // out[t, n] = bf16(sum_k act[t, k] * Wsh[n, k]) for t < T, n < H, k < SH, act the row blocks' SiTU rows.
 // Block T + c takes Wsh's rows [64 c, 64 c + 64): they land in shared memory by cp.async at entry
-// (warps 8-31), the T activation rows once published (ready[64 c + b] = 1 by row block b, polled by
-// warps 0-1; each block clears its own flags for the next layer). Each output is one chain over
-// k = 0, 16, 32, ... in order, f32 accumulators: the order and instruction cuBLASLt's kernels for this
-// shape sum in (nvjet tst 64 x 8..48 tiles, no split-K), so the result is cuBLASLt's bit for bit (a
-// harness compares every output at 1-64 rows on random and real weights), on either path:
-//   * up to UMMA_ROWS rows, mma.sync m16n8k16: warp g < 4 multiplies rows 64 c + 16 g + [0, 16) by every
-//     row tile; operands row-major at pitch SPITCH, an odd number of 16-byte units, so
-//     ldmatrix's eight rows fall on distinct banks. Its time grows with the rows (shared-memory bound);
-//   * above, one thread issues tcgen05.mma M = 64, N = the rows rounded to 8, K = 16, 48 in a row into
-//     TMEM (~25 ns each whatever N); operands K-major in 128-byte swizzle atoms, every warp moves one
-//     tile out of TMEM.
-// The row blocks never wait on these and have lower indices, so they are all dispatched first: the
-// polls cannot hang.
+// (warps 8-30), the T activation rows once published (ready[64 c + b] = 1 by row block b, polled by
+// warps 0-1; each block clears its own flags for the next layer), both K-major in 128-byte swizzle atoms.
+// One thread issues tcgen05.mma M = 64, N = the rows rounded to 8, K = 16, 48 in a row into TMEM (~25 ns
+// each whatever N), every warp moves tiles out. Each output is one chain over k = 0, 16, 32, ... in
+// order, f32 accumulators: the order and instruction cuBLASLt's kernels for this shape sum in (nvjet tst
+// 64 x 8..48 tiles, no split-K), so the result is cuBLASLt's bit for bit (a harness compares every output
+// at 1-64 rows on random and real weights). The row blocks never wait on these and have lower indices, so
+// they are all dispatched first: the polls cannot hang.
 #define SROWS 64
-#define SPITCH (SH * 2 + 16)
-#define SMEM_SH (SROWS * SPITCH + 64 * SPITCH + 64 * SROWS * 2)
-#define UMMA_ROWS 24
 #define WORKERS (THREADS - 32)  // warp 31 prefetches FC1's first expert (prefetch_first), the rest project
 #define work_sync() asm volatile("bar.sync 1, %0;" ::"n"(WORKERS) : "memory")
 #define ACOL (SROWS * 128)  // a 64-column swizzle atom column of 64 rows
 #define UMMA_OPERAND (SH / 64 * ACOL)
-static_assert((SPITCH / 16) % 2 == 1 && SH % 64 == 0, "conflict-free ldmatrix rows");
-static_assert(1024 + 2 * UMMA_OPERAND + 64 * SROWS * 2 <= SMEM_SH, "both layouts in the same shared memory");
+#define SMEM_SH (1024 + 2 * UMMA_OPERAND + 64 * SROWS * 2)
+static_assert(SH % 64 == 0, "whole swizzle atoms");
 
 __device__ __forceinline__ uint32_t smem_at(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
 
-// row r's 16-byte chunk k: row-major at SPITCH, or the K-major 128-byte swizzle layout
-__device__ __forceinline__ uint32_t pitched(int r, int k) { return r * SPITCH + k * 16; }
+// row r's 16-byte chunk k in the K-major 128-byte swizzle layout
 __device__ __forceinline__ uint32_t swizzled(int r, int k) { return (k / 8) * ACOL + r * 128 + ((k % 8) ^ (r % 8)) * 16; }
 
 // tcgen05 shared-memory descriptor: K-major, 128-byte swizzle, 8-row groups 1 KB apart
@@ -280,54 +271,6 @@ __device__ __forceinline__ void umma_rows(uint32_t sw, uint32_t sa, uint32_t tm,
   }
 }
 
-__device__ __forceinline__ void mma16816(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
-                                         uint32_t b0, uint32_t b1) {
-  asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
-      "{%0, %1, %2, %3};"
-      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-}
-
-template <int TILES>
-__device__ __forceinline__ void sh_frags(uint32_t a_at, uint32_t b_at, int tiles, int k, uint32_t (&a)[4],
-                                         uint32_t (&b)[TILES][2]) {
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
-               : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(a_at + k * 2));
-#pragma unroll
-  for (int j = 0; j < TILES; ++j)
-    if (j < tiles)
-      asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
-                   : "=r"(b[j][0]), "=r"(b[j][1]) : "r"(b_at + j * 8 * SPITCH + k * 2));
-}
-
-// A warp's 16 rows times the row tiles [0, TILES) below `tiles`, one chain an output, k ascending,
-// the next steps' fragments in flight; the sums, rounded to bf16, to the tile [t][64 rows].
-template <int TILES>
-__device__ __forceinline__ void sh_rows16(uint32_t a_at, uint32_t b_at, int tiles, __nv_bfloat16* tile,
-                                          int n, int q) {
-  constexpr int DEPTH = 2, STEPS = SH / 16;
-  float acc[TILES][4];
-#pragma unroll
-  for (int j = 0; j < TILES; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
-  uint32_t a[DEPTH][4], b[DEPTH][TILES][2];
-#pragma unroll
-  for (int d = 0; d < DEPTH; ++d) sh_frags<TILES>(a_at, b_at, tiles, 16 * d, a[d], b[d]);
-#pragma unroll
-  for (int s = 0; s < STEPS; ++s) {
-    const int d = s % DEPTH;
-#pragma unroll
-    for (int j = 0; j < TILES; ++j)
-      if (j < tiles) mma16816(acc[j], a[d][0], a[d][1], a[d][2], a[d][3], b[d][j][0], b[d][j][1]);
-    if (s + DEPTH < STEPS) sh_frags<TILES>(a_at, b_at, tiles, 16 * (s + DEPTH), a[d], b[d]);
-  }
-#pragma unroll
-  for (int j = 0; j < TILES; ++j)
-    if (j < tiles)
-#pragma unroll
-      for (int i = 0; i < 4; ++i)
-        tile[(j * 8 + 2 * q + i % 2) * SROWS + n + (i / 2) * 8] = __float2bfloat16(acc[j][i]);
-}
-
 // FC1's first CTAs take the touched experts of the lowest local indices: row b publishes its two lowest
 // local picks j_b < j2_b (ids[c * 64 + b] = 1 + j_b + 256 j2_b, LOCAL for none; the value is the message,
 // relaxed); warp 31 of block T + c, apart from the projection from the start, takes the two least over the
@@ -364,26 +307,24 @@ __device__ __forceinline__ void shared_down(const __nv_bfloat16* __restrict__ ac
   extern __shared__ __align__(128) uint8_t sm[];  // the weight rows, T activation rows, the bf16 tile [T][64]
   __shared__ __align__(8) uint64_t s_bar;
   __shared__ uint32_t s_tmem;
-  const int t = threadIdx.x, warp = t / 32, lane = t % 32, n0 = c * SROWS;
+  const int t = threadIdx.x, warp = t / 32, n0 = c * SROWS;
   if (t >= WORKERS) {
     prefetch_first(ids, T, c, w13, w13_sf);
     return;
   }
-  const bool umma = T > UMMA_ROWS;
-  uint8_t* sw = umma ? sm + ((1024 - (smem_at(sm) & 1023)) & 1023) : sm;  // swizzle atoms 1 KB aligned
-  uint8_t* sa = sw + (umma ? UMMA_OPERAND : SROWS * SPITCH);
-  __nv_bfloat16* tile = reinterpret_cast<__nv_bfloat16*>(sa + (umma ? UMMA_OPERAND : 64 * SPITCH));
-  const auto at = [umma](int r, int k) { return umma ? swizzled(r, k) : pitched(r, k); };
+  uint8_t* sw = sm + ((1024 - (smem_at(sm) & 1023)) & 1023);  // swizzle atoms 1 KB aligned
+  uint8_t* sa = sw + UMMA_OPERAND;
+  __nv_bfloat16* tile = reinterpret_cast<__nv_bfloat16*>(sa + UMMA_OPERAND);
   if (t >= 256)
     for (int i = t - 256; i < SROWS * (SH / 8); i += WORKERS - 256)
       asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
-                   ::"r"(smem_at(sw + at(i / (SH / 8), i % (SH / 8)))), "l"(W + (size_t)n0 * SH + i * 8) : "memory");
+                   ::"r"(smem_at(sw + swizzled(i / (SH / 8), i % (SH / 8)))), "l"(W + (size_t)n0 * SH + i * 8) : "memory");
   asm volatile("cp.async.commit_group;" ::: "memory");
-  if (umma && warp == 2) {
+  if (warp == 2) {
     asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 64;" ::"r"(smem_at(&s_tmem)) : "memory");
     asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
   }
-  if (umma && t == 64) asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(smem_at(&s_bar)) : "memory");
+  if (t == 64) asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(smem_at(&s_bar)) : "memory");
   if (t < T) {
     int v;
     int* flag = ready + c * 64 + t;
@@ -397,32 +338,17 @@ __device__ __forceinline__ void shared_down(const __nv_bfloat16* __restrict__ ac
   work_sync();
   for (int i = t; i < T * (SH / 8); i += WORKERS)
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
-                 ::"r"(smem_at(sa + at(i / (SH / 8), i % (SH / 8)))), "l"(act + i * 8) : "memory");
+                 ::"r"(smem_at(sa + swizzled(i / (SH / 8), i % (SH / 8)))), "l"(act + i * 8) : "memory");
   asm volatile("cp.async.commit_group;" ::: "memory");
   asm volatile("cp.async.wait_group 0;" ::: "memory");
-  const int tiles = (T + 7) / 8;
-  if (umma) {
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // the operands, to the tensor cores' reads
-    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
-    work_sync();
-    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-    umma_rows(smem_at(sw), smem_at(sa), s_tmem, &s_bar, tiles, tile);
-    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
-    work_sync();
-    if (warp == 2) asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 64;" ::"r"(s_tmem) : "memory");
-  } else {
-    work_sync();
-    if (warp < 4) {
-      // ldmatrix rows: A (16 W rows) lane l -> row l % 16, column half l / 16; B (8 act rows) lane l -> row l % 8, half (l / 8) % 2
-      const uint32_t a_at = smem_at(sw + (16 * warp + lane % 16) * SPITCH + (lane / 16) * 16);
-      const uint32_t b_at = smem_at(sa + (lane % 8) * SPITCH + ((lane / 8) % 2) * 16);
-      if (tiles <= 1)
-        sh_rows16<1>(a_at, b_at, tiles, tile, 16 * warp + lane / 4, lane % 4);
-      else
-        sh_rows16<3>(a_at, b_at, tiles, tile, 16 * warp + lane / 4, lane % 4);
-    }
-    work_sync();
-  }
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // the operands, to the tensor cores' reads
+  asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+  work_sync();
+  asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+  umma_rows(smem_at(sw), smem_at(sa), s_tmem, &s_bar, (T + 7) / 8, tile);
+  asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+  work_sync();
+  if (warp == 2) asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 64;" ::"r"(s_tmem) : "memory");
   for (int i = t; i < T * (SROWS / 8); i += WORKERS) {
     const int r = i / (SROWS / 8), col = i % (SROWS / 8);
     reinterpret_cast<uint4*>(out + (size_t)r * NSH + n0)[col] = reinterpret_cast<const uint4*>(tile + r * SROWS)[col];
