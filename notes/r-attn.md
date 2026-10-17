@@ -165,3 +165,12 @@ loop/d/ranks with an absolute OUT: the ranks run on other hosts.)
   the split is slower everywhere (8 rows 5.74 → 7.17, 16 rows 7.74 → 9.06):
   both CTAs pay the whole prologue (32 KB tile, window, scalars) and the
   cluster barriers. Dropped.
+- **kda_core state copy issue**: one thread issuing the 16 bulk pieces vs 16
+  threads one each: 1 row 5.60 → 5.31, 20-25 rows -0.3 µs, bit-identical;
+  D 3.433 → 3.431 (kept). Per-thread cp.async of the state (its own commit
+  group behind the tile's): no better. Bulk *stores* of the updated slice
+  from smem (in place, fence.proxy.async, 16 × 4 KB): +0.5-1.3 µs, dropped.
+  The 12 → 13-row step (6.2 → 7.4 µs, two items an SM) is the write-back:
+  without stores 16 rows drops 1.44 µs vs 0.55 at 8 rows, ~46 B/clk of
+  STG.128 an SM.
+- One-GPU harnesses are in `harness/attn/` (`run.sh kda|absorb OUT ARGS`).

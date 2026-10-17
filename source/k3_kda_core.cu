@@ -65,7 +65,7 @@
 //     registers), the row's scalars into registers.  The prologue walked ~7
 //     dependent round trips before (7 us of a 9 us call at 8 rows);
 //   * -DKDA_SMEM_STATE=1 also bulk-copies the head's 64 KB state slice into
-//     dynamic shared memory right after the line index, beside the conv
+//     dynamic shared memory (16 bulk copies of 4 KB, one a thread) right after the line index, beside the conv
 //     window's loads, so the state read overlaps the whole prologue and the
 //     delta rule runs from shared memory (65,536 B of dynamic smem, ~100 KB a
 //     block: 2 blocks an SM, the build for batches that fit one wave of them).
@@ -214,7 +214,7 @@ __device__ __forceinline__ void block_sum2(float a, float b, float* sm, float& s
 #ifndef KDA_SMEM_STATE
 #define KDA_SMEM_STATE 0
 #endif
-#define KDA_BULKN 16  // the state slice's bulk copies, 4 KB each
+#define KDA_BULKN 16  // the state slice's bulk copies, 4 KB each, one a thread
 #ifndef KDA_MINB
 #define KDA_MINB 1
 #endif
@@ -299,12 +299,12 @@ extern "C" __global__ __launch_bounds__(KDA_THREADS, KDA_MINB) void kern_k3_kda_
     asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(bar));
     asm volatile("fence.mbarrier_init.release.cluster;");
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bar), "r"(KD * KD * 4));
-#pragma unroll
-    for (int q = 0; q < KDA_BULKN; ++q)
-      asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-                   ::"r"((unsigned)__cvta_generic_to_shared(sh_rec) + q * (KD * KD * 4 / KDA_BULKN)),
-                   "l"(rec_src + q * (KD * KD * 4 / KDA_BULKN)), "r"(KD * KD * 4 / KDA_BULKN), "r"(bar) : "memory");
   }
+  __syncthreads();
+  if (tid < KDA_BULKN)  // a piece a thread: the copies issue side by side
+    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                 ::"r"((unsigned)__cvta_generic_to_shared(sh_rec) + tid * (KD * KD * 4 / KDA_BULKN)),
+                 "l"(rec_src + tid * (KD * KD * 4 / KDA_BULKN)), "r"(KD * KD * 4 / KDA_BULKN), "r"(bar) : "memory");
 #endif
   const float wsm_beta = wsm_partial[(size_t)b * WSM_LDS + h];
   const float wsm_flow = wsm_partial[(size_t)b * WSM_LDS + WSM_FA + d];
