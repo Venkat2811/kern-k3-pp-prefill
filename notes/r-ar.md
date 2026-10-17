@@ -40,6 +40,13 @@ at nb 1), the closing add ~0.2 (4.4 against 3.1). The production step runs mostl
   within +-0.2 us); step A/B 3 rounds 3.230-3.240 vs 3.232-3.236: flat. Reverted.
 - Issuing the snapshot copies after the push instead of at entry: no change at nb 1 or 8 (harness).
 - nb >= 4 entries spill 24-40 bytes at the 64-register cap (sc[] across the poll; Lamport's slot pointers).
+- ar_finalize_rms's row block polls the row's shared part, then its latent (two poll rounds before the norm).
+  Row r's shared part read by block KGRID - 1 - r instead (out of the load window, which then runs on blocks
+  B..KGRID - B): harness MoE +0.4..+0.8 us at 1-4 rows, -0.2..-0.8 at 8-13, flat from 16 (noise ~0.5 us: the
+  untouched attention kernel moved by up to 1 us between variants); step 3 rounds 3.236-3.238 -> 3.240-3.244
+  (8 rows +13-15 us, 48 rows +15-20). Reverted. Bit-identical.
+- Under nsys the ranks start a replay up to ~0.3 ms apart, and the early ones wait in the step's first exchange;
+  the plain bench's rank 0 p50 matches the latest rank's span under nsys, so the score does not carry it.
 
 ## Done table
 
