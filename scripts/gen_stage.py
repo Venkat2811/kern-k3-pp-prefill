@@ -445,7 +445,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                        "inout buffer<bf16>", "in buffer<f32>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32",
                        "i32", *PF_PARAMS],
             "impl": {"launches": [launch("k3_ar_fused", "kern_k3_land_add2_attnres_rms", grid=[TP_AR_GRID, 1, 1],
-                                         block=[1024, 1, 1], smem=CAND_SMEM)]},
+                                         block=[1024, 1, 1], smem=CAND_SMEM, pdl=True)]},
         }} if decode else {}),
         # P's closing add on its own, before a snapshot layer.
         **({"land_add2": {
@@ -684,14 +684,14 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                        "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32", "i64", "i64",
                        *PF_PARAMS, *PF_PARAMS],
             "impl": {"launches": [launch("k3_ar_fused", "kern_k3_ar_attnres_rms", defines={"NRANKS": tp},
-                                         grid=[TP_AR_GRID, 1, 1], block=[1024, 1, 1], smem=CAND_SMEM)]},
+                                         grid=[TP_AR_GRID, 1, 1], block=[1024, 1, 1], smem=CAND_SMEM, pdl=True)]},
         }
         ops["ar_finalize_rms"] = {
             "params": ["in buffer<bf16>", "in buffer<i32>", "in buffer<f32>", "in buffer<bf16>", *lamport_params,
                        "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "i32", "i64", "i64", *PF_PARAMS,
                        *PF_PARAMS],
             "impl": {"launches": [launch("k3_ar_fused", "kern_k3_ar_finalize_rms", defines={"NRANKS": tp},
-                                         grid=[TP_AR_GRID, 1, 1], block=[1024, 1, 1])]},
+                                         grid=[TP_AR_GRID, 1, 1], block=[1024, 1, 1], pdl=True)]},
         }
         # `--peer-ar`: one kernel, every rank's partial pushed into every
         # peer's Lamport stage over NVLink (one hop, no ring), summed in f32.
