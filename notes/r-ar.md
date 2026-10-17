@@ -30,14 +30,32 @@ blocks' weight loads); with the spread only below 33 rows, 3.404-3.405 (-0.2%).
 = main d85613c 3.373 -> 3.270 (-3.0%). **Offer: the branch at its head** (15 commits on d85613c).
 All bit-identical vs main (loop/d/check x3; two-shot paths in the harness).
 
-Each exchange's own time in the step (work/ar/own.py: per call, end minus the previous kernel's end, the minimum
-over 5 ranks = the last-arriving rank's; us a call, 8 / 48 rows): ar_attnres own 12.6 / 13.5, mean 17.8 / 18.0,
-max 21.7 / 20.8; ar_finalize own 11.0 / 12.2, mean 19.5 / 27.3, max 28.3 / 41.3 (EP skew); land 4.1 / 4.9.
+Each kernel's own time in the step (work/ar/own.py: per call, its end minus the previous kernel's end, the
+minimum over the ranks = the last-arriving rank's; nsys, 7 ranks, us a call, 8 / 48 rows x 64k):
 
-What is left in the step (nsys, 8 / 48 rows x 64k, us a step on the frontier): ar_attnres 331 / 306, ar_finalize
-237 / 349, land 66 / 79, embed 6 / 6. An all-reduce's frontier time is ~2x its time alone: the wait for the
-last rank (the GEMM before it ends 2-6 us apart across ranks; EP skew before ar_finalize) and the load window's
-drain. The closing add ends 3.8-4.9 us after lat_up (1-1.5 of it the release of griddepcontrol.wait).
+| | branch at 95593b1-ish (5 ranks) | branch head fe5afb8 (7 ranks) | mean over ranks (head) |
+|---|---:|---:|---:|
+| ar_attnres_rms | 12.6 / 13.5 | **9.15 / 9.57** | 12.3 / 13.0 |
+| ar_finalize_rms | 11.0 / 12.2 | **7.09 / 8.81** | 16.8 / 25.8 (EP skew) |
+| land_add2_attnres_rms | 4.1 / 4.9 | **3.17 / 4.08** | 3.4 / 4.5 |
+
+On the step's frontier (us a step, 8 / 48 rows): ar_attnres 170 / 242, ar_finalize 225 / 310, land 51 / 67 (at the
+round's start: 249-298 / 400-418, 278-344 / 484-507, 99-101 / 119-121).
+
+## The floor at 1-8 rows: why the all-reduce stays ~2.3x the 3.9 us empty one-shot
+
+In the step the open (state, handshake, slot pointers, snapshots, prefix) is before griddepcontrol.wait, under the
+GEMM. After it, on the last-arriving rank: x's load (o_proj's output, L2) ~0.5 us; the push and the slowest peer's
+data ~3.4 us (the empty one-shot's floor, fabric latency over 2 trays); the epilogue ~1.5 us at nb 1 (the new row's
+score and the mix's norm: two dependent block reductions, ~0.4 us each, the rest loads and stores); then the load
+window's end (0.5 us past the first row's data) and the drain of the loads in flight (8 MB). Measured own time
+9.15 us. What would take it nearer 1.15x:
+- the epilogue in one reduction: the mix's norm from the candidates' dots (measured: flat in the step, moves
+  outputs by 1-2 ulp; dropped) or the rows over a cluster (2 blocks a row: flat; 4: cannot be co-resident);
+- multicast: measured, ~0.1 us (the one-shot is ingress-bound once the push is spread);
+- no load window: the exchange alone, but the GEMM after it then reads its whole weight from HBM (main's r-gemm
+  measured the window at -2.4%).
+So the remaining distance is the fabric latency plus a bit-identical epilogue; I see nothing left in the protocol.
 
 ## Tools (work/ar/, not committed unless kept)
 
