@@ -90,11 +90,10 @@ typedef __nv_bfloat16 bf16_t;
 typedef __nv_bfloat162 bf162_t;
 
 // ---------------------------------------------------------------- protocol
-__device__ __forceinline__ unsigned long long gtimer() {
-  unsigned long long t;
-  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-  return t;
-}
+// A wait's deadline counts SM cycles, `timeout_ns` at 2 a ns: %globaltimer is resynced to the host clock
+// early in a process, and its jump fires a deadline with nothing late (k3_dcp.cu's await_all).
+__device__ __forceinline__ long long dl_now() { return clock64(); }
+__device__ __forceinline__ bool dl_past(long long t0, long long timeout_ns) { return dl_now() - t0 > 2 * timeout_ns; }
 
 __device__ __forceinline__ uint4 ld_volatile(const uint4* p) {
   uint4 v;
@@ -154,10 +153,10 @@ __device__ __forceinline__ void lamport_handshake(uint8_t* lamport, const unsign
     reinterpret_cast<volatile int*>(reinterpret_cast<uint8_t*>(peers[threadIdx.x]) + at)[rank] = 1;
   if (threadIdx.x == 0) {
     const volatile int* ready = reinterpret_cast<const volatile int*>(lamport + at);
-    const unsigned long long t0 = gtimer();
+    const long long t0 = dl_now();
     for (int q = 0; q < NRANKS; ++q)
       while (!ready[q])
-        if ((long long)(gtimer() - t0) > timeout_ns) give_up(err, 1 + q);
+        if (dl_past(t0, timeout_ns)) give_up(err, 1 + q);
   }
 }
 
@@ -226,7 +225,7 @@ __device__ __forceinline__ void lamport_push(const Lamport& l, long long i, uint
 // The rank-order f32 sum of vector i over the slots, rounded once.
 __device__ __forceinline__ uint4 lamport_sum(const Lamport& l, long long i, long long timeout_ns, int& fail) {
   uint4 vals[NRANKS];
-  unsigned long long t0 = 0;
+  long long t0 = 0;
   while (true) {
     int missing = 0;
 #pragma unroll
@@ -235,10 +234,9 @@ __device__ __forceinline__ uint4 lamport_sum(const Lamport& l, long long i, long
       if (missing == 0 && !arrived(vals[r])) missing = 1 + r;
     }
     if (missing == 0) break;
-    const unsigned long long now = gtimer();
     if (t0 == 0) {
-      t0 = now;
-    } else if ((long long)(now - t0) > timeout_ns) {
+      t0 = dl_now();
+    } else if (dl_past(t0, timeout_ns)) {
       fail = missing;
       break;
     }
@@ -256,15 +254,14 @@ __device__ __forceinline__ uint4 lamport_sum(const Lamport& l, long long i, long
 
 // Vector i of slot q alone: a two-shot's gathered sum.
 __device__ __forceinline__ uint4 lamport_one(const Lamport& l, int q, long long i, long long timeout_ns, int& fail) {
-  unsigned long long t0 = 0;
+  long long t0 = 0;
   const uint4* p = l.mine + (long long)q * l.tot + i;
   while (true) {
     const uint4 v = ld_volatile(p);
     if (arrived(v)) return v;
-    const unsigned long long now = gtimer();
     if (t0 == 0) {
-      t0 = now;
-    } else if ((long long)(now - t0) > timeout_ns) {
+      t0 = dl_now();
+    } else if (dl_past(t0, timeout_ns)) {
       fail = 1 + q;
       return v;
     }

@@ -41,11 +41,6 @@ __device__ __forceinline__ u32 ord_f32(float f) {
 }
 __device__ __forceinline__ u64 key_of(float v, int i) { return ((u64)ord_f32(v) << 32) | (u32)(IDX_TOP - i); }
 
-__device__ __forceinline__ unsigned long long gtimer() {
-  unsigned long long t;
-  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-  return t;
-}
 
 extern "C" __global__ void __launch_bounds__(THREADS) kern_k3_head_argmax(
     const float* __restrict__ part, float* logits, const unsigned long long* __restrict__ logits_peers,
@@ -103,9 +98,10 @@ extern "C" __global__ void __launch_bounds__(THREADS) kern_k3_head_argmax(
     u64 g = 0ull;
     if (t < NRANKS) {
       const volatile u64* slot = keys + stage + t * KEY_ROWS + b;
-      const unsigned long long t0 = gtimer();
+      // the deadline counts SM cycles (~2 a ns): %globaltimer jumps early in a process (k3_dcp.cu)
+      const long long t0 = clock64();
       while ((g = *slot) == 0ull)
-        if ((long long)(gtimer() - t0) > timeout_ns) {
+        if (clock64() - t0 > 2 * timeout_ns) {
           atomicMax(err, 1 + t);
           __threadfence_system();
           __trap();
