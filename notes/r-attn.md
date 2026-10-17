@@ -12,7 +12,10 @@ W_UK by TMA; -0.3..-2.0 µs a call from 8 rows, +0.2 at 1 row) and the
 fp8 builds' e4m3 cast in hardware (absorb fp8 16.4 → 8.1 µs at 48 rows;
 `--kv fp8` only). Tried and dropped since: W_UK into L2 from mla_prep, the
 next KDA layer's state from kda_core (both slower; numbers below), the
-fp8 query on tcgen05.
+fp8 query on tcgen05, kda_core's weights at evict_last (no change). The MLA
+kernel is not started: its ceiling (no-math table), the pair design's
+budgets and the measured building blocks (tcgen05 rates, TMEM residency and
+a pair's D layout, descriptor forms) are in "For an MLA kernel later".
 
 ## Status (03:40 UTC)
 
