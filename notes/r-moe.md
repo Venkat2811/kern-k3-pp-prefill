@@ -179,6 +179,15 @@ the flags carry that ordering (noted in the commit and the kernel).
   tiles above 24 rows 3.4717, worse. FC1 waits for every grid launched before it (the transitive wait
   above), so sh_down's end, not moe_front's, now sets FC1's start at every row count: moe_front's own
   tail (hand-off, tables) only pays once sh_down is shorter.
+- **sh_down merged into moe_front's grid** (blocks T .. T + 111 of moe_front run the projection;
+  launch_bounds(1024) -> 54-64 registers, no spills; row blocks dispatch first, so no hang): one launch
+  less a MoE layer, 207 -> 192 a step (12.9 -> 12.0 / layer), bit-identical (loop/d/check). But
+  3.4480 -> 3.4740 ms/step (+0.75%): FC1 runs ~2.2 us longer after the merged kernel, at every layer
+  and row count (layer-by-layer nsys, `work/fc1gap.py`), although the merged grid ends earlier than
+  HEAD's sh_down at 24-36 rows. Bisected: merged with the shared blocks idle -> FC1 normal; without
+  their GEMM -> normal; with the GEMM (even on garbage weights, even HEAD's exact GEMM code, even
+  delayed 0.9 us) -> slow. Not the smem carveout (HEAD with moe_front's dynamic smem raised to 207 KB:
+  equal). Cause not found; reverted. If someone finds it, the merge is worth a launch a layer.
 - Verification caveat: main itself gave different logits at 24 rows teacher-forced across two leases
   once (48 rows reproducible); compare a candidate against main run in the same batch.
 
