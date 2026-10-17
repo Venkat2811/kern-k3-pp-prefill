@@ -765,7 +765,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             # three stages, then the first call's handshake words (k3_ar_fused.cu), never poisoned
             "tp_ar_lamport": {"dtype": "u8", "shape": [3 * ar_stage + 64], "kind": "carry", "export": True},
             "tp_ar_lamport_peers": {"dtype": "u64", "shape": [tp], "kind": "peer", "of": "tp_ar_lamport", "group": "tp"},
-            "tp_ar_state": {"dtype": "i32", "shape": [8], "kind": "carry"},
+            # k3_ar_fused.cu: [6] the handshake, from [8] every block's stage and re-poison count
+            "tp_ar_state": {"dtype": "i32", "shape": [8 + 2 * TP_AR_GRID], "kind": "carry"},
             "tp_err": {"dtype": "i32", "shape": [1], "kind": "output", "fill": "error"},
         })
     # D: a KV row lives on member p % tp; a KDA line is this member's heads of
