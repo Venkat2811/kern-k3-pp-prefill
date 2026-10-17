@@ -671,6 +671,13 @@ Where next (the bound is shared memory bytes a tile, ~128 B/clk):
 4. A persistent grid over the (row, split) items (the DSL's empty 16-slot clusters, skew's tail): the item
    loop around this kernel's pipeline, O and Q reloaded per item.
 
+- **The attention's first wave into L2 from absorb** (`work/abspf.diff`): 56 more absorb blocks, on the SMs
+  its 96 heads leave idle while W_UK streams at a fraction of HBM's rate, find the DSL's first 76 non-empty
+  clusters in launch order (a block scan over split-major (split, row)) and `prefetch.global.L2` each one's
+  first tile (two pages), nothing to wait on. Bit-identical (loop/d/check); D A/B against the branch, one
+  lease, 3 rounds: 3.223 / 3.224 / 3.227 → 3.231 / 3.229 / 3.229 ms/step, no shape faster. Dropped: the DSL's
+  first tile is not where its fixed cost is.
+
 ## moe_front (`source/k3_moe_front.cu`, taken this session: no round-3 run owns it)
 
 One block a row (1024 threads): sigmoid + biased top-16 of 896 router scores, the latent's mxfp8 quant, the
