@@ -241,3 +241,9 @@ overlapping its stream (register build), as the done table says.
   q_b's splitKreduce) and D 3.379 → 3.377 / 3.389. Dropped, as in round 1.
   An L2 prefetch of W_UK from mla_prep has no idle block to run in (every
   block holds a row at TP8) and would cross q_b's 54 MB.
+- harness/run.sh `conv` now also runs the D step's two kda builds against
+  their SGLang variants (CONV_TAP_MAJOR + LINE_GUARD, padded rows) bit for
+  bit (`--smem 65536` for the shared-memory one): PASS at 2 / 8 / 64 rows;
+  `tp8` kda_core (non-conv build) PASS against its CPU reference. `sass`
+  flags k3_dcp's exchange (STACK:16): main's, not this branch's (r-comm's
+  kernel now).

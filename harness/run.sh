@@ -118,6 +118,13 @@ conv() {
   for B in 2 8 64; do
     r "$out/kda_conv_layout" --B "$B" --base "$(cubin k3_kda_core+$d+WSM_FA=12+WSM_LDS=6400)" \
       --variant "$(cubin k3_kda_core+CONV_TAP_MAJOR=1+$d+LINE_GUARD=1+WSM_FA=12+WSM_LDS=6400)"
+    # the D step's two builds (gen_stage.py routes up to 25 rows to the first)
+    r "$out/kda_conv_layout" --B "$B" --smem 65536 \
+      --base "$(cubin k3_kda_core+HEADS=12+KDA_CONV=1+KDA_SMEM_STATE=1+LDS=6400+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400)" \
+      --variant "$(cubin k3_kda_core+CONV_TAP_MAJOR=1+HEADS=12+KDA_CONV=1+KDA_SMEM_STATE=1+LDS=6400+LINE_GUARD=1+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400)"
+    r "$out/kda_conv_layout" --B "$B" \
+      --base "$(cubin k3_kda_core+HEADS=12+KDA_CONV=1+KDA_MINB=4+LDS=6400+ROWS_PER_ITER=2+WSM_FA=12+WSM_LDS=6400)" \
+      --variant "$(cubin k3_kda_core+CONV_TAP_MAJOR=1+HEADS=12+KDA_CONV=1+KDA_MINB=4+LDS=6400+LINE_GUARD=1+ROWS_PER_ITER=2+WSM_FA=12+WSM_LDS=6400)"
   done
 }
 

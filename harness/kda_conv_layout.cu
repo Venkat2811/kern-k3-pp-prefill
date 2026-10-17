@@ -10,7 +10,7 @@
 //
 //   nvcc -O2 -std=c++17 -arch=sm_103a kda_conv_layout.cu -o kda_conv_layout -lcuda
 //   ./kda_conv_layout --base <k3_kda_core+HEADS=12+KDA_CONV=1+...cubin> \
-//                     --variant <k3_kda_core+CONV_TAP_MAJOR=1+...+LINE_GUARD=1+...cubin> --B 64
+//                     --variant <k3_kda_core+CONV_TAP_MAJOR=1+...+LINE_GUARD=1+...cubin> --B 64 [--smem 65536]
 //
 // The model constants are the TP8 rank's (12 heads, the fused 6400-column
 // partial). Exit 0 PASS, 1 FAIL, 2 harness or driver error.
@@ -76,12 +76,14 @@ int main(int argc, char** argv) {
   std::string base, variant;
   int B = 64;
   unsigned seed = 1234;
+  int smem = 0;
   for (int i = 1; i + 1 < argc; i += 2) {
     std::string a = argv[i];
     if (a == "--base") base = argv[i + 1];
     else if (a == "--variant") variant = argv[i + 1];
     else if (a == "--B") B = std::atoi(argv[i + 1]);
     else if (a == "--seed") seed = (unsigned)std::atoi(argv[i + 1]);
+    else if (a == "--smem") smem = std::atoi(argv[i + 1]);  // dynamic smem of both launches (KDA_SMEM_STATE builds)
     else { std::fprintf(stderr, "unknown option `%s`\n", argv[i]); return 2; }
   }
   if (base.empty() || variant.empty() || B < 2) {
@@ -149,8 +151,12 @@ int main(int argc, char** argv) {
 
   void* ab[] = {&dp, &dcw, &dwsm, &dwfb, &ddt, &dal, &dgo, &dlines, &dbi, &lb, &dob, &b_, &dat, &span};
   void* av[] = {&dp, &dcw, &dwsm, &dwfb, &ddt, &dal, &dgo, &drec, &dvi, &rb, &dwin, &dvi, &wb, &dov, &b_, &dat, &span};
-  CU(cuLaunchKernel(fb, B, HEADS, 1, 128, 1, 1, 0, 0, ab, nullptr));
-  CU(cuLaunchKernel(fv, B, HEADS, 1, 128, 1, 1, 0, 0, av, nullptr));
+  if (smem) {
+    CU(cuFuncSetAttribute(fb, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem));
+    CU(cuFuncSetAttribute(fv, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem));
+  }
+  CU(cuLaunchKernel(fb, B, HEADS, 1, 128, 1, 1, smem, 0, ab, nullptr));
+  CU(cuLaunchKernel(fv, B, HEADS, 1, 128, 1, 1, smem, 0, av, nullptr));
   CU(cuCtxSynchronize());
 
   auto ob = get(dob, poison.size() * 2), ov = get(dov, poison.size() * 2);
