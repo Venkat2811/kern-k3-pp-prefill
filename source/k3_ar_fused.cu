@@ -82,7 +82,7 @@ namespace cg = cooperative_groups;
 #define TOPK 16
 #define KGRID 152  // the exchanges' grid (gen_stage.py's TP_AR_GRID): one 1024-thread block an SM
 #ifndef TWO_SHOT_ROWS
-#define TWO_SHOT_ROWS 20
+#define TWO_SHOT_ROWS 14
 #endif
 
 typedef __nv_bfloat16 bf16_t;
