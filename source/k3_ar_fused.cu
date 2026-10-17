@@ -6,8 +6,9 @@
 // rotate by call, each block keeping the rotation itself (`state`, below).
 //
 // The exchange runs over a row's sixteen-byte vectors. Every block pushes an
-// equal run of all rows' vectors (and re-poisons a share of the previous
-// call's stage); block b < B then waits for row b and runs the epilogue on it,
+// equal run of all rows' vectors (the two-shot: the first blocks, a vector a
+// thread) and re-poisons a share of the previous call's stage; block b < B
+// then waits for row b and runs the epilogue on it,
 // a row per 1024 threads. From TWO_SHOT_ROWS rows a row goes to its owner
 // (row % NRANKS) only, whose row block sums it as the one-shot does; the
 // blocks of the rows a rank does not own first gather its rows' sums to the
@@ -194,19 +195,16 @@ __device__ __forceinline__ void lamport_clear(const Lamport& l) {
 // Vector i of a call's `tot` this thread pushes, or -1: runs of PUSH_RUN vectors dealt to the
 // KGRID blocks in order, so a row's pushes leave from several SMs rather than from the one block
 // a row would fill (an SM pushes ~55 GB/s). The grid is a constant: a division by gridDim.x
-// costs the push 0.3 us. From PUSH_SPREAD_ROWS rows the pushes fill the first blocks a vector a
-// thread instead, so the blocks past them start loading the next weight (l2_load_while) at once.
+// costs the push 0.3 us. The two-shot (from TWO_SHOT_ROWS rows) pushes from the first blocks a
+// vector a thread instead, so the blocks past them start loading the next weight (l2_load_while) at once.
 #ifndef PUSH_RUN
 #define PUSH_RUN 128
-#endif
-#ifndef PUSH_SPREAD_ROWS
-#define PUSH_SPREAD_ROWS 33
 #endif
 __device__ __forceinline__ int share_per(long long tot) {
   return (((int)tot + PUSH_RUN - 1) / PUSH_RUN + KGRID - 1) / KGRID * PUSH_RUN;
 }
 __device__ __forceinline__ long long share(long long tot, int B) {
-  if (B >= PUSH_SPREAD_ROWS) {
+  if (B >= TWO_SHOT_ROWS) {
     const int i = (int)blockIdx.x * KTHREADS + (int)threadIdx.x;
     return i < (int)tot ? i : -1;
   }
@@ -882,7 +880,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
   // the top-k of the (at most two) rows this block's share spans, written by moe_front: read before the wait
   __shared__ int s_e2p[2][TOPK];
   __shared__ float s_w[2][TOPK];
-  const int row0 = (B >= PUSH_SPREAD_ROWS ? b * KTHREADS : share_per(tot) * b) / ROWV;
+  const int row0 = (B >= TWO_SHOT_ROWS ? b * KTHREADS : share_per(tot) * b) / ROWV;
   if (t < 2 * TOPK && row0 + t / TOPK < B) {
     s_e2p[t / TOPK][t % TOPK] = exp2perm[(row0 + t / TOPK) * TOPK + t % TOPK];
     s_w[t / TOPK][t % TOPK] = wts[(row0 + t / TOPK) * TOPK + t % TOPK];
