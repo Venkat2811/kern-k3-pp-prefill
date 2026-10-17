@@ -62,8 +62,9 @@ The named limits of what is not within ~1.15x:
 - `w_dn` (layer 0 only, after situ), `lm_head` (1 call, 280 MB: the closing add hints the first 96 MB).
 
 Not tried, for a next session: sh_down (and o_proj) computed inside the all-reduce after them (r-ar's kernels, a
-proposal: -1 launch a layer each); qkvg / front at 33-48 rows need a kernel whose A stages do not crowd the weight
-ring (at BN 40 / 48 a 64-row tile keeps only 4 stages at three CTAs an SM).
+proposal: -1 launch a layer each; for sh_down a 48-MMA mma.sync chain a 16 x 8 tile, ~2.5-3 us inside the AR vs
+2.7 us + a launch now, so mostly a launch). qkvg / front at 33-48 rows: tried once (below, swapped operands);
+what is left is a 2-3-CTA-an-SM kernel whose A stages do not crowd the weight ring.
 
 ## Tools (work/, not committed)
 
@@ -172,6 +173,11 @@ Tried and dropped (A/B in one lease each, ms/step):
 - prefetching K-major (line t of every row and split before line t + 1, so every CTA's first blocks warm evenly)
   instead of in address order: worse (hints 15.9 vs 14.3 us after, loads too slow to issue): DRAM page locality
   matters more than CTA balance.
+- qkvg / front at 33-48 rows with the operands swapped (rows of A the M = 64 operand, 128 weight rows N: a 16 KB
+  weight box beside an 8 KB A box at any m, 8 stages, one CTA an SM, the splits added in order through global
+  scratch by the last of three; work/h/k3_gemm_f32w.cu): bit-identical 1..48, but 26 vs 18 us cold, 20 vs 10 hot.
+  Its loop is fine (7.0 us) and the epilogue 1.7; a 194 KB CTA cannot sit beside the kernel before it, so every
+  call pays its whole start (~2.5 us) after the predecessor, and it is worse back to back.
 - o_proj by a kernel holding its whole 192 KB weight slice in shared memory, requested before
   griddepcontrol.wait (work/h/k3_gemm_pre.cu, bit-identical 1..64 rows): 8.6 vs 5.2 us alone, 7.1 vs 4.7 after a
   9 us PDL predecessor: A's 64-row boxes through a 3-deep ring after the wait cost more than the preload saves.
