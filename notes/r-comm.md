@@ -18,6 +18,8 @@ rebased onto it and carries:
 | `0f5d1fe`, `02a2685` | `harness/xchg/` (the 8-rank harness), `abn.sh` (interleaved A/B) | |
 
 All bit-identical (`loop/d/check` x3 each; the harness compares main's kernels byte for byte).
+The whole branch (`eb1f5ab`) against main `fd5c92c`, interleaved three rounds in one lease:
+3.248 / 3.248 / 3.248 -> 3.245 / 3.244 / 3.247 ms/step (-0.1%).
 
 History of the all-reduce line, for the orchestrator's question (03:48):
 
@@ -273,6 +275,8 @@ Harness, us a call (`fusedv`, `attnv`, `sweep`; 1 snapshot):
   0.1-0.4 at 8-16, -0.9 at 1 row: ~-0.2 us a call at the bench's traffic, ~0.1% of the step. Not
   bit-identical from 2 snapshots (1-9 elements of `normed` a call) and not worth finding why.
 - A `__nanosleep` backoff in the polls (32 / 100 / 200 ns): slower at every row count, 0.1-0.9 us.
+  The same in k3_dcp's `await_all2` (64 / 256 ns, to free issue slots for a co-resident block still
+  merging): 0.4-0.6 us slower at 1-36 rows, equal at 48.
 - A barrier between a block's pushes and its row poll: neutral (+-0.1 us), worse at 48 MoE rows.
 - The shuffle-free softmax (each thread computing all candidates' weights, warp_sum's tree replayed in
   registers; bit-identical): 9 rsqrt / exp / IEEE divides a thread swamp the special-function unit,
