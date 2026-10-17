@@ -56,10 +56,10 @@ namespace cg = cooperative_groups;
 
 #include "k3_l2_prefetch.cuh"
 
-// how long the loads of the next weight go on past a row's arrival: under kern_k3_ar_attnres_rms's row
-// epilogue (the attention residual's ~4.3 us) and kern_k3_ar_finalize_rms's (the latent norm's ~1 us)
+// how long the loads of the next weight go on past a row's arrival: past that the grid's end waits for them,
+// not for the row epilogue (kern_k3_ar_attnres_rms's attention residual ~1.5 us, the latent norm's ~1 us)
 #ifndef AR_GRACE_NS
-#define AR_GRACE_NS 2500
+#define AR_GRACE_NS 500
 #endif
 #ifndef FIN_GRACE_NS
 #define FIN_GRACE_NS 500
