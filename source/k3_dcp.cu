@@ -107,7 +107,6 @@
 #include <cuda_bf16.h>
 #include <math_constants.h>
 #include <cstdint>
-#include <cstdio>
 
 #ifndef HEADS
 #define HEADS 96
@@ -578,9 +577,10 @@ extern "C" __global__ void __launch_bounds__(256, 2) kern_k3_dcp_exchange(
     if (next < items) stage_w(sw, w_kv_b, next / 2 % HL, next % 2 * 2), stage_w(sw, w_kv_b, next / 2 % HL, next % 2 * 2 + 1);
   }
   if (fail) {
-    // A member's data never came: whatever this step computes from here is wrong, so stop it loudly.
+    // A member's data never came: whatever this step computes from here is wrong, so stop it loudly
+    // (`err` names the member; a printf here would give the kernel a stack frame).
     atomicMax(err, fail);
-    if (threadIdx.x % 32 == 0) printf("kern_k3_dcp_exchange: rank %d gave up on member %d (block %d)\n", rank, fail - 1, blockIdx.x);
+    __threadfence_system();
     __trap();
   }
 
