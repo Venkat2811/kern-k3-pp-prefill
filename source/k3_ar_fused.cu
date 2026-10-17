@@ -9,8 +9,9 @@
 // equal run of all rows' vectors (and re-poisons a share of the previous
 // call's stage); block b < B then waits for row b and runs the epilogue on it,
 // a row per 1024 threads. From TWO_SHOT_ROWS rows a row goes to its owner
-// (row % NRANKS) only, whose row block sums it as the one-shot does and
-// gathers the sum to the others. The blocks past B load the next GEMM's weight
+// (row % NRANKS) only, whose row block sums it as the one-shot does; the
+// blocks of the rows a rank does not own first gather its rows' sums to the
+// others (gather_share). The blocks past B load the next GEMM's weight
 // `pf` (`pf_bytes`) into L2 while a row block still waits (k3_l2_prefetch.cuh;
 // state[2 * phase] stamps a row's data in, state[7] is the loads' sink);
 // kern_k3_ar_finalize_rms's then the next layer's o_proj
@@ -275,14 +276,23 @@ __device__ __forceinline__ uint4 lamport_one(const Lamport& l, int q, long long 
 __device__ __forceinline__ uint4 lamport_get(const Lamport& l, bool two, int owner, int rank, long long i,
                                              long long timeout_ns, int& fail) {
   if (two && owner != rank) return lamport_one(l, owner, i, timeout_ns, fail);
-  uint4 v = lamport_sum(l, i, timeout_ns, fail);
-  if (two) {
-    v = unpoison4(v);
+  const uint4 v = lamport_sum(l, i, timeout_ns, fail);
+  return two ? unpoison4(v) : v;
+}
+
+// Two-shot: the sums of this rank's rows (row % NRANKS == rank) gathered to the other ranks by the blocks of the
+// rows it does not own, an equal run of the owned vectors each (RW a row), before they wait for their own row: the
+// gather leaves from ~7B/8 SMs instead of B/8. The owner's row block sums its row again for itself.
+template <int RW>
+__device__ __forceinline__ void gather_share(const Lamport& l, int rank, int B, long long timeout_ns, int& fail) {
+  const int b = blockIdx.x, nown = (B - rank + NRANKS - 1) / NRANKS, m = B - nown;
+  const int per = (nown * RW + m - 1) / m, g = (b - (b - rank + NRANKS - 1) / NRANKS) * per + (int)threadIdx.x;
+  if ((int)threadIdx.x >= per || g >= nown * RW) return;
+  const long long i = (long long)(rank + NRANKS * (g / RW)) * RW + g % RW;
+  const uint4 v = unpoison4(lamport_sum(l, i, timeout_ns, fail));
 #pragma unroll 1
-    for (int q = 0; q < NRANKS; ++q)
-      if (q != rank) l.slot[q][i] = v;
-  }
-  return v;
+  for (int q = 0; q < NRANKS; ++q)
+    if (q != rank) l.slot[q][i] = v;
 }
 
 // The word l2_load_while stops on (the first row block's arrival stamp): one a phase, state[2 * phase]; the
@@ -647,6 +657,7 @@ __device__ __forceinline__ void ar_attnres_rms(const uint4* __restrict__ x, uint
 
   int fail = 0;
   if (row) {
+    if (two && b % NRANKS != rank) gather_share<KVEC>(l, rank, B, timeout_ns, fail);
     float sc[NB + 1];
     row_snap_scores<NB>(cand, r, sc, s, t);
     V8 pv;
@@ -879,7 +890,8 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
                   : c < KLATV ? finalize(fc2, s_e2p[row - row0], s_w[row - row0], c)
                               : shared[(long long)row * KVEC + c - KLATV];
   // From TWO_SHOT_ROWS rows the sum runs as two shots: every row goes to its owner (row % NRANKS) only, the
-  // owner sums it and gathers the sum to the others, 2 x 7/8 of a partial out of each rank instead of 7.
+  // owner sums it and gathers the sum to the others (gather_share), 2 x 7/8 of a partial out of each rank
+  // instead of 7.
   const bool two = B >= TWO_SHOT_ROWS;
   if (i >= 0) {
     if (two)
@@ -896,6 +908,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
   if (b < B) {
     const long long base = (long long)b * ROWV;
     const int owner = b % NRANKS;
+    if (two && owner != rank) gather_share<ROWV>(l, rank, B, timeout_ns, fail);
     const auto summed = [&](long long i) { return lamport_get(l, two, owner, rank, i, timeout_ns, fail); };
     if (t < KVEC) shared_sum[(long long)b * KVEC + t] = summed(base + KLATV + t);
     l2_arrive(stamp);
