@@ -8,13 +8,15 @@
 //       int B);                  // B <= 64
 //
 //   grid  (1, HEADS, LAT / CS = 4)   block (2 * CS = 256, 1, 1)   smem 0 dynamic (52 KB static)
+//   3 blocks an SM (80 registers): the 384 blocks are one wave
 //
 // Block (h, cs) owns columns cs*CS .. +CS of head h for every row: W_UK's
 // 128 x CS slice is read once (the scalar kernel re-read it per 8-row group,
 // and its 16-way smem reduction made a 16-row step ~13 us for 12 MB),
 // staged in shared memory with the batch's bf16 query, and each of the CS / 16
-// warps multiplies its 16 columns with wmma 16x16x16 (bf16 in, f32
-// accumulate) over ceil(B/16) row tiles. Rows past B are zero in shared
+// warps multiplies its 16 columns with mma.sync m16n8k16 (bf16 in, f32
+// accumulate; ldmatrix fragments, W's transposed) over ceil(B/16) row tiles,
+// its accumulators stored straight to q_abs. Rows past B are zero in shared
 // memory and never stored. Each block also copies its eighth of the rope
 // columns (2 threads x 4 columns per row, loaded with everything else).
 //
@@ -31,8 +33,6 @@
 //
 //   nvcc -cubin -arch=sm_103a -O3 source/k3_mla_absorb_mma.cu
 #include <cuda_bf16.h>
-#include <mma.h>
-using namespace nvcuda;
 
 #ifdef Q_FP8
 #include <cuda_fp8.h>
@@ -57,15 +57,14 @@ typedef __nv_bfloat16 q_t;
 #define CS 128     // columns per block
 #endif
 #define THREADS (2 * CS)  // a warp per 16 columns
-#define QP (NOPE + 8)  // padded smem rows keep the wmma loads off one bank
+#define QP (NOPE + 8)  // padded smem rows keep the ldmatrix loads off one bank
 #define WP (CS + 8)
 
-extern "C" __global__ void __launch_bounds__(THREADS) kern_k3_mla_absorb_mma(const float* __restrict__ q_partial,
+extern "C" __global__ void __launch_bounds__(THREADS, 3) kern_k3_mla_absorb_mma(const float* __restrict__ q_partial,
                                                                         const __nv_bfloat16* __restrict__ w_kv_b,
                                                                         q_t* __restrict__ q_abs, int B) {
   __shared__ __align__(32) __nv_bfloat16 qs[BMAX][QP];
   __shared__ __align__(32) __nv_bfloat16 ws[NOPE][WP];
-  __shared__ __align__(32) float out[CS / 16][16][16];
   const int h = blockIdx.y, c0 = blockIdx.z * CS, t = threadIdx.x, warp = t / 32, lane = t % 32;
   const int tiles = (B + 15) / 16;
   // W slice: 128 rows x CS columns = 16 * CS sixteen-byte vectors, 8 per thread, all in flight.
@@ -103,31 +102,41 @@ extern "C" __global__ void __launch_bounds__(THREADS) kern_k3_mla_absorb_mma(con
     *reinterpret_cast<uint4*>(&ws[d][v * 8]) = wv[k];
   }
   __syncthreads();
-  // The warp's W columns are the same for every row tile: their fragments stay in registers.
-  wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> wf[NOPE / 16];
+  // The warp's 16 W columns are the same for every row tile: their B fragments (ldmatrix.trans of the
+  // row-major [k][n] slice, two n8 tiles a k16 step) stay in registers.
+  const unsigned qs0 = (unsigned)__cvta_generic_to_shared(&qs[0][0]), ws0 = (unsigned)__cvta_generic_to_shared(&ws[0][0]);
+  unsigned bw[NOPE / 16][4];
 #pragma unroll
-  for (int k = 0; k < NOPE / 16; ++k) wmma::load_matrix_sync(wf[k], &ws[k * 16][warp * 16], WP);
+  for (int k = 0; k < NOPE / 16; ++k)
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(bw[k][0]), "=r"(bw[k][1]), "=r"(bw[k][2]), "=r"(bw[k][3])
+                 : "r"(ws0 + ((k * 16 + lane % 16) * WP + warp * 16 + 8 * (lane / 16)) * 2));
+  const int g = lane / 4, tq = lane % 4;
   for (int m = 0; m < tiles; ++m) {
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-    wmma::fill_fragment(acc, 0.f);
+    float c[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
 #pragma unroll
     for (int k = 0; k < NOPE / 16; ++k) {
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
-      wmma::load_matrix_sync(a, &qs[m * 16][k * 16], QP);
-      wmma::mma_sync(acc, a, wf[k], acc);
-    }
-    wmma::store_matrix_sync(&out[warp][0][0], acc, 16, wmma::mem_row_major);
-    __syncwarp();
-    // 16 rows x 8 column pairs per warp, 4 per lane
+      unsigned a[4];
+      asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                   : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                   : "r"(qs0 + ((m * 16 + lane % 8 + 8 * (lane / 8 % 2)) * QP + k * 16 + 8 * (lane / 16)) * 2));
 #pragma unroll
-    for (int k = 0; k < 4; ++k) {
-      const int i = lane + k * 32, r = i / 8, j2 = i % 8, b = m * 16 + r;
+      for (int n = 0; n < 2; ++n)
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+                     "{%0, %1, %2, %3};"
+                     : "+f"(c[n][0]), "+f"(c[n][1]), "+f"(c[n][2]), "+f"(c[n][3])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(bw[k][2 * n]), "r"(bw[k][2 * n + 1]));
+    }
+    // c[n] holds rows g and g + 8 of the tile, columns n * 8 + 2 tq and + 1
+#pragma unroll
+    for (int hr = 0; hr < 2; ++hr) {
+      const int b = m * 16 + g + 8 * hr;
       if (b < B) {
-        q_t* o = q_abs + ((size_t)b * HEADS + h) * ROW + c0 + warp * 16;
-        PUT2(o, j2, __floats2bfloat162_rn(out[warp][r][2 * j2], out[warp][r][2 * j2 + 1]));
+        q_t* o = q_abs + ((size_t)b * HEADS + h) * ROW + c0 + warp * 16 + 2 * tq;
+#pragma unroll
+        for (int n = 0; n < 2; ++n) PUT2(o + n * 8, 0, __floats2bfloat162_rn(c[n][2 * hr], c[n][2 * hr + 1]));
       }
     }
-    __syncwarp();
   }
   if (rr < B) {
     q_t* o = q_abs + ((size_t)rr * HEADS + h) * ROW + LAT + rc;
