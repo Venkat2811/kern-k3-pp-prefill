@@ -512,3 +512,9 @@ math, TMEM O, bf16 P) to write and tune from PTX, more than this session.
   evict_last, kda_core then reading them evict_first. Worth ~0.6 / 0.9 / 1.2
   µs a call at 8 / 16 / 24 rows (12 calls a 16-layer step: 7 / 11 / 15 µs,
   0.25-0.45%), less what the extra 6.3-19 MB of L2 costs the qkvg prefetch.
+- **kda_core's own weights at evict_last** (w_f_b tile by cp.async with an
+  L2 cache hint, conv taps / dt_bias / a_log / gamma by ld.global.nc with
+  it: ~0.5 MB a layer, all twelve KDA layers resident from step to step):
+  one GPU no change (5.54 → 5.55 at 8 rows, 12.98 → 12.96 at 48), D A/B on
+  main 21a9174 3.285 / 3.286 → 3.285 / 3.287. The all-warm harness's extra
+  0.6 µs over a warm state is not those weights' L2 misses. Dropped.
