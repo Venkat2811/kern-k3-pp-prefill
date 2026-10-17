@@ -55,6 +55,9 @@
 #include <cstdint>
 namespace cg = cooperative_groups;
 
+// the loads' bytes in flight (k3_l2_prefetch.cuh's 12 MB): past the window's end the grid waits for the ones
+// issued to return, and the exchange's own traffic shares HBM with them
+#define L2_INFLIGHT (8 << 20)
 #include "k3_l2_prefetch.cuh"
 
 // how long the loads of the next weight go on past a row's arrival: past that the grid's end waits for them,
