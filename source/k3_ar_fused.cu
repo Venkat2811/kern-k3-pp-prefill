@@ -798,35 +798,40 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
 #define MLA_SPLIT_TILES 2
 #define MLA_WAVES 3
 
-__device__ __forceinline__ long long warp_sum_ll(long long v) {
+__device__ __forceinline__ int warp_sum_i(int v) {
 #pragma unroll
   for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
   return v;
 }
-__device__ __forceinline__ long long warp_max_ll(long long v) {
+__device__ __forceinline__ int warp_max_i(int v) {
 #pragma unroll
   for (int o = 16; o; o >>= 1) v = max(v, __shfl_xor_sync(0xffffffffu, v, o));
   return v;
 }
-// kern's k3_mla_split_plan.cu: `per` tiles a split over `budget` clusters, a row's splits from it
-__device__ __forceinline__ long long split_per(long long total, long long budget) {
-  budget = max(budget, 1ll);
-  return max((total + budget - 1) / budget, 1ll);
+// kern's k3_mla_split_plan.cu: `per` tiles a split over `budget` clusters, a row's splits from it (32-bit: a
+// batch's tiles are at most 64 x 2560)
+__device__ __forceinline__ int split_per(int total, int budget) {
+  budget = max(budget, 1);
+  return max((total + budget - 1) / budget, 1);
 }
-__device__ __forceinline__ long long row_splits(long long tiles, long long per, int split_max) {
-  return min(max((tiles + per - 1) / per, 1ll), (long long)split_max);
+__device__ __forceinline__ int row_splits(int tiles, int per, int split_max) {
+  return min(max((tiles + per - 1) / per, 1), split_max);
 }
 
-__device__ __forceinline__ void embed_rms(const long long* __restrict__ ids, const bf16_t* __restrict__ table,
-                                          bf16_t* __restrict__ hidden, bf16_t* __restrict__ blocks,
+// the gathered row, its stores, then the norm (nb = 0)
+__device__ __forceinline__ V8 embed_row(const long long* __restrict__ ids, const bf16_t* __restrict__ table, int b,
+                                        int t) {
+  V8 pv;
+  pv.w[0] = 0u, pv.w[1] = 0u, pv.w[2] = 0u, pv.w[3] = 0u;
+  if (t < KVEC) pv = ldv(table + ids[b] * KH + t * 8);
+  return pv;
+}
+__device__ __forceinline__ void embed_rms(const V8& pv, bf16_t* __restrict__ hidden, bf16_t* __restrict__ blocks,
                                           const bf16_t* __restrict__ gamma, bf16_t* __restrict__ normed, int b,
                                           int t) {
   __shared__ RowSmem s;
   const RowRegs r = row_prefetch<0>(blocks, nullptr, gamma, nullptr, t);
-  V8 pv;
-  pv.w[0] = 0u, pv.w[1] = 0u, pv.w[2] = 0u, pv.w[3] = 0u;
   if (t < KVEC) {
-    pv = ldv(table + ids[b] * KH + t * 8);
     stv(hidden + (size_t)b * KH + t * 8, pv);
     stv(blocks + (size_t)b * KNB_MAX * KH + t * 8, pv);
   }
@@ -838,7 +843,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_embed_rms(
     bf16_t* __restrict__ blocks, const bf16_t* __restrict__ gamma, bf16_t* __restrict__ normed, int B) {
   asm volatile("griddepcontrol.launch_dependents;");
   if (blockIdx.x >= B) return;
-  embed_rms(ids, table, hidden, blocks, gamma, normed, blockIdx.x, threadIdx.x);
+  embed_rms(embed_row(ids, table, blockIdx.x, threadIdx.x), hidden, blocks, gamma, normed, blockIdx.x, threadIdx.x);
 }
 
 extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_embed_rms_plan(
@@ -848,30 +853,35 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_embed_rms_plan
   asm volatile("griddepcontrol.launch_dependents;");
   const int b = blockIdx.x, t = threadIdx.x;
   if (b >= B) return;
-  if (t < 32) {  // the plan of row b
-    long long total = 0;
-    for (int q = t; q < B; q += 32) total += (seq_lens[q] + MLA_TILE - 1) / MLA_TILE;
-    total = warp_sum_ll(total);
+  const V8 pv = embed_row(ids, table, b, t);
+  if (t < 32) {  // the plan of row b, every row's tile count read once (B <= 64: two a lane)
+    int tiles[2];
+#pragma unroll
+    for (int k = 0; k < 2; ++k) tiles[k] = t + 32 * k < B ? (seq_lens[t + 32 * k] + MLA_TILE - 1) / MLA_TILE : 0;
+    const int total = warp_sum_i(tiles[0] + tiles[1]);
     unsigned nsm;
     asm("mov.u32 %0, %%nsmid;" : "=r"(nsm));
-    const long long clusters = nsm / 2;
+    const int clusters = nsm / 2;
     // `per` tiles a split such that the batch fills W waves of clusters, the W of the least modelled time
-    long long best = 0, best_cost = 0;
+    long long best_cost = 0;
+    int best = 0;
     for (int w = 1; w <= MLA_WAVES; ++w) {
-      const long long per = split_per(total, w * clusters - B);
-      long long splits = 0, longest = 0;
-      for (int q = t; q < B; q += 32) {
-        const long long tiles = (seq_lens[q] + MLA_TILE - 1) / MLA_TILE, sp = row_splits(tiles, per, split_max);
-        splits += sp;
-        longest = max(longest, (tiles + sp - 1) / sp);
-      }
-      splits = warp_sum_ll(splits);
-      longest = warp_max_ll(longest);
+      const int per = split_per(total, w * clusters - B);
+      int splits = 0, longest = 0;
+#pragma unroll
+      for (int k = 0; k < 2; ++k)
+        if (t + 32 * k < B) {
+          const int sp = row_splits(tiles[k], per, split_max);
+          splits += sp;
+          longest = max(longest, (tiles[k] + sp - 1) / sp);
+        }
+      splits = warp_sum_i(splits);
+      longest = warp_max_i(longest);
       long long cost = 0;
-      for (long long n = splits; n > 0; n -= clusters) cost += (longest + MLA_SPLIT_TILES) * max((long long)MLA_SATURATE, min(n, clusters));
+      for (int n = splits; n > 0; n -= clusters) cost += (long long)(longest + MLA_SPLIT_TILES) * max(MLA_SATURATE, min(n, clusters));
       if (w == 1 || cost < best_cost) best = per, best_cost = cost;
     }
-    if (t == 0) block_split_kvs[b] = (int)row_splits((seq_lens[b] + MLA_TILE - 1) / MLA_TILE, best, split_max);
+    if (t == 0) block_split_kvs[b] = row_splits((seq_lens[b] + MLA_TILE - 1) / MLA_TILE, best, split_max);
   }
-  embed_rms(ids, table, hidden, blocks, gamma, normed, b, t);
+  embed_rms(pv, hidden, blocks, gamma, normed, b, t);
 }
