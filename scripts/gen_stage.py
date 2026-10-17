@@ -153,6 +153,7 @@ LAND_CL = 4  # k3_ar_fused.cu: the closing add's row over a cluster of 4 blocks
 PF_PARAMS = ["in buffer<bf16>", "i64"]  # k3_ar_fused.cu: the next GEMM's weight, prefetched into L2
 PF_OPS = {"ar_attnres_rms", "ar_finalize_rms", "land_add2_attnres_rms_snap"}
 PF_MAX = 96 << 20  # of the GB300's 129 MB L2
+LAND_PF_MAX = 16 << 20  # the closing add's prefetch hints: their issue holds the grid the next GEMM waits on
 # ar_finalize_rms also loads the next o_proj's weight at evict_last; ar_attnres_rms after that o_proj demotes it
 PF_LAST = ".o_proj"
 
@@ -1368,7 +1369,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         for k, c in enumerate(prog):
             if c["op"] in PF_OPS:
                 w = next(g["args"][1] for j, g in gemms if j > k)
-                c["args"] += [w, i64(min(size(w), PF_MAX))]
+                c["args"] += [w, i64(min(size(w), LAND_PF_MAX if c["op"].startswith("land") else PF_MAX))]
             if c["op"] == "ar_finalize_rms":
                 j, g = next(((j, g) for j, g in gemms if j > k and g["label"].endswith(PF_LAST)), (None, None))
                 c["args"] += [g["args"][1], i64(size(g["args"][1]))] if g else [w, i64(0)]
