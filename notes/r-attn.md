@@ -4,6 +4,19 @@ Kernels: `k3_kda_core`, MLA (`k3_mla_prep`, `k3_mla_absorb_mma`, the DSL
 `mla_decode_h96_p64` and its grid), the DCP exchange (`k3_dcp`).
 Previous lane notes: `notes/d-attn.md` (round 1, every idea tried there).
 
+## Status (03:40 UTC)
+
+Merged as d85613c. The orchestrator's 02:52 task 1 (a new MLA kernel) is
+answered by measurement in "MLA attention: what a new kernel could win":
+the 96 → 128 head padding costs nothing at the bench's cluster counts (the
+DSL is HBM-bound there, its MMAs 66% busy), positions-as-M does not fit
+shared memory, and a no-math kernel with the DSL's grid already takes
+16.0 / 39.2 / 53.5 / 133 µs of the DSL's 21.9 / 46.7 / 65.0 / 160.9 at the
+bench shapes. What a new kernel could take is the difference: 6-28 µs a
+call, 0.8-2.4% of a 16-layer step, by streaming at the full HBM rate under its math.
+That is a DSL-class kernel (2-CTA, TMEM, a sub-tile KV pipeline), not
+started.
+
 ## Status (02:57 UTC): lane closed
 
 Branch vs main 95bc0b0: D 3.414 → 3.386 ms/step (-0.84%), bit-identical
@@ -323,6 +336,60 @@ A member's view: 96 heads (every head, a DCP member's positions), latent 512
   clusters left idle (72 of 76 at 24-36 rows, uniform splits). A kernel
   that merged its splits on chip (a persistent cluster per row group, bf16
   or in-cluster partials) and fed every cluster would target those first.
+
+## MLA attention: what a new kernel could win (orchestrator 02:52 task 1, cont.)
+
+**tcgen05 rates by shape** (`harness/attn/mma_rate.cu`, bf16 → f32, operands in
+smem, 152 SMs, flop/clk/SM): one CTA M=64: 4096 at N=96/128/256 (half rate);
+M=128: 7020 at N=96, 8190 at N=128/256; a CTA pair M=128 (64 rows an SM):
+6776 / 8188 / 8190; pair M=256: 7968 / 8190 / 8190. Peak 8190 = 2.41 PF.
+So heads-as-M pads 96 heads to 128 rows (64 an SM is the smallest full-rate
+unit); a positions-as-M tile at full rate needs 128 positions an SM (147 KB
+of KV a stage, or 64 an SM in a pair at M=128, which works for QK^T but not
+for PV: a pair's PV over its 128 positions needs each CTA to hold V for
+the other's 64 positions too, 106 KB a stage a CTA), next to the 55-110 KB
+of q it must keep as the B operand. Neither double-buffers in 227 KB.
+(A cta_group::1 PV beside a cta_group::2 QK^T: ptxas rejects a kernel that
+uses both granularities.)
+
+**Padding is not what costs at the bench shapes**: the DSL's 1.70 µs a
+128-position tile a pair is 89% of the pair's HBM share (1.53 µs at 7.33 TB/s
+over 76 pairs, 6.2 TB/s measured at 72 clusters), while its 128-row MMAs
+(QK^T 576 + PV 512 deep) take 1.13 µs at the measured peak: 66% busy. The
+padding only shows where few clusters run (1-8 rows at short contexts).
+
+**The item chain** (`harness/attn/mla_chain.cu`): a kernel with the DSL's
+grid, cluster and shared memory (one CTA an SM) that does everything but the
+math: page-table entry, the row's q half from L2, the item's KV pages by bulk
+copy (two 73.7 KB pages in flight a CTA), a 96 × 512 f32 partial and lse
+stored. Its time is the floor of any non-persistent kernel with these items.
+µs a call, one GPU, KV cold:
+
+| rows × positions a member | items × tiles | no-math kernel | DSL (step) | floor |
+|---|---|---|---|---|
+| 1 × 1k | 8 × 1 | 4.22 | 8.58 | 0.42 |
+| 8 × 1k | 64 × 1 | 6.22 | 10.60 | 2.48 |
+| 32 × 1k | 64 × 4 | 10.15 | 27.29 (16 slots) | 7.36 |
+| 64 × 1k | 64 × 8 | 16.38 | 50.07 (16 slots) | 12.99 |
+| 32 × 4k | 64 × 16 | 28.11 | 43.79 | 22.80 |
+| 8 × 8k (bench) | 64 × 8 | 16.01 | 21.9 | 10.3 |
+| 24 × 8k (bench) | 72 × 22 | 39.16 | 46.7 | 31 |
+| 36 × 8k (bench) | 72 × 32 | 53.51 | 65.0 | 46 |
+| 48 × 16k (bench) | 144 × 43 | 133.02 | 160.9 | 123 |
+
+A lone item's chain is 4.2 µs (launch, table, q + first page, 98 KB out a
+CTA); the DSL's one-tile item is 8.6 (its math, TMEM, softmax and epilogue
+on top). At the bench shapes the no-math kernel is 1.08-1.55x the floor,
+the DSL 1.21-1.37x the no-math kernel. The difference (5.9 / 7.5 / 11.5 /
+27.9 µs a call; 24 / 30 / 46 / 112 µs a 16-layer step, 0.8-2.4% of it) is the
+most a kernel with the same items could take: the DSL's tile rate below the
+HBM share (~0.17 µs a tile) and its math's fill and drain. Most of the rest
+of the gap to the floor is structural to any split-KV launch: the chain once
+a wave (two waves at 48 rows), 64 of 76 pairs at 8 rows. A persistent kernel
+over the same items would also drop the 16-slot grid's empty clusters
+(the tier experiment's -0.37%) and skew's tail. Not started: it is the
+DSL's own design (2-CTA heads-as-M, KV streamed by 64-dim chunks under the
+math, TMEM O, bf16 P) to write and tune from PTX, more than this session.
 
 - **kda_core S at 3 blocks an SM, ablated** (36 rows, one GPU): 11.81 µs;
   without the state stores 10.51; without the smem state reads 11.65. Even
