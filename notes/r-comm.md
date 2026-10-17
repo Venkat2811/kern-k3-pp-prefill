@@ -6,27 +6,34 @@ path is this run's, `k3_ar_fused.cu` included.
 
 ## State
 
-Main moved to `21a9174` at 03:23 (r-ar merged, 3.373 -> 3.289 ms/step). r-ar's `k3_ar_fused.cu` took
-the same protocol ideas this run had on `k3_xchg.cuh` (per-block stage state, pushes from every
-block, owner sums gathered by the other rows' blocks, no grid count) plus its own row math, and is
-faster in the harness (attention all-reduce 9.3 vs 10.4 us at 1 row), so this branch dropped its
-`k3_ar_fused.cu` commits (`51538be`, `f12cd81`; on the local branch `r-comm-pre-rebase`) and keeps:
+Main is `fd5c92c` (04:27: r-ar + r-gemm, 3.239 ms/step in the orchestrator's lease). This branch is
+rebased onto it and carries:
 
-| commit | what | D 16 layers, weighted (A/B in one lease, twice) |
+| commit | what | D 16 layers, weighted (A/B against its parent in one lease, twice) |
 |---|---|---|
-| `28fbe84` | dcp: one wait a merge, reduce-scatter v-up, 16 splits' lse at once | main 3.295 / 3.296 -> 3.294 / 3.293 ms |
-| `fd8a04b` | head: the row's key after a gpu-scope fence | 3.287 / 3.289 -> 3.288 / 3.290 ms (one call a step) |
-| `08b98c2` | the MoE all-reduce two-shot from 12 rows (was 20) | 3.291 / 3.288 -> 3.283 / 3.284 ms |
-| `fb64092` | the attention all-reduce two-shot from 12 rows too | 3.281 / 3.282 -> 3.280 / 3.278 ms |
-| `afa866a` | deadlines in SM cycles (all-reduces, head), as k3_dcp's | 3.291 / 3.290 -> 3.293 / 3.293 ms (noise) |
-| `23bf79b` | the two-shot MoE all-reduce's row block waits after its gather and its shared half | 3.286 / 3.284 -> 3.283 / 3.284 ms (36 rows -15 us) |
+| `7560058` | dcp: one wait a merge, reduce-scatter v-up, 16 splits' lse at once | 3.295 / 3.296 -> 3.294 / 3.293 ms on `21a9174` |
+| `5307a10` | head: the row's key after a gpu-scope fence (-0.6 to -3.9 us a call) | 3.287 / 3.289 -> 3.288 / 3.290 ms (one call a step) |
+| `c934878` | the two-shot MoE all-reduce's row block waits after its gather and its shared half | 3.245 / 3.244 -> 3.241 / 3.240 ms on `fd5c92c` (36 rows -13..-19 us) |
+| `eb1f5ab` | deadlines in SM cycles (all-reduces, head), as k3_dcp's | 3.241 / 3.240 -> 3.243 / 3.243 ms (noise; a fired deadline traps the step) |
+| `0f5d1fe`, `02a2685` | `harness/xchg/` (the 8-rank harness), `abn.sh` (interleaved A/B) | |
 
-Launches 219 (13.7/layer, main's count). Both bit-identical (`loop/d/check` x3 each).
-`source/k3_xchg.cuh` stays as the harness's protocol (the bare all-reduces in `harness/xchg/`);
-no kernel of the step includes it.
+All bit-identical (`loop/d/check` x3 each; the harness compares main's kernels byte for byte).
 
-Before the rebase (on `95bc0b0`), the header's all-reduces measured 3.411 / 3.414 -> 3.384 / 3.385
-ms/step and the warp-0 softmax a further 3.387 / 3.388 -> 3.384 / 3.382; both were bit-identical.
+History of the all-reduce line, for the orchestrator's question (03:48):
+
+- `k3_xchg.cuh` (per-block stage records, input / record / peers loaded together, pushes spread
+  over the grid, the two-shot gather spread over the grid, the MoE row's shared half summed by the
+  grid, deadlines in cycles, switch at 20 / 12 rows) measured against main `95bc0b0`'s protocol:
+  fused all-reduces 1.0-3.8 us faster a call in the harness (tables below), -0.8% in the step
+  (3.411 / 3.414 -> 3.384 / 3.385). The warp-0 softmax took another -0.1%.
+- r-ar's rewrite (merged at `21a9174`) took the same protocol ideas (per-block stage state, pushes
+  from every block, owner sums gathered by the other rows' blocks, no grid count) and faster row
+  math: its attention all-reduce is 9.3 us at 1 row against the header's 10.4 (4 snapshots). So
+  the rewrite was dropped (`r-comm-pre-rebase` keeps it). What it still won on top of r-ar's: the
+  one/two-shot switch at 12 rows (r-ar has since moved to 14), and the two-shot MoE all-reduce's
+  waits (`c934878`), which the header's grid-wide gather never needed.
+- In the orchestrator's 04:27 lease the branch before this rebase (85048e0) measured 3.280 against
+  main 3.290 (-0.3%).
 
 ## The harness (`harness/xchg/`)
 
@@ -142,6 +149,12 @@ its vector and polls it), main's `kern_peer_allreduce_bf16`, multicast (`kern_xa
   rank-order f32, would change numerics), NCCL symmetric (not callable from the harness).
 
 ## Multicast (proposal: needs the runtime to create the multicast object)
+
+The orchestrator measured SGLang's K3 small-message protocol (`kimi_k3/comm/ar_fusion.cuh`'s
+push / one-shot: one `multimem.st` into slot `rank` of every member, no barrier) on this cluster:
+6.92 us at 8 x 7168 on 8 ranks over 2 trays against 8.06 unicast, 5.6 us on 4 ranks in one tray;
+crossing the trays costs ~0.3 us; barriers with a system-scope fence or release ~4.4 us each,
+relaxed ~2.5.
 
 `kern_xar_mc`: the header with every store all members receive as one `multimem.st` to the stage's
 multicast alias: the one-shot's push, and the two-shot owner's sum into an extra slot (so the
