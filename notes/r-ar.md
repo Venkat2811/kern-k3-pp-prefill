@@ -75,6 +75,10 @@ at nb 1), the closing add ~0.2 (4.4 against 3.1). The production step runs mostl
   it: the same butterfly per value, and a + b = b + a), harness (no PDL) +0.4..+0.8 us at nb 3-8, in the step
   (work/ar/nbx.sh manifests, 8 x 64k) +1.0..+1.5 us a call at nb 3-8 (16 calls 62 -> 75 us): the add launches
   ~1 us before lat_up ends, too short for a cluster reduction. Dropped.
+- The snapshots read (cp.async) and written at L2 evict_last (they are read by both residual rows of every layer,
+  up to 7.3 MB a call at 64 rows x nb 8, with 100+ MB of weights through L2 between): 93-layer step 9.377 /
+  11.878 / 17.179 / 22.738 -> 9.374 / 11.874 / 17.189 / 22.733 ms (1 / 8 / 32 / 64 rows), bench flat. The
+  snapshot reads are not what the per-snapshot cost waits on. Dropped.
 - Under nsys the ranks start a replay up to ~0.3 ms apart, and the early ones wait in the step's first exchange;
   the plain bench's rank 0 p50 matches the latest rank's span under nsys, so the score does not carry it.
 
