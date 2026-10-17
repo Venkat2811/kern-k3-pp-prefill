@@ -418,3 +418,19 @@ would carry [latent | W_up partial | shared] (17920 wide, for the latent's sum o
 closing add (prefix2 + s * y + shared, the next mix and norm) would be its epilogue. But the routed finalize then needs
 its own launch before lat_up (fc2's rows are permuted by expert), so the launches stay at five a MoE layer, the
 message grows 67%, and the GEMM sees bf16 partials instead of the rounded sum (a numerics change). Not worth it.
+
+## Proposals for other runs
+
+- **Every run: keep a launch's code contiguous from its entry.** In the step a kernel's instructions are cold at
+  every call (L2 holds weights between two calls of it). One function holding nine template copies behind a
+  `switch` ran the copies ~110 KB past its entry 5-6 us slower a call than the one right after it, while the
+  same code behind its own entry ran at nb 1's time; in the 93-layer step the split was worth 2-10% of the
+  step (above). Code size past the entry measured nothing (40 -> 30 KB). So: an entry (or a `when` launch) a
+  variant, not a runtime switch over inlined variants. No other D kernel is shaped like that today (largest
+  entries ar_finalize_rms 47 KB, dcp_exchange 38 KB).
+- **r-gemm: lat_up finishing the closing add.** The closing add (92 launches a step, 3.0-4.0 us own at the
+  bench's shapes, 3.1-8.8 us in the 93-layer step) is the add -> score -> mix -> norm of a row whose new part
+  is lat_up's output. A lat_up of ours (split-K 1, one K-ascending chain an output: bit-identical to cuBLAS's
+  nvjet, as r-gemm found for TGV) whose last CTA of a row group (an atomic count over the N tiles) runs the
+  row's epilogue from L2 would drop the launch and its PDL hand-off (~1-1.5 us a call); the epilogue's two
+  row reductions stay. It needs lat_up at cuBLAS's 5.5-6.4 us first.
