@@ -134,6 +134,17 @@ Tried and dropped (A/B in one lease each, ms/step):
   them); our CTAs issuing cp.async.bulk.prefetch.tensor L2 prefetches of their whole slice before
   griddepcontrol.wait: +40 us a step (3.4375).
 - wfu with our GEMM (2 splits, block 56): bit-identical, slower than cuBLAS.
+- one build for 1-32 rows (run-time N, A box of 32 rows; loop/count 14.6 a layer instead of 19.7): 3.4185 vs
+  3.4005 (worse than cuBLAS alone): the buckets' extra ring stages are the whole gain. So the four `when` buckets
+  stay; if loop/count is fixed to its own docstring (a `when`-gated launch counts once) they count as one.
+- front on our GEMM up to 48 rows (BN 40 / 48 at two CTAs an SM, cold -1.3 us alone): 3.4055 vs 3.4030, +10-15 us
+  at 36 rows. qkvg / front from 33 rows stay on cuBLAS.
+- our CTAs' idle warps 2-3 loading the rest of their weight slice before griddepcontrol.wait (real loads): +60 us
+  at 8-24 rows (3.4415 vs 3.4000), with or without the closing add's hints: the loads race the TMA stream for the
+  same bytes.
+- o_proj by a kernel holding its whole 192 KB weight slice in shared memory, requested before
+  griddepcontrol.wait (work/h/k3_gemm_pre.cu, bit-identical 1..64 rows): 8.6 vs 5.2 us alone, 7.1 vs 4.7 after a
+  9 us PDL predecessor: A's 64-row boxes through a 3-deep ring after the wait cost more than the preload saves.
 
 ## Own f32 GEMM (source/k3_gemm_f32.cu)
 
