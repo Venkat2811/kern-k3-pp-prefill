@@ -12,6 +12,12 @@ Previous lane notes: `notes/d-attn.md` (round 1, every idea tried there).
 | MLA split slots 16 → 4 from 16 rows (e33e3a1) | 13.2 | 3.474 |
 | kda_core: loads at entry, state in smem ≤ 25 rows (4f31f73) | 13.9 | 3.453 (vs 3.473 same lease) |
 | absorb: ldmatrix + mma.sync, one wave | 13.9 | 3.443 (vs 3.4485 same lease) |
+| mla_prep fast path at TP8 (41d420d) | 13.9 | 3.436 (vs 3.441) |
+| kda ROWS_PER_ITER 1 / 2 (f8bd7e6), copy issue from 16 threads | 13.9 | 3.431 (vs 3.433) |
+| rebased on main 95bc0b0; slot tiers reverted (skewed batches) | 13.7 | **3.386 vs main 3.414** (-0.84%, same lease, 2 rounds) |
+
+Launches counted 13.7 a layer against main's 12.9: kda_core's second `when`
+launch (S / R builds); one of them runs, so executed launches are unchanged.
 
 ## Where the half stands at the bench's shapes (nsys, rank 0, 16 layers, main)
 
