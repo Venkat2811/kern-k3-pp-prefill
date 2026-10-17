@@ -130,7 +130,7 @@ the 896 experts a rank (`rank, rank + 8, …`).
 | Module | What it is |
 |---|---|
 | `k3_kda_core+HEADS=12+KDA_CONV=1+…` | the KDA step over a rank's 12 heads, the conv fused in |
-| `k3_mla_prep+INNER=1536+MLA_FUSED=3648`, `k3_mla_absorb_mma` | the MLA q side and the absorb on tensor cores, every head over the rank's own positions |
+| `k3_mla_prep+INNER=1536+MLA_FUSED=3648`, `k3_mla_absorb_tc` | the MLA q side and the absorb on tcgen05 (a block a head; `k3_mla_absorb_mma` under `--kv fp8`), every head over the rank's own positions |
 | `k3_dcp` | the DCP exchange around one all-to-all: fixup, pack, and the LSE merge of 8 partials into the rank's 12 heads |
 | `k3_ar_fused`, `peer_allreduce_bf16+NRANKS=8` | the step's all-reduces as a Lamport one-shot over peer memory (`--peer-ar`; NCCL without), with the work on either side fused |
 | `k3_moe_front+EXPERTS=896+…` | everything between the front GEMM and the batched GEMMs: router top-k, the latent in mxfp8, the rank's routing tables, the shared expert's activation |

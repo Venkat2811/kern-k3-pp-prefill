@@ -124,6 +124,7 @@ MLA_SHORT_SPLITS = 16
 # o_bf16, the keys two pieces share fewer than SPLIT_ROWS more of latent_g / kv_exp.
 SPLIT_ROWS, SPLIT_EXTRA = 512, 1024
 MLA_REDUCE_SMEM = 1024    # 256-split reducer scratch
+ABSORB_SMEM = 1024 + 2 * 4 * 64 * 128 * 2 + 2 * 64 * 128 + 128  # k3_mla_absorb_tc.cu SMEM_BYTES
 
 # D's MLA decode attention over SGLang's fp8 cache (--kv fp8): FlashInfer's
 # Cake-generated Kimi-K3 kernel (source/flashinfer-cake-k3-mla), its wide
@@ -589,11 +590,19 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                                                   **({"KV_FP8": 1} if fp8 else {})}) if tp > 1
                                   else launch("k3_mla_prep", "kern_k3_mla_prep")]},
         },
-        # every member absorbs the whole batch's 96 heads, at most `seqs` rows (tensor cores)
+        # every member absorbs the whole batch's 96 heads, at most `seqs` rows: on tcgen05, a block a head, W_UK
+        # by a tensor map (64 columns x 128 rows a box, the 128 B swizzle its MMA reads); the fp8 query keeps
+        # mma.sync's kernel, whose e4m3 casts (software, no saturation) go two at a time
         "mla_absorb": {
             "params": ["in buffer<f32>", "in buffer<bf16>", f"out buffer<{'fp8e4m3' if fp8 else 'bf16'}>", "i32"],
             "impl": {"launches": [launch("k3_mla_absorb_mma", "kern_k3_mla_absorb_mma", grid=[1, HEADS, 4],
-                                         block=[256, 1, 1], defines={"Q_FP8": 1} if fp8 else None)]},
+                                         block=[256, 1, 1], defines={"Q_FP8": 1}) if fp8 else launch(
+                "k3_mla_absorb_tc", "kern_k3_mla_absorb_tc", grid=[HEADS, 1, 1], block=[256, 1, 1], smem=ABSORB_SMEM,
+                params=["bytes<128>", "in buffer<f32>", "out buffer<bf16>", "i32"],
+                args=[{"pack": {"size": 128, "fields": [{"at": 0, "tensormap": {
+                    "param": 1, "dtype": "bf16", "dims": [KV_LORA, HEADS * 256], "strides": [KV_LORA * 2],
+                    "box": [64, NOPE_DIM], "swizzle": 128, "l2_promotion": 128}}]}},
+                      {"param": 0}, {"param": 2}, {"param": 3}])]},
         },
         "mla_vup_gate": {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32"],
