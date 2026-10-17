@@ -3,7 +3,7 @@
 // columns) and the batched GEMMs.
 //
 //   kern_k3_moe_front(const f32* S, const f32* bias, const bf16* rs, i32* idx, f32* wts,
-//       u8* q, u8* sf, bf16* act, i32* done, i32* cta_batch, i32* cta_limit,
+//       u8* q, u8* sf, bf16* act, i32* ready, i32* done, i32* cta_batch, i32* cta_limit,
 //       i32* num_non_exiting, i32* total_padded, i32* route_map, i32* exp2perm, int first, int T)
 //   grid (T, 1, 1)   block (1024, 1, 1)   T <= 64
 //
@@ -14,7 +14,9 @@
 //     (16-30 of them on real routing) are compacted and warp 0 sorts them 32 at a
 //     time into a running top 16 (below);
 //   * meanwhile warps 28..31 run k3_land.cu's land_situ on the shared expert's
-//     gate | up (the SH columns after the latent), and once the candidates are
+//     gate | up (the SH columns after the latent) and publish the row to each CTA c
+//     of the shared expert's down projection (k3_sh_down.cu) running beside this
+//     grid (ready[c * 64 + b] = 1); once the candidates are
 //     in, warps 14..27 land the latent (columns EXPERTS + [0, LATENT)) to bf16
 //     and quantise it to mxfp8 as k3_moe_prefill.cu's kern_k3_moe_quant (four
 //     threads per 32-element group);
@@ -43,6 +45,9 @@
 #define STRIDE 8
 #endif
 #define LATENT 3584
+#ifndef READERS
+#define READERS 112  // k3_sh_down.cu's CTAs: ready[c * 64 + b] is row b's flag for CTA c
+#endif
 #define TOPK 16
 #define TILE 16
 #define LOCAL (EXPERTS / STRIDE)
@@ -195,7 +200,7 @@ static_assert(EXPERTS % 32 == 0 && TOPK <= SORT_WARPS && SORT_WARPS <= 31 && QUA
 extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
     const float* __restrict__ S, const float* __restrict__ bias, const __nv_bfloat16* __restrict__ rs,
     int* __restrict__ idx, float* __restrict__ wts, uint8_t* __restrict__ q, uint8_t* __restrict__ sf,
-    __nv_bfloat16* __restrict__ act, int* __restrict__ done, int* __restrict__ cta_batch,
+    __nv_bfloat16* __restrict__ act, int* __restrict__ ready, int* __restrict__ done, int* __restrict__ cta_batch,
     int* __restrict__ cta_limit, int* __restrict__ num_non_exiting, int* __restrict__ total_padded,
     int* __restrict__ route_map, int* __restrict__ exp2perm, int first, int T) {
   __shared__ float s_sig[EXPERTS];
@@ -251,14 +256,32 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
       quant8(row + EXPERTS, q + (long long)b * LATENT, sf + (long long)b * (LATENT / 32), t - QUANT_WARP0 * 32);
     }
   } else {
-    for (int k = t - SORT_WARPS * 32; k < SITU_THREADS; k += THREADS - SORT_WARPS * 32) {
-      const float4 g = reinterpret_cast<const float4*>(row + EXPERTS + LATENT)[k];
-      const float4 u = reinterpret_cast<const float4*>(row + EXPERTS + LATENT + SH)[k];
-      __nv_bfloat162 o[2];
-      o[0] = __floats2bfloat162_rn(situ_f(g.x, u.x), situ_f(g.y, u.y));
-      o[1] = __floats2bfloat162_rn(situ_f(g.z, u.z), situ_f(g.w, u.w));
-      reinterpret_cast<uint2*>(act + (long long)b * SH)[k] = *reinterpret_cast<const uint2*>(o);
+    // every pass's gate | up loads in flight before the first is used
+    constexpr int SITU_LANES = THREADS - SORT_WARPS * 32, PASSES = (SITU_THREADS + SITU_LANES - 1) / SITU_LANES;
+    float4 g[PASSES], u[PASSES];
+#pragma unroll
+    for (int p = 0; p < PASSES; ++p) {
+      const int k = t - SORT_WARPS * 32 + p * SITU_LANES;
+      if (k < SITU_THREADS) {
+        g[p] = reinterpret_cast<const float4*>(row + EXPERTS + LATENT)[k];
+        u[p] = reinterpret_cast<const float4*>(row + EXPERTS + LATENT + SH)[k];
+      }
     }
+#pragma unroll
+    for (int p = 0; p < PASSES; ++p) {
+      const int k = t - SORT_WARPS * 32 + p * SITU_LANES;
+      if (k < SITU_THREADS) {
+        __nv_bfloat162 o[2];
+        o[0] = __floats2bfloat162_rn(situ_f(g[p].x, u[p].x), situ_f(g[p].y, u[p].y));
+        o[1] = __floats2bfloat162_rn(situ_f(g[p].z, u[p].z), situ_f(g[p].w, u[p].w));
+        reinterpret_cast<uint2*>(act + (long long)b * SH)[k] = *reinterpret_cast<const uint2*>(o);
+      }
+    }
+    // the row's activation published to k3_sh_down.cu, which runs beside this grid (release: cumulative
+    // over the SiTU warps' stores, ordered before it by the barrier)
+    asm volatile("bar.sync 3, %0;" ::"n"(THREADS - SORT_WARPS * 32));
+    for (int c = t - SORT_WARPS * 32; c < READERS; c += THREADS - SORT_WARPS * 32)  // a flag per reader CTA
+      asm volatile("st.release.gpu.global.b32 [%0], %1;" ::"l"(ready + c * 64 + b), "r"(1) : "memory");
   }
 
   __syncthreads();
