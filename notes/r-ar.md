@@ -10,7 +10,7 @@ Rebased onto main 95bc0b0 (r-gemm's L2 loads in the exchanges, 3.411-3.416 ms/st
 commits on it were flat (3.418-3.420: 8-24 rows faster, 36/48 rows +20 us, the spread push delaying the idle
 blocks' weight loads); with the spread only below 33 rows, 3.404-3.405 (-0.2%).
 
-## Where it stands (06:15 UTC, rebased on main 8319034)
+## Where it stands (06:00 UTC, rebased on main 8319034)
 
 **Offer: the branch at its head.** Four kernel commits on main 8319034 (d461d78 per-count entries, 8bff953 +
 3d53bbb `early`, daeddf9 the softmax division), one lease, 3 interleaved rounds: main 3.225 / 3.228 / 3.229 ->
@@ -18,6 +18,20 @@ blocks' weight loads); with the spread only below 33 rows, 3.404-3.405 (-0.2%).
 loop/d/check x3 PASS bit-identical; the 16-layer manifest teacher-forced over ids-r4 against main's: logits and
 every rank's tokens byte-identical. 12.9 launches a layer run (loop/count's 20.4 counts other runs' `when`
 buckets). P manifests byte-identical to main's.
+
+**In the 93-layer step** (`gen_stage.py --layers 93 --tp 8` as loop/gen's D flags, k3_step --bench at the
+roofline's A/B points, ctx 8192; work/ar/ab93.sh, one lease, 2 interleaved rounds, rank 0 p50, ms/step):
+
+| rows x 8k | main 8319034 | branch head | change |
+|---|---:|---:|---:|
+| 1 | 10.364 / 10.380 | 9.376 / 9.401 | -0.98 ms (-9.5%) |
+| 8 | 12.635 / 12.634 | 11.876 / 11.886 | -0.75 ms (-6.0%) |
+| 32 | 17.643 / 17.638 | 17.215 / 17.205 | -0.43 ms (-2.4%) |
+| 64 | 23.248 / 23.241 | 22.843 / 22.777 | -0.43 ms (-1.9%) |
+
+The 16-layer bench runs nb 1-2 only, so it shows -0.5%; the production step runs nb up to 8 in 93 layers,
+where the switch's far copies were cold (see "Cold code"). This is the gap decode.md saw between its 93-layer
+per-call times and the bench's for these kernels.
 
 Before the rebase, on main fd5c92c (3.244-3.247 ms/step, same lease) (hashes there: 6535bd6, ba3b52b, 27a664e,
 ccc5111):
