@@ -9,13 +9,14 @@ Previous lane notes: `notes/d-attn.md` (round 1, every idea tried there).
 Merged as d85613c. The orchestrator's 02:52 task 1 (a new MLA kernel) is
 answered by measurement in "MLA attention: what a new kernel could win":
 the 96 → 128 head padding costs nothing at the bench's cluster counts (the
-DSL is HBM-bound there, its MMAs 66% busy), positions-as-M does not fit
-shared memory, and a no-math kernel with the DSL's grid already takes
+DSL is HBM-bound there, its MMAs 66% busy, so a positions-as-M tiling,
+which fits the DSL's shared-memory budget, would save MMA time that is not
+on the critical path), and a no-math kernel with the DSL's grid already takes
 16.0 / 39.2 / 53.5 / 133 µs of the DSL's 21.9 / 46.7 / 65.0 / 160.9 at the
 bench shapes. What a new kernel could take is the difference: 6-28 µs a
-call, 0.8-2.4% of a 16-layer step, by streaming at the full HBM rate under its math.
-That is a DSL-class kernel (2-CTA, TMEM, a sub-tile KV pipeline), not
-started.
+call, 0.8-2.4% of a 16-layer step, by streaming at the full HBM rate under
+its math. That is a DSL-class kernel (2-CTA, TMEM, a sub-tile KV pipeline),
+not started. kda_core: two more ideas measured and dropped (below).
 
 ## Status (02:57 UTC): lane closed
 
@@ -344,13 +345,18 @@ smem, 152 SMs, flop/clk/SM): one CTA M=64: 4096 at N=96/128/256 (half rate);
 M=128: 7020 at N=96, 8190 at N=128/256; a CTA pair M=128 (64 rows an SM):
 6776 / 8188 / 8190; pair M=256: 7968 / 8190 / 8190. Peak 8190 = 2.41 PF.
 So heads-as-M pads 96 heads to 128 rows (64 an SM is the smallest full-rate
-unit); a positions-as-M tile at full rate needs 128 positions an SM (147 KB
-of KV a stage, or 64 an SM in a pair at M=128, which works for QK^T but not
-for PV: a pair's PV over its 128 positions needs each CTA to hold V for
-the other's 64 positions too, 106 KB a stage a CTA), next to the 55-110 KB
-of q it must keep as the B operand. Neither double-buffers in 227 KB.
-(A cta_group::1 PV beside a cta_group::2 QK^T: ptxas rejects a kernel that
-uses both granularities.)
+unit, as in the DSL). Positions-as-M avoids the padding in a pair: QK^T at
+pair M=128 (64 positions a CTA, q split 48 heads a CTA as the B operand,
+55 KB; 6776 flop/clk at N=96), PV at pair M=256 over the latent dims (P^T
+split 48 heads a CTA, exchanged by DSMEM; each CTA also needs V of the other
+CTA's 64 positions for its dims, 32 KB a tile), S^T 96 + O^T 192 TMEM
+columns. A tile is then 106 KB of KV a CTA beside 55 KB of q, 12 KB of P:
+the same 1.3-1.5 tiles of 8 KB chunks the DSL streams with its 74 KB of q,
+not a double buffer. It fits; what it saves is MMA time, ~10% (96 rows at
+83% rate against 128 at 100%), and MMA is not what limits at the bench
+shapes (below). Its cost is a cross-lane softmax (max and sum per head over
+TMEM lanes) and the P exchange. (A cta_group::1 PV beside a cta_group::2
+QK^T is not an option: ptxas rejects a kernel that uses both granularities.)
 
 **Padding is not what costs at the bench shapes**: the DSL's 1.70 µs a
 128-position tile a pair is 89% of the pair's HBM share (1.53 µs at 7.33 TB/s
@@ -400,3 +406,27 @@ math, TMEM O, bf16 P) to write and tune from PTX, more than this session.
   under this one's stream; overlapping inside one item needs its state on
   chip during the prologue (register file full at 4 an SM; smem staging
   measured slower at 2 and 3).
+
+## kda_core, tried after the merge (one GPU, harness/attn kda, state cold)
+
+- **R build: one-thread bulk L2 prefetch of the head's state at entry**
+  (`cp.async.bulk.prefetch.L2.global` of the 64 KB slice as soon as the line
+  index is in: no registers, 111 as before), µs at 26 / 36 / 48 / 64 rows:
+  9.94 / 10.96 / 12.99 / 18.79 → 9.76 / 11.01 / 13.30 / 18.37. The state's
+  37.7 MB (48 rows) stream ahead of the prologue's own window and partial
+  loads, which then wait behind them: the critical path moves, it does not
+  shrink. Round 1's per-thread version said the same. Dropped.
+- **S build: one mbarrier per 8 KB (2-8 barriers), each delta-rule pass
+  waiting for its own 16 dv rows only**: slower at every row count (1 row
+  5.09 → 5.76-6.27, 24 rows 8.50 → 8.93-9.28). Waiting for all of them
+  before the loop is as slow, and pinning the line-index load first
+  (`asm volatile` load) does not recover it: the extra barriers move ptxas's
+  schedule (main's build issues `line_index[b]` as its first load; with a
+  barrier array it sank below the barrier setup). Per-pass waits against
+  wait-all differ by ≤ 0.13 µs: the 16 pieces land together, so there is no
+  arrival to follow. Dropped.
+- Paired f32x2 math (FFMA2 / FMUL2, bit-identical where the pairs are
+  independent: dec scaling, the update, the f_b products and tree levels)
+  would remove ~10% of the R build's ~1200 instructions a thread; the m / aq
+  chains are sequential sums and do not pair without reordering them. At
+  48 rows that is worth ≲ 0.3 µs a call: not attempted.
