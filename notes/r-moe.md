@@ -13,13 +13,16 @@ them in the TP8 / EP8 / DCP8 decode step. Main at the start: 3.486 ms/step weigh
   up to 24 rows: two warps x 32 rows; eight warps x 16 rows above, bit-identical), `3677977` (sh_down
   from 25 rows: four warps x 16 rows x every tile), `939a424` (sh_down merged into moe_front's grid,
   moe_front a programmatic dependent of the front GEMM: one launch less a MoE layer, bit-identical),
-  `028c43a` (above 24 rows the shared-expert blocks multiply on tcgen05 into TMEM, bit-identical).
+  `028c43a` (above 24 rows the shared-expert blocks multiply on tcgen05 into TMEM, bit-identical),
+  `d9bced7`, `ba58d40`, `32da87d`, `3c2c64a` (FC1's two lowest touched experts prefetched into L2 while
+  moe_front runs, below; bit-identical).
   moe_front 6.5-6.6 -> 5.5-5.6 us a call in the step at 8-64 rows (before sh_down moved beside it).
   D 16 layers weighted, against the commit before each in one lease: 3.4857 -> 3.4733 (moe_front
   top-k), 3.4690 -> 3.4665 (tau), 3.4710 -> 3.4540 (sh_down), 3.4497 -> 3.4403 (sh_down layout).
   HEAD (fd69491) against main in one lease, 3 rounds each: 3.4873 -> 3.4467 ms/step (-1.16%);
-  then 3.4413 -> 3.4393 (3677977), 3.4460 -> 3.4380 (939a424) and 3.4340 -> 3.4317 (028c43a): about
-  -1.5% against main.
+  then 3.4413 -> 3.4393 (3677977), 3.4460 -> 3.4380 (939a424), 3.4340 -> 3.4317 (028c43a) and the
+  prefetch steps 3.4353 -> 3.4323, 3.4270 -> 3.4220, 3.4257 -> 3.4197, 3.4220 -> 3.4170: about -2.0%
+  against main.
   Launches 207 -> 192 a step, 12.9 -> 12.0 a layer (939a424).
 - FC1 / FC2: no variant, bucket or grid change beats main's pair (below); the remaining gap is the
   cubins' one CTA per SM (wave quantization, ~46 GB/s a CTA) and FC1's wait at entry.
@@ -265,6 +268,27 @@ Before that, as a dependent of FC2:
   cuBLAS, the rest one bf16 ulp either way, same max / mean error vs fp64. mma.sync's latency on
   sm_103 (~140 ns a dependent mma) bounds it: it needs 8-16 independent accumulator chains a warp.
   In the step (three builds by `when`): 3.485 -> 3.482 ms, noise. Not committed.
+
+## FC1's first experts prefetched during moe_front
+
+HBM idles during moe_front once the shared weights have landed (~2.5 us), and FC1's first instruction waits
+for moe_front's grid. FC1 launches expert-major (grid 48 panels x CTA rows, x fastest), so its first wave
+reads the touched local experts of the lowest indices. Committed in four steps, each bit-identical and
+measured against its predecessor in one lease (3 rounds):
+- `d9bced7`: every row's SiTU warps also publish the row's ids to each shared-expert block (`sh_ids`,
+  after a named barrier with the picking warp); warp 31 of each shared-expert block, after the block's
+  activations land, takes the lowest touched local expert and prefetches its 1/112 share of that
+  expert's FC1 weights and scales (`cp.async.bulk.prefetch.L2`, 98 KB + 6 KB). -0.1% (three leases).
+  moe_front then ends 1-2 us later (a grid retires once its prefetches land), FC1 needs 1.4-1.8 us less.
+- `ba58d40`: warp 31 leaves the projection at entry (the other warps sync on a named barrier of 992) and
+  prefetches as soon as the ids are in: -0.15%.
+- `32da87d`: each row sends its lowest local pick as the flag value (relaxed), so the prefetcher reads no
+  ids from L2 and the SiTU warps no longer release: -0.18%.
+- `3c2c64a`: the two lowest (two picks a row in the flag): -0.15%.
+Tried, worse: half or a quarter of one expert (the flag machinery costs more than the bytes it saves),
+three or four experts (3.4113 two -> 3.4187 / 3.4197), the touched set as a 128-bit mask (slower to
+build than a min-reduction, so the prefetch starts later).
+Together 3.4317 (028c43a) -> ~3.411-3.417 ms/step depending on the lease.
 
 ## Proposals
 
