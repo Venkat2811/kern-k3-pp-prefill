@@ -4,6 +4,14 @@ Kernels: `k3_kda_core`, MLA (`k3_mla_prep`, `k3_mla_absorb_tc` (`_mma` under `--
 `mla_decode_h96_p64` and its grid), the DCP exchange (`k3_dcp`).
 Previous lane notes: `notes/d-attn.md` (round 1, every idea tried there).
 
+## Status (05:35 UTC): the MLA kernel exists, correct, 1.25-1.4x the DSL
+
+`source/k3_mla_decode.cu` (kern_k3_mla_decode, the DSL split kernel's contract: acc_o / acc_lse, its grid,
+`mla_bsk` splits) is written and checked against an f32 reference at every A/B and bench shape
+(`harness/attn/mla_decode.cu`; o relRMS 0.9-1.5e-3 = the bf16 P, lse within 1e-5). Not in kernels.toml or any
+manifest yet: it is slower than the DSL everywhere (table in "MLA decode kernel" below). What bounds it and
+what was measured on the way is there.
+
 ## Status (04:15 UTC)
 
 Branch rebased on main 21a9174 (r-ar merged): check PASS bit-identical, D
@@ -575,3 +583,61 @@ math, TMEM O, bf16 P) to write and tune from PTX, more than this session.
   normalized, acc_lse in log2 units, S = ceil(t / ceil(t / bsk)) splits a
   row) or k3_dcp's CAKE build's (bf16 parts, max and sum, uniform splits:
   half the partial bytes).
+
+## MLA decode kernel (`source/k3_mla_decode.cu`, this session)
+
+A CTA pair a (row, split), heads as M (CTA c: heads 64c .. +64, CTA 1's last 32 the q map's zero fill), the
+DSL's grid and output contract so that it drops into `mla_attn_op` and k3_dcp unchanged. Per 128-position tile:
+S = Q K^T (pair M 128 x N 128, each CTA its own page as B) into two TMEM buffers, softmax by 4 warps (warps w
+and w ^ 2 share a head row: positions 0-63 / 64-127, max exchanged by a 64-thread named barrier), P bf16 in
+smem, O += P V (pair M 128 x N 256, B = 128 latent dims of both pages a CTA, MN-major), m raised lazily
+(O rescaled in TMEM only when a tile's max passes m + 8). 7 warps: 4 softmax, K loader, MMA (CTA 0), V loader.
+Harness: `harness/attn/mla_decode.cu` (f32 reference per split, 2.4 GB pool, KV cold, CUDA graph of 20).
+`-DMLA_PROF`: per-wait cycle counts of the first cluster; `-DMLA_DEBUG`: a hang watchdog naming the barrier.
+
+µs a call, one GPU (DSL: in the step, nsys; floors from roofline/decode.md):
+
+| rows x positions a member (splits) | 1x1k (8) | 8x1k (8) | 32x1k (2) | 64x1k (1) | 32x4k (2) | 8x8k (8) | 24x8k (3) | 36x8k (2) | 48x16k (3) |
+|---|---|---|---|---|---|---|---|---|---|
+| DSL (16 slots) | 8.6 | 10.6 | 27.3 | 50.1 | 43.8 | 21.9 | 46.7 | 65.0 | 160.9 |
+| no-math chain (harness/attn/mla_chain.cu) | 4.2 | 6.2 | 10.2 | 16.4 | 28.1 | 16.0 | 39.2 | 53.5 | 133.0 |
+| v1 page ring, release.cluster arrives | 12.8 | 14.5 | 24.4 | 40.2 | 56.6 | 33.7 | 72.8 | 99.3 | 249.1 |
+| v2 one 8 KB ring (K then V from L2), P V N 128 | 13.1 | 15.0 | 25.6 | 42.5 | 61.5 | 36.3 | 79.7 | 109.5 | 276.5 |
+| v2, arrives at .release.cta | 12.5 | 14.1 | 24.2 | 40.3 | 56.9 | 33.6 | 73.6 | 102.0 | 262.1 |
+| v3 page ring, own V reused, P V N 256 | 12.0 | 13.5 | 23.0 | 37.2 | 47.8 | 29.8 | 61.8 | 83.4 | 209.2 |
+| **v4 K box ring + V pair ring (L2), P V N 256** | 11.9 | 13.6 | 22.5 | 36.3 | 45.6 | 28.1 | 58.0 | 79.2 | 200.8 |
+
+(floors 0.42 / 2.48 / 7.36 / 12.99 / 22.8 / 10.3 / 31 / 46 / 123). Run-to-run noise is ~±4%.
+
+What each step found:
+- **`mbarrier.arrive.release.cluster` costs ~0.7-1 µs** while TMA loads are in flight (it orders the SM's
+  outstanding memory traffic): two of them a tile (S empty, P full, to CTA 0's barriers) were 1.9 µs of a
+  3.1 µs tile. `.release.cta.shared::cluster` on the remote barrier (Cake does the same; the P stores are
+  fenced to the async proxy before it) costs nothing: the S load went 0.73 → 0.04 µs a tile.
+- **Shared memory bandwidth bounds the tile** once the waits are gone. The SS MMAs alone at pair M 128 x
+  N 128 read 4 KB per 32 clocks a CTA = 128 B/clk, the SM's shared memory rate (`work/mma/rate2.cu`: K- and
+  MN-major B, a commit every 4 MMAs, all 8188 flop/clk/SM alone). v4 moves 392 KB a tile a CTA (TMA 72 K +
+  64 V, Q K^T reads 144, P V reads 96, P 16): its MMA warp issues for 1.6 µs a tile (`-DMLA_PROF`, 36 x 8k),
+  126 B/clk. v3 moves 360 KB (V from the own page, only the other page's half from L2) and issues at 1.16 µs,
+  but holds a tile's 4 pair slots until its P V, so with two tiles of ring the next tile's K is requested only
+  when P V(i) frees them: 0.9 µs a tile waiting for K. The DSL's 1.70 µs a tile is this same bound.
+- L2 prefetch of the own page 1-4 tiles ahead (bulk `cp.async.bulk.prefetch.L2`, tensor prefetch by box, or
+  `prefetch.global.L2` over the loader warp's lanes) is slower at every distance; ncu: DRAM bytes and the L2
+  hit rate unchanged (the bulk forms queue in the TMA unit ahead of the ring's loads).
+- Separate K and V rings (9 / 8 or 11 / 6 boxes) vs one: same in v2. Page ids a warp-load per 32 tiles instead
+  of one dependent load a tile: same.
+- **TMEM as the A operand of a pair MMA (M 128)** (`harness/attn/tmem_a_layout.cu`): D lane L reads A from
+  lane L, the whole K16 step in that lane's 8 columns; lanes 0-63 feed N 0 .. N/2, lanes 64-127 N/2 .. N, and
+  they may hold different rows. The softmax's P is in exactly S's layout (lanes 0-63 positions 0-63, 64-127
+  the rest), so P in place would feed each N half only its own page's positions: right only if both halves
+  accumulate all 512 dims as partials (O 512 TMEM columns: no room for S), otherwise P must be exchanged
+  between lane halves (smem again; tcgen05.cp from smem with the warpx2 replication saves only the A
+  re-reads, ~16 KB a tile).
+
+Where next (the bound is shared memory bytes a tile, ~128 B/clk):
+1. Q K^T at N 256 (256-position tiles, each CTA two pages): the Q re-reads halve, -36 KB per 128 positions;
+   TMEM is then exactly full (S 2 x 128 + O 256). Splits stay in 128-position tiles (a last half tile masked).
+2. P from smem by tcgen05.cp into both lane halves, then P V with A in TMEM: -16 KB.
+3. v3's own-page V reuse with a deeper K stream (the 0.9 µs wait): needs ring space beyond two tiles.
+4. A persistent grid over the (row, split) items (the DSL's empty 16-slot clusters, skew's tail): the item
+   loop around this kernel's pipeline, O and Q reloaded per item.
