@@ -4,18 +4,18 @@ Target: `qkvg`, `front`, `wfu`, `q_b`, `lm_head` (f32 out, `cublas_bf16_tn_f32`)
 `lat_up`, `wgu`, `w_dn` (bf16 out, `cublaslt_bf16_tn`). Check `loop/d/check loop/out/d-l4-tp8.json`, bench
 `loop/d/bench loop/out/d-l16-tp8.json`. Main 01d6dc5: 12.9 launches/layer, 3.488 ms/step (base-r3).
 
-## State (rebased on main d85613c)
+## State (rebased on main 21a9174)
 
 Merged on main (95bc0b0): the closing add's hints, the all-reduces' loads, the o_proj evict_last pin (3.488 ->
-3.405). Offered on this branch, each bit-identical (loop/d/check PASS), against main d85613c in one lease:
-- dbedd6a: our own split-K GEMM for qkvg / front at 1-32 rows: 3.3873 -> 3.3690 ms/step (-0.54%, 3 rounds); 8 /
-  16 / 24 rows -12..-33 us a step, 36 / 48 within +-5.
-- 2603ca7: D's bf16 projections over the rows rounded up to 8: the bench even, 1 row -1.3%, 4 rows -0.3%.
-- 499159d: our front GEMM pins sh_down in L2 for after the MoE: 3.3653 -> 3.3617 (-0.11%, 3 rounds).
+3.405). Offered on this branch (71464fe own split-K GEMM for qkvg / front at 1-32 rows; c8d2d9f bf16 projections
+over the rows rounded up to 8; 205a325 front GEMM pins sh_down in L2), all bit-identical (loop/d/check PASS):
+**against main 21a9174, same lease, 3 rounds each: 3.2903 -> 3.2590 ms/step (-0.95%)**; 8 / 16 / 24 rows -30..-55
+us a step, 36 / 48 even. Earlier, against main d85613c: own GEMM -0.54%, sh_down pin -0.11%, row rounding even
+on the bench and -1.3% at 1 row.
 Launches run per step: main's minus one per qkvg / front call at 1-32 rows (cuBLAS's splitKreduce_kernel gone);
 loop/count reads 20.4 a layer against main's 13.7 (it counts the four `when` buckets of gemm_t6400 / gemm_t6016,
-of which one runs; a single bucket loses the whole gain, see below; three buckets (16 / 24 / 32) would cost ~1 us
-weighted, the 8-row bucket).
+of which one runs; a single bucket loses the whole gain, see below; three buckets (16 / 24 / 32, loop/count 18.8)
+cost +0.15%, 3.3657 vs 3.3607, the 8-row steps +10-15 us).
 
 ## The table (rank 0, nsys critical path, us a call, main d85613c -> this branch 499159d, ratio to decode.md's HBM floor)
 
