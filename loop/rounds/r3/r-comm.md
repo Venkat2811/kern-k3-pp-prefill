@@ -2,7 +2,7 @@ Run `r-comm` · **target: D's exchanges themselves at their floor: the 8-rank La
 
 Read [`loop/rounds/r3/ROOF.md`](ROOF.md) first: done-means, references, numerics, GPUs. Use the `KernelWiki` skill (Blackwell kernel techniques and PRs: search it for all-reduce, Lamport, NVLink, multicast, MNNVL) and `ncu-report-skill` before and while you design.
 
-This run is a second, independent line on communication beside `r-ar`. `r-ar` owns the fused kernels' row math (residual, attention residual, norms) in `source/k3_ar_fused.cu`; you own how bytes move between ranks. Do not edit `k3_ar_fused.cu`'s row routines; put the protocol in a header of its own (e.g. `source/k3_xchg.cuh`), prove it in your harness and in the step, and write in your notes what `r-ar` (or the orchestrator) has to change to adopt it. `k3_dcp` and `k3_head` are yours outright (`r-attn` no longer works on `k3_dcp`).
+This run is a second, independent line on D's communication, beside `r-ar`, on purpose: do not coordinate with it, do not read its branch. The whole exchange path is yours, `source/k3_ar_fused.cu` included (protocol, row math, thresholds, prefetch), plus `k3_dcp` and `k3_head`. The orchestrator measures both runs' results and merges the faster one.
 
 Where they stand (`roofline/decode.md`): two exchanges a layer, 186 a step, the empty 8-rank one-shot 3.90 µs (2 trays), one-shot all-reduce 6.0 µs at 1 × 7168, 7.3 / 10.2 µs at 8 rows (7168 / 10752 wide), 12.0 / 16.0 at 32, 18.4 / 26.2 at 64; `k3_dcp` 12.0-24.7 µs (1.2-2× a same-size one-shot); `k3_head` 11.7-64 µs. The one-way NVLink flag across trays is 2.09 µs, so an exchange's latency floor is about two of those; 3.90 is this protocol's, not the hardware's.
 
