@@ -223,3 +223,9 @@ Round 2's reason for not beating cuBLAS: the main loop. What made it competitive
   placement).
 - per-call phases (hot, 8 rows): ~1.4-2.4 us to the first stage (PDL overlaps it in the step), 6.7 us loop,
   ~1 us epilogue.
+- cuOccupancyMaxActiveBlocksPerMultiprocessor / MaxActiveClusters report 1 CTA an SM (46 clusters of 3) for this
+  kernel at any shared-memory size; per-CTA globaltimer stamps show all 300 of qkvg's CTAs resident at once, so
+  the API does not model it (tcgen05 / TMEM kernels?). Do not size grids by it.
+- CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE = SPREAD (not a kern launch field): no change.
+- graph-timed back-to-back "hot" numbers of the 16-32-row builds (14-16 us vs 10 for the 8-row one) do not show
+  in per-CTA stamps (same 7 us loop, 1 us epilogue): a harness artifact; the step A/B is the judge.
