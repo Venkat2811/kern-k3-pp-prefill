@@ -59,6 +59,12 @@ fc1 85-92 us across ranks).
 | PDL + the idle blocks prefetch the next weight before the wait (all blocks push) | | 3.473 (+1.3%: the spare blocks' pushes wait behind their prefetch issue) | no |
 | pushes from the first 64 blocks only; the blocks with neither row nor push prefetch before the wait | | 3.429 / 3.427 vs 3.432 / 3.429 (flat) | no |
 | pushes from 32 blocks | | crashed at 36 rows: a share past 1024 vectors (now a static_assert) | no |
+| `block_sum` above 8 values: warp w sums value w behind a second barrier (was: all 32 warps re-reduce all N) | land nb 4 / 8: -0.4 / -0.9 us; attn nb 8: -0.2..-0.4; bit-identical | bench unchanged (nb <= 2) | yes |
+| `embed_rms_plan`: the plan's tile counts read once into registers, 32-bit integer math, the gather issued before the plan | 5.3-7.1 -> 4.5-5.2 us, identical outputs and split counts | | yes |
+| land ablation (nb 1, 1 row): full 4.73, no norm reduction 4.46, no score reduction 4.32, neither 3.92, empty kernel 1.32 us | each reduction ~0.3-0.4 us; the rest is the load -> store chain and the kernel's launch | | |
+| GRAM: the mix's sum of squares from the candidates' pairwise dots (snapshot pairs before the wait/poll, the prefix's with the snapshots in its score reduction): one reduction after the wait | alone: nb 1 +0.1, nb 2 +0.4, nb 4 +1.9, nb 8 +7 us (pairwise work, spills); 0.1-0.4% of outputs move 1-2 ulp | at nb <= 2: 3.437 / 3.437 / 3.437 -> 3.435 / 3.434 / 3.434 (-0.09%) | no: not worth a numerics change |
+| land over a cluster of 2 / 4 / 8 blocks (a slice of the row a block, totals over DSMEM, cluster barrier) | 1 row nb 1/2/8: 4.64/5.32/7.74 -> cl2 4.37/4.73/6.23, **cl4 3.96/3.96/5.28**, cl8 3.91/4.05/5.69; 64 rows nb 2: 5.56 -> 5.14 / 4.92 / 5.42; <= 0.03% of outputs move 1-2 ulp | see A/B | |
+| snapshot rows by TMA (`cp.async.bulk` 14 KB a snapshot, warp c's lane 0, one mbarrier) instead of 16-byte cp.async | land nb 2: -0.1..-0.2 us, nb 4-8: flat (9.3 vs 9.0-9.7) | | no: the ~0.5 us a snapshot is not the load |
 
 Step A/B (same lease, ms/step, 2 rounds): main 3.488 / 3.488, cand (all of the above) 3.490 / 3.491,
 PUSH_RUN 1024 3.502 / 3.497, two-shot at 33 3.487 / 3.488. Per shape cand vs main: 8 rows -13..-15 us,

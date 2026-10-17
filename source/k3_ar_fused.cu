@@ -38,9 +38,10 @@
 //   `state` [8 + 2 * KGRID] starts zeroed: [6] the handshake done, [8 + 2b] block b's stage,
 //   [9 + 2b] the vectors it re-poisons next call.
 //
-// The residual rows around them, a row per 1024 threads with the same row routine:
-//   kern_k3_land_add2_attnres_rms   a layer's closing add, then the next layer's mix and norm
-//                                   (dynamic smem KCAND_BYTES; its blocks past B prefetch `pf`)
+// The residual rows around them:
+//   kern_k3_land_add2_attnres_rms   a layer's closing add, then the next layer's mix and norm: a row
+//                                   a cluster of LAND_CL blocks of 1024 / LAND_CL threads, dynamic
+//                                   smem KCAND_BYTES / LAND_CL; the blocks past LAND_CL * B prefetch `pf`
 //   kern_k3_embed_rms(_plan)        the step's embedding gather and its first layer's norm
 //                                   (_plan: and the MLA split plan)
 // Every kernel here triggers its dependents at entry (griddepcontrol.launch_dependents): the
@@ -48,8 +49,10 @@
 // The all-reduces and the closing add may launch as programmatic dependents themselves: they
 // read the kernel before them's output only past griddepcontrol.wait.
 
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+namespace cg = cooperative_groups;
 
 #include "k3_l2_prefetch.cuh"
 
@@ -410,6 +413,44 @@ __device__ __forceinline__ void block_sum(float (&v)[N], float* red, int t) {
   }
 }
 
+// block_sum over a row split into CL slices of SW warps on a cluster of CL blocks (the slices aligned to
+// 32 vectors): each warp's first stage goes into its row-wide warp slot in every block's `red` (the
+// slots past the row from the blocks' spare warps, zero), and behind the cluster barrier every block
+// runs block_sum's second stage over the row's 32 slots: the same sums in the same order as one
+// 1024-thread block.
+template <int N, int CL, int SW, int W>
+__device__ __forceinline__ void cluster_block_sum(float (&v)[N], float* red, int t) {
+  static_assert(CL * (SW + 1) == 32, "a row's 32 warp slots: SW a block, one zero slot a block");
+  constexpr int SH = 5 - log2_of(N);
+  cg::cluster_group cl = cg::this_cluster();
+  const int lane = t & 31, warp = t >> 5, me = cl.block_rank();
+  halve<N, 16>(v, lane);
+  const int slot = warp < SW ? me * SW + warp : CL * SW + me;
+  if (warp <= SW && (lane & ((1 << SH) - 1)) == 0) {
+#pragma unroll
+    for (int q = 0; q < CL; ++q) cl.map_shared_rank(red, q)[(lane >> SH) * RED_LD + slot] = warp < SW ? v[0] : 0.f;
+  }
+  cl.sync();
+  if constexpr (N <= BS_SMALL) {
+#pragma unroll
+    for (int j = 0; j < N; ++j) v[j] = red[j * RED_LD + lane];
+    halve<N, 16>(v, lane);
+    const float mine = v[0];
+#pragma unroll
+    for (int j = 0; j < N; ++j) v[j] = __shfl_sync(0xffffffffu, mine, j << SH);
+  } else {
+    for (int j = warp; j < N; j += W) {
+      float x = red[j * RED_LD + lane];
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) x += __shfl_xor_sync(0xffffffffu, x, o);
+      if (lane == 0) red[j * RED_LD + 32] = x;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < N; ++j) v[j] = red[j * RED_LD + 32];
+  }
+}
+
 // candidate x's sum of squares and dot with sw over this thread's eight
 __device__ __forceinline__ void partial(const V8& x, const float* swv, float& sq, float& dp) {
   sq = 0.f, dp = 0.f;
@@ -631,21 +672,50 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_attnres_rms
 // k3_residual.cu's K1c on bf16 partials then K1a: hidden = bf16(prefix2 + p1 + (two ? p2 : 0))
 // written (and snapshotted into blocks[b, nb] when `snapshot`), then normed = rms(attnres(
 // blocks, hidden, nb), gamma): a layer's closing add fused into the next layer's mix.
+// A row over a cluster of LAND_CL blocks of 1024 / LAND_CL threads, each a slice of LV vectors, its
+// reductions the 1024-thread block's over DSMEM (a row on one SM is bound by its arithmetic and
+// barriers, ~0.4 us a snapshot).
+#define LAND_CL 4
+#define LV (KVEC / LAND_CL)
+#define LT (KTHREADS / LAND_CL)
+
+struct LandSmem {
+  float red[2][32 * RED_LD];
+};
+
 template <int NB>
 __device__ __forceinline__ void land_add2_attnres_rms(const bf16_t* __restrict__ p1, const bf16_t* __restrict__ p2,
                                                       const bf16_t* __restrict__ prefix2, bf16_t* __restrict__ hidden,
                                                       int two, bf16_t* __restrict__ blocks, const float* __restrict__ sw,
                                                       const bf16_t* __restrict__ gamma, bf16_t* __restrict__ normed,
-                                                      int snapshot, uint4* cand, RowSmem& s) {
-  const int b = blockIdx.x, t = threadIdx.x;
-  const size_t off = (size_t)b * KH + t * 8;
-  const RowRegs r = row_prefetch<NB>(blocks + (size_t)b * KNB_MAX * KH, sw, gamma, cand, t);
-  V8 pr, pv;
-  pr.w[0] = 0u, pr.w[1] = 0u, pr.w[2] = 0u, pr.w[3] = 0u;
-  if (t < KVEC) pr = ldv(prefix2 + off);
+                                                      int snapshot, uint4* cand, LandSmem& s) {
+  const int b = blockIdx.x / LAND_CL, t = threadIdx.x, v0 = (blockIdx.x % LAND_CL) * LV;
+  const bool act = t < LV;
+  const size_t off = (size_t)b * KH + (v0 + t) * 8;
+  const bf16_t* blk_row = blocks + (size_t)b * KNB_MAX * KH;
+  float swv[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  V8 g, pr;
+  g.w[0] = g.w[1] = g.w[2] = g.w[3] = 0u;
+  pr = g;
+  if (act) {
+#pragma unroll
+    for (int c = 0; c < NB; ++c) {
+      const unsigned dst = (unsigned)__cvta_generic_to_shared(cand + c * LV + t);
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(blk_row + (size_t)c * KH + (v0 + t) * 8));
+    }
+    if (NB > 0) {
+      const float4* sp4 = (const float4*)(sw + (v0 + t) * 8);
+      const float4 a = sp4[0], c = sp4[1];
+      swv[0] = a.x; swv[1] = a.y; swv[2] = a.z; swv[3] = a.w;
+      swv[4] = c.x; swv[5] = c.y; swv[6] = c.z; swv[7] = c.w;
+    }
+    g = ldv(gamma + (v0 + t) * 8);
+    pr = ldv(prefix2 + off);
+  }
+  asm volatile("cp.async.commit_group;");
   grid_wait();
-  pv = pr;
-  if (t < KVEC) {
+  V8 pv = pr;
+  if (act) {
     const V8 a = ldv(p1 + off);
     V8 c;
     if (two) c = ldv(p2 + off);
@@ -661,20 +731,77 @@ __device__ __forceinline__ void land_add2_attnres_rms(const bf16_t* __restrict__
       pv.w[j] = f2bf(make_float2(x, y));
     }
     stv(hidden + off, pv);
-    if (snapshot && NB < KNB_MAX) stv(blocks + ((size_t)b * KNB_MAX + NB) * KH + t * 8, pv);
+    if (snapshot && NB < KNB_MAX) stv(blocks + ((size_t)b * KNB_MAX + NB) * KH + (v0 + t) * 8, pv);
   }
-  row_finish<NB>(cand, r, pv, normed + (size_t)b * KH, t, s);
+  const auto cand_v = [&](int c) {
+    V8 x;
+    x.w[0] = x.w[1] = x.w[2] = x.w[3] = 0u;
+    if (act) x = asv(cand[c * LV + t]);
+    return x;
+  };
+  V8 mixed = pv;
+  if constexpr (NB > 0) {
+    constexpr int N = pow2_at_least(2 * NB + 2);
+    float v[N];
+#pragma unroll
+    for (int j = 0; j < N; ++j) v[j] = 0.f;
+    asm volatile("cp.async.wait_all;" ::: "memory");
+    if (act) {
+#pragma unroll
+      for (int c = 0; c <= NB; ++c) partial(c < NB ? cand_v(c) : pv, swv, v[2 * c], v[2 * c + 1]);
+    }
+    cluster_block_sum<N, LAND_CL, LV / 32, LT / 32>(v, s.red[0], t);
+    float sc[NB + 1], mx = -3.0e38f, den = 0.f;
+#pragma unroll
+    for (int c = 0; c <= NB; ++c) mx = fmaxf(mx, sc[c] = score_of(v[2 * c], v[2 * c + 1]));
+#pragma unroll
+    for (int c = 0; c <= NB; ++c) den += (sc[c] = __expf(sc[c] - mx));
+    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int c = 0; c <= NB; ++c) {
+      const float p = sc[c] / den;
+      const V8 x = c < NB ? cand_v(c) : pv;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float2 f = bf2f(x.w[j]);
+        acc[2 * j] += p * f.x;
+        acc[2 * j + 1] += p * f.y;
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) mixed.w[j] = f2bf(make_float2(acc[2 * j], acc[2 * j + 1]));
+  }
+  float sq[1] = {0.f};
+  if (act) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 f = bf2f(mixed.w[j]);
+      sq[0] += f.x * f.x; sq[0] += f.y * f.y;
+    }
+  }
+  cluster_block_sum<1, LAND_CL, LV / 32, LT / 32>(sq, s.red[1], t);
+  const float rr = rsqrtf(sq[0] * (1.0f / (float)KH) + KEPS);
+  if (act) {
+    V8 o;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      float2 f = bf2f(mixed.w[j]);
+      f.x *= rr; f.y *= rr;
+      o.w[j] = from_bf162(__hmul2(__float22bfloat162_rn(f), as_bf162(g.w[j])));
+    }
+    stv(normed + off, o);
+  }
 }
 
-extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_land_add2_attnres_rms(
+extern "C" __global__ void __launch_bounds__(LT, 1) kern_k3_land_add2_attnres_rms(
     const bf16_t* __restrict__ p1, const bf16_t* __restrict__ p2, const bf16_t* __restrict__ prefix2,
     bf16_t* __restrict__ hidden, int two, bf16_t* __restrict__ blocks, const float* __restrict__ sw,
     const bf16_t* __restrict__ gamma, bf16_t* __restrict__ normed, int nb, int snapshot, int B,
     const uint8_t* __restrict__ pf, long long pf_bytes) {
   extern __shared__ uint4 cand[];
-  __shared__ RowSmem s;
+  __shared__ LandSmem s;
   asm volatile("griddepcontrol.launch_dependents;");
-  if ((int)blockIdx.x >= B) return l2_prefetch(pf, pf_bytes, B);
+  if ((int)blockIdx.x >= LAND_CL * B) return l2_prefetch(pf, pf_bytes, LAND_CL * B);
 #define LAND(NB) land_add2_attnres_rms<NB>(p1, p2, prefix2, hidden, two, blocks, sw, gamma, normed, snapshot, cand, s)
   NB_DISPATCH(nb, LAND)
 }

@@ -149,6 +149,7 @@ DCP_GRID = 256  # two exchange blocks fit an SM: every block resident with room 
 KDA_STATE_SMEM = HEAD_DIM * HEAD_DIM * 4  # k3_kda_core.cu's KDA_SMEM_STATE build: a head's state slice
 KDA_SMEM_BLOCKS = 2 * 152  # ... and two of its blocks an SM: the batches of one wave of them
 CAND_SMEM = NB_MAX * H * 2  # k3_ar_fused.cu: a row's snapshots prefetched into shared memory
+LAND_CL = 4  # k3_ar_fused.cu: the closing add's row over a cluster of 4 blocks
 PF_PARAMS = ["in buffer<bf16>", "i64"]  # k3_ar_fused.cu: the next GEMM's weight, prefetched into L2
 PF_OPS = {"ar_attnres_rms", "ar_finalize_rms", "land_add2_attnres_rms_snap"}
 PF_MAX = 96 << 20  # of the GB300's 129 MB L2
@@ -444,8 +445,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             "params": ["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32",
                        "inout buffer<bf16>", "in buffer<f32>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32",
                        "i32", *PF_PARAMS],
-            "impl": {"launches": [launch("k3_ar_fused", "kern_k3_land_add2_attnres_rms", grid=[TP_AR_GRID, 1, 1],
-                                         block=[1024, 1, 1], smem=CAND_SMEM, pdl=True)]},
+            "impl": {"launches": [launch("k3_ar_fused", "kern_k3_land_add2_attnres_rms",
+                                         grid=[LAND_CL * TP_AR_GRID, 1, 1], block=[1024 // LAND_CL, 1, 1],
+                                         cluster=[LAND_CL, 1, 1], smem=CAND_SMEM // LAND_CL, pdl=True)]},
         }} if decode else {}),
         # P's closing add on its own, before a snapshot layer.
         **({"land_add2": {
