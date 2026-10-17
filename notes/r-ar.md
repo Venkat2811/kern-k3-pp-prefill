@@ -10,9 +10,17 @@ Rebased onto main 95bc0b0 (r-gemm's L2 loads in the exchanges, 3.411-3.416 ms/st
 commits on it were flat (3.418-3.420: 8-24 rows faster, 36/48 rows +20 us, the spread push delaying the idle
 blocks' weight loads); with the spread only below 33 rows, 3.404-3.405 (-0.2%).
 
-## Where it stands (05:30 UTC, on main fd5c92c)
+## Where it stands (06:15 UTC, rebased on main 8319034)
 
-Two commits on main fd5c92c (3.244-3.247 ms/step, same lease):
+**Offer: the branch at its head.** Four kernel commits on main 8319034 (d461d78 per-count entries, 8bff953 +
+3d53bbb `early`, daeddf9 the softmax division), one lease, 3 interleaved rounds: main 3.225 / 3.228 / 3.229 ->
+3.213 / 3.212 / 3.211 ms/step (-0.5%), every shape faster (8 rows -14..-17 us, 48 rows -9..-17).
+loop/d/check x3 PASS bit-identical; the 16-layer manifest teacher-forced over ids-r4 against main's: logits and
+every rank's tokens byte-identical. 12.9 launches a layer run (loop/count's 20.4 counts other runs' `when`
+buckets). P manifests byte-identical to main's.
+
+Before the rebase, on main fd5c92c (3.244-3.247 ms/step, same lease) (hashes there: 6535bd6, ba3b52b, 27a664e,
+ccc5111):
 - **6535bd6 one kernel entry per snapshot count** (`kern_k3_ar_attnres_rms_nb<N>`,
   `kern_k3_land_add2_attnres_rms_nb<N>`, an op a count from `nb_op`): 3.235-3.236 (-0.3%), every shape faster or
   equal, bit-identical (check x3, and the 16-layer manifest teacher-forced: logits and every rank's tokens
