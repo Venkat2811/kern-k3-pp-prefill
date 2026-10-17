@@ -59,8 +59,10 @@ Attention floor (the rank's latent rows once, 1152 B a position): 10.3 /
   rows 3.042 → 3.103, 36 rows 4.114 → 4.204. The capped long row (4 splits
   where the plan wants 16+) is every MLA layer's tail. The slots would have
   to follow the batch's longest row; no launch expression sees it and the
-  DSL kernel is non-persistent. Back to 16. (A split cap of 32 would help
-  skewed batches further but costs ~0.8% on the uniform bench, round 1.)
+  DSL kernel is non-persistent. Back to 16. A cap of 32 (`--mla-split-max
+  32`, same lease): uniform 3.379 → 3.419 (+1.2%), and slower on the skewed
+  batch too (one 256k row: 16 rows 2.877 → 2.898, 48 rows 4.149 → 4.226):
+  16 is the measured best on both.
 
 - **kda_core** (4f31f73): ablation on one GPU (work/t/kda.cu under nsys,
   `work/t/kda.sh`) showed a call at 8 rows was 9.0 µs of which 7.0 with no
@@ -219,3 +221,12 @@ overlapping its stream (register build), as the done table says.
    none executed. With an expression a single cubin could take both paths
    (branching on %dynamic_smem_size). kern verify rejects any expression in
    `shared_mem` (an untagged-enum mismatch).
+3. **(idea, not a runtime feature) static grids that follow the longest
+   row**: two DSL launches every step, A with 4 slots over every row, B with
+   16 slots over a compacted list of the batch's long rows (at most a few:
+   the plan writes their count, lengths, splits and copied page-table rows;
+   absorb also writes their q into a small q_abs_B; A sees them as empty).
+   The exchange (r-comm's k3_dcp) would read a long row's partials from B's
+   workspace. Costs one more launch a MLA layer and a contract change in
+   k3_dcp; worth it only if real batches' long rows are rare and short rows
+   many.
