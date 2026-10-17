@@ -229,6 +229,20 @@ the flags carry that ordering (noted in the commit and the kernel).
     (`when`) with row blocks 0..7 taking the leftover column tiles after their row: moe_front 11.1 -> 12.4
     us at 48 rows with the weights prefetched at entry (they queue ahead of the row's own loads), 11.4 with
     the prefetch from the SiTU warps after publishing. The second wave is not what costs at 48 rows.
+  - In-step stamps (`work/dbg3.sh`, `work/dbg4.sh`: a u64 buffer dumped per step, %globaltimer from one
+    thread; each stamp also loads the buffer's pointer, so gaps carry ~0.5 us of error), HEAD, us from the
+    first block's entry: rows' SiTU 1.3-1.5, flags stored 2.0-2.8, picks 3.0, hand-off (barrier + the
+    acq_rel atomic) 4.0-4.9, the last block's tables 5.4-6.1; shared-expert blocks see the flags at 3.1-3.3
+    (max 3.8-4.5), data 4.0-4.1, product 5.5-5.8, end 5.8-6.0 (max 6.5-7.3) at 36 rows; at 16 rows the
+    tables (5.6-6.1) and the projection (end max 5.7) finish together; at 48 rows the 8 blocks of the
+    second wave enter at 5.3 and end at 9.7.
+  - The hand-off replaced by per-row id flags (warp 0's st.release after the picks) and block 0 building the
+    tables once it acquires all T: moe_front -0.17 us at 8 rows, +0.14 at 24, -0.57 at 48; 3.4280 -> 3.4263
+    in one lease, noise. Block 0's stamps put its tables 2.6 us after its polls succeed (HEAD's last block:
+    0.2-1.2 after the hand-off), not understood. With row blocks 1..8 taking the 48-row leftover tiles on
+    top (weights prefetched by their SiTU warps): moe_front 9.8 us at 48 rows (HEAD 11.1), but that build
+    measured 3.4350 -> 3.4500 in another lease, +0.02-0.03 ms at 8-24 rows where it should equal the
+    first. Polls without `__nanosleep`: no change (3.4350 -> 3.4345).
 - Tried on `939a424`: the shared-expert blocks land the SiTU rows themselves from the f32 front rows (no
   flags, no `sh_ready`, row blocks without SiTU warps): bit-identical, but 3.4350 -> 3.4757 ms/step
   (+1.2%), the loss growing with rows (+0.05 ms at 24-36, +0.1 at 48): each of the 112 blocks reads T x
