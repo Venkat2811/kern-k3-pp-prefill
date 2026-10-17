@@ -12,8 +12,8 @@
 // (row % NRANKS) only, whose row block sums it as the one-shot does and
 // gathers the sum to the others. The blocks past B load the next GEMM's weight
 // `pf` (`pf_bytes`) into L2 while a row block still waits (k3_l2_prefetch.cuh;
-// state[1] stamps a row's data in, state[3] counts the blocks done, state[7] is
-// the loads' sink); kern_k3_ar_finalize_rms's then the next layer's o_proj
+// state[2 * phase] stamps a row's data in, state[7] is the loads' sink);
+// kern_k3_ar_finalize_rms's then the next layer's o_proj
 // weight `pf2` at evict_last, which the kern_k3_ar_attnres_rms after that
 // o_proj puts back to evict_normal (`dm`).
 //
@@ -280,6 +280,13 @@ __device__ __forceinline__ uint4 lamport_get(const Lamport& l, bool two, int own
       if (q != rank) l.slot[q][i] = v;
   }
   return v;
+}
+
+// The word l2_load_while stops on (the first row block's arrival stamp): one a phase, state[2 * phase]; the
+// call of phase p zeroes phase p + 1's for the call after it, so no grid-wide count clears it at the end.
+__device__ __forceinline__ unsigned* l2_stamp(int* state, const Lamport& l) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) state[2 * ((l.phase + 1) % 3)] = 0;
+  return reinterpret_cast<unsigned*>(state) + 2 * l.phase;
 }
 
 __device__ __forceinline__ void lamport_close(const Lamport& l, int* state, int* err, int fail) {
@@ -631,7 +638,8 @@ __device__ __forceinline__ void ar_attnres_rms(const uint4* __restrict__ x, uint
       lamport_push(l, i, v);
   }
   lamport_clear(l);
-  l2_load_while(pf, pf_bytes, B, (unsigned*)state + 1, AR_GRACE_NS, state + 7);
+  unsigned* const stamp = l2_stamp(state, l);
+  l2_load_while(pf, pf_bytes, B, stamp, AR_GRACE_NS, state + 7);
   l2_demote(dm, dm_bytes, B);
 
   int fail = 0;
@@ -644,7 +652,7 @@ __device__ __forceinline__ void ar_attnres_rms(const uint4* __restrict__ x, uint
       const long long i = (long long)b * KVEC + t;
       const int owner = b % NRANKS;
       const V8 lp = asv(lamport_get(l, two, owner, rank, i, timeout_ns, fail));
-      l2_arrive((unsigned*)state + 1);
+      l2_arrive(stamp);
       if (snapshot) {
         pv = lp;
       } else {
@@ -658,7 +666,6 @@ __device__ __forceinline__ void ar_attnres_rms(const uint4* __restrict__ x, uint
     }
     row_prefix_finish<NB>(cand, r, pv, sc, normed + (size_t)b * KH, t, s);
   }
-  l2_close((unsigned*)state + 1, state + 3);
   lamport_close(l, state, err, fail);
 }
 
@@ -870,8 +877,9 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
       lamport_push(l, i, v);
   }
   lamport_clear(l);
-  l2_load_while(pf, pf_bytes, B, (unsigned*)state + 1, FIN_GRACE_NS, state + 7);
-  l2_load_while<true>(pf2, pf2_bytes, B, (unsigned*)state + 1, FIN_GRACE_NS, state + 7);
+  unsigned* const stamp = l2_stamp(state, l);
+  l2_load_while(pf, pf_bytes, B, stamp, FIN_GRACE_NS, state + 7);
+  l2_load_while<true>(pf2, pf2_bytes, B, stamp, FIN_GRACE_NS, state + 7);
 
   int fail = 0;
   if (b < B) {
@@ -879,7 +887,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
     const int owner = b % NRANKS;
     const auto summed = [&](long long i) { return lamport_get(l, two, owner, rank, i, timeout_ns, fail); };
     if (t < KVEC) shared_sum[(long long)b * KVEC + t] = summed(base + KLATV + t);
-    l2_arrive((unsigned*)state + 1);
+    l2_arrive(stamp);
     // kern_k3_rms at h = KLAT: vector t of the row, its squares serially, a warp
     // butterfly, then the 32 warp slots (zero past the row) by another, in every warp
     uint4 x = make_uint4(0u, 0u, 0u, 0u), g;
@@ -909,7 +917,6 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
       stv(latent_norm + (long long)b * KLAT + t * 8, o);
     }
   }
-  l2_close((unsigned*)state + 1, state + 3);
   lamport_close(l, state, err, fail);
 }
 
