@@ -89,7 +89,10 @@ int main(int argc, char** argv) {
     CK(cuStreamBeginCapture(st, CU_STREAM_CAPTURE_MODE_GLOBAL));
     for (int i = 0; i < reps; ++i) {
       if (!warm) { void* fa[] = {&d_flush, &fn, &d_sink}; CK(cuLaunchKernel(ff, 152 * 4, 1, 1, 512, 1, 1, 0, st, fa, 0));
-        long long pn = (long long)B * LDS / 4; void* pa[] = {&d_part, &pn, &d_sink}; CK(cuLaunchKernel(ff, 152, 1, 1, 512, 1, 1, 0, st, pa, 0)); }
+        long long pn = (long long)B * LDS / 4; void* pa[] = {&d_part, &pn, &d_sink}; CK(cuLaunchKernel(ff, 152, 1, 1, 512, 1, 1, 0, st, pa, 0));
+        if (getenv("STATE_WARM")) {  // the rows' lines (state and windows) read into L2 after the flush
+          CUdeviceptr lp = d_lines + (size_t)(i % SETS) * BM * LINE; long long ln = (long long)B * LINE / 16;
+          void* la[] = {&lp, &ln, &d_sink}; CK(cuLaunchKernel(ff, 152, 1, 1, 512, 1, 1, 0, st, la, 0)); } }
       launch(*k, B, warm ? 0 : i % SETS);
     }
     CUgraph g; CK(cuStreamEndCapture(st, &g)); CUgraphExec ge; CK(cuGraphInstantiate(&ge, g, 0));

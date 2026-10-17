@@ -479,3 +479,22 @@ math, TMEM O, bf16 P) to write and tune from PTX, more than this session.
   the kernel open about as long as HBM takes to serve them (1.7 µs at full
   rate, longer from few SMs), and absorb gains less than that. D A/B
   (bulk): 3.378 / 3.376 → 3.376 / 3.375, 8 rows worse. Dropped.
+- **kda_core: the next KDA layer's state into L2 from this one** (S build:
+  one thread a block ends with a 64 KB `cp.async.bulk.prefetch.L2` at
+  evict_last of the next layer's slice, under o_proj whose weight is
+  already in L2; the next layer's bulk copy reads it with an evict_first
+  hint): D A/B 3.376 / 3.378 → 3.391 / 3.392, 8-24 rows +15..35 µs a step.
+  nsys: kda_core 6.16 → 6.82 µs at 8 rows, 9.14 → 9.60 at 24; the prefetch's
+  issue holds the block (as in mla_prep above) and no read-side gain shows.
+  Dropped. What a warm state is worth (harness/attn kda, `STATE_WARM=1`:
+  the rows' lines read into L2 after the flush, weights and partial as in
+  the step): 1 / 8 / 16 / 24 rows 5.17 / 5.76 / 7.58 / 8.43 → 5.12 / 5.18 /
+  6.66 / 7.20 µs (everything warm: 4.45 / 4.51 / 6.34 / 6.59; R build at
+  36 / 48 rows 11.04 / 13.07 → 8.48 / 10.40 all warm).
+  **Proposal for k3_ar_fused's owner** (r-ar / r-comm): the all-reduce before
+  each KDA layer's qkvg (land_add2_attnres_rms_snap) idles HBM while it
+  waits; its idle blocks could load the layer's state lines (rows × 12 heads
+  × 64 KB, line_index known) beside the qkvg weight they already pull, at
+  evict_last, kda_core then reading them evict_first. Worth ~0.6 / 0.9 / 1.2
+  µs a call at 8 / 16 / 24 rows (12 calls a 16-layer step: 7 / 11 / 15 µs,
+  0.25-0.45%), less what the extra 6.3-19 MB of L2 costs the qkvg prefetch.
