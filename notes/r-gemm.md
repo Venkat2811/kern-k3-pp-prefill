@@ -4,6 +4,52 @@ Target: `qkvg`, `front`, `wfu`, `q_b`, `lm_head` (f32 out, `cublas_bf16_tn_f32`)
 `lat_up`, `wgu`, `w_dn` (bf16 out, `cublaslt_bf16_tn`). Check `loop/d/check loop/out/d-l4-tp8.json`, bench
 `loop/d/bench loop/out/d-l16-tp8.json`. Main 01d6dc5: 12.9 launches/layer, 3.488 ms/step (base-r3).
 
+## State (1ba6abe)
+
+D weighted cost, same-lease A/B: main 3.484 -> 3.40 ms/step (-2.4%), every commit bit-identical vs main.
+Launches run per step: main's minus one per qkvg / front call at 1-32 rows (cuBLAS's splitKreduce_kernel gone);
+loop/count reads 19.7 a layer (it counts the four `when` buckets of gemm_t6400 / gemm_t6016, of which one runs).
+Step p50 at the round's A/B shapes, main -> head (prof8, same lease): 1 x 8k 2.02 -> 1.95 ms, 8 x 8k 2.52 -> 2.43,
+32 x 8k 3.70 -> 3.61, 64 x 8k 4.76 -> 4.65, 32 x 32k 3.78 -> 3.72.
+
+## The table (rank 0, nsys critical path, us a call, main -> head, ratio to the HBM floor of decode.md)
+
+A ratio under 1 means the predecessor pulled the weight into L2 during its own wait: the call's floor is then
+L2's, and the HBM bytes moved earlier. 16-layer step, ctx as named.
+
+| call | n x k | 1 x 8k | 8 x 8k | 32 x 8k | 64 x 8k | 32 x 32k |
+|---|---|---:|---:|---:|---:|---:|
+| `qkvg` | 6400 x 7168 f32 | 17.9 -> **12.2** (0.98x) | 17.6 -> **12.4** (0.99x) | 18.9 -> **14.7** (1.16x) | 18.0 -> **14.5** (1.12x) | 19.2 -> **14.6** (1.15x) |
+| `front` | 6016 x 7168 f32 | 14.9 -> **10.0** (0.85x) | 13.4 -> **10.5** (0.89x) | 15.8 -> **13.0** (1.08x) | 18.4 -> **16.7** (1.38x) | 15.9 -> **13.5** (1.13x) |
+| `lat_up` | 7168 x 3584 | 8.3 -> **8.6** (1.23x) | 8.4 -> **5.6** (0.80x) | 8.5 -> **6.0** (0.85x) | 8.1 -> **6.6** (0.92x) | 8.6 -> **6.0** (0.85x) |
+| `o_proj` | 7168 x 1536 | 5.1 -> **4.3** (1.43x) | 5.0 -> **4.4** (1.45x) | 5.8 -> **4.4** (1.40x) | 5.6 -> **4.5** (1.41x) | 5.7 -> **4.5** (1.47x) |
+| `sh_down` | 7168 x 768 | 3.7 -> **3.7** (2.50x) | 3.7 -> **3.6** (2.41x) | 4.0 -> **4.0** (2.56x) | 4.0 -> **4.0** (2.48x) | 4.0 -> **4.0** (2.58x) |
+| `wfu` | 3648 x 7168 f32 | 11.6 -> **10.3** (1.45x) | 11.9 -> **9.7** (1.36x) | 13.0 -> **10.9** (1.50x) | 13.3 -> **10.4** (1.41x) | 12.9 -> **10.9** (1.51x) |
+| `q_b` | 18432 x 1536 f32 | 10.6 -> **10.6** (1.38x) | 10.4 -> **10.4** (1.34x) | 11.1 -> **11.0** (1.36x) | 11.2 -> **11.3** (1.35x) | 11.1 -> **11.0** (1.37x) |
+| `lm_head` | 20480 x 7168 f32 | 48.8 -> **46.3** (1.15x) | 50.6 -> **47.8** (1.19x) | 48.3 -> **45.3** (1.12x) | 48.7 -> **44.6** (1.09x) | 47.6 -> **44.8** (1.11x) |
+| `wgu` | 8448 x 7168 | 18.7 -> **17.3** (1.05x) | 17.2 -> **15.9** (0.96x) | 20.3 -> **19.5** (1.16x) | 22.9 -> **23.1** (1.36x) | 20.5 -> **19.8** (1.18x) |
+| `w_dn` | 7168 x 4224 | 11.5 -> **11.3** (1.36x) | 11.7 -> **11.8** (1.41x) | 13.6 -> **12.9** (1.53x) | 13.8 -> **14.0** (1.63x) | 13.2 -> **13.1** (1.55x) |
+
+Paid elsewhere for it (same profile): the closing add +27..+48 us a step (its hint blocks, 1.7-3 us a call), the
+attention all-reduce +40..+58 at 1-8 rows (the loads' grace), within +-20 at 32-64.
+
+The named limits of what is not within ~1.15x:
+- `sh_down` (10.5 MB): it runs right after FC2, whose experts stream 100s of MB through L2, and nothing before FC2
+  can hold it: pinned at evict_last from the attention all-reduce it costs more than it saves (3.4185 vs 3.4025);
+  normal loads do not survive the stream (work/h/el_gemm.cu). Cold, cuBLAS's 112-CTA 64x8 tile reaches 2.8-3.0
+  TB/s; no split-K-1 cuBLASLt config is faster at 1-16 rows (19202 tried), 0.7-0.9 us at 17-48 alone but nothing
+  in the step. What would move it: computing it inside ar_finalize_rms (its A, shared_act, is ready before FC1;
+  a K-ascending mma chain is bit-identical to cuBLAS's split-K 1, g-small): -1 launch a layer and its 3.7 us,
+  but that kernel is r-ar's and being rewritten: a proposal for r-ar.
+- `o_proj` (21 MB): read from L2 (pinned by the MoE all-reduce one layer earlier), it is at cuBLAS's own L2 time
+  (3.2-4.3 us alone, hot): 112 CTAs (n / 64, one K chain an output, no split to add without changing the bits).
+- `wfu` / `q_b` (4 calls a step each): wfu gets only the closing add's hints; our split-K kernel at 2 splits is
+  slower than cuBLAS (114 CTAs, 12.6-14.4 vs 11.7-12.1 cold). q_b follows mla_prep (r-attn's, 3 us): no host.
+- `front` at 49-64 rows: cuBLAS runs one K chain an output there (no split): our kernel would need a 448-MMA
+  chain a 64-row tile (23 us vs 16.7); kept on cuBLAS.
+- `w_dn` (layer 0 only, after situ), `lm_head` (1 call, 280 MB: the closing add hints the first 96 MB).
+
+
 ## Tools (work/, not committed)
 
 - `work/dprof.sh PROFILE MANIFEST:OUT...`: one 8-GPU lease, k3_step `--profile` per manifest, nsys on rank 0
@@ -81,6 +127,13 @@ Tried and dropped (A/B in one lease each, ms/step):
   evict_last 16 / 32 MB: 3.4180 / 3.4305 vs 3.4075.
 - cuBLASLt algorithm pins for o_proj / sh_down at 17-64 rows (64x32 / 64x48 / 48x64 tiles, 0.7-0.9 us a call
   faster alone, bit-identical): 3.4205 vs 3.4230 in the step, inside noise; not worth four `when` buckets each.
+- sh_down pinned at evict_last by the attention all-reduce, demoted by the MoE one: 3.4185 vs 3.4025.
+- own GEMM: one build for 1-32 rows with the MMA's N set at run time (fewer `when` buckets): a stage less than
+  the bucketed builds, 0.4-0.9 us a call slower cold; with the buckets, run-time N changes nothing (3.4030 vs 3.4025).
+- no closing-add hints before qkvg where our GEMM runs it: neutral at 8-24 rows (3.4055 vs 3.4035, 36-48 lose
+  them); our CTAs issuing cp.async.bulk.prefetch.tensor L2 prefetches of their whole slice before
+  griddepcontrol.wait: +40 us a step (3.4375).
+- wfu with our GEMM (2 splits, block 56): bit-identical, slower than cuBLAS.
 
 ## Own f32 GEMM (source/k3_gemm_f32.cu)
 
