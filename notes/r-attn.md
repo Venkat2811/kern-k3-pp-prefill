@@ -226,7 +226,10 @@ rows), the 4-slot MLA tier (≥ 16) or larger mla_prep / absorb batches. The
 check's 4 rows tiled to 20 and to 36 rows, teacher-forced 640 steps on TP8,
 main's d-l4-tp8 against this branch's (after f8bd7e6): top-1 1.0000, relRMS
 max 0.00000 over every kept row-step, 8 ranks agreeing, at both. (Run
-loop/d/ranks with an absolute OUT: the ranks run on other hosts.)
+loop/d/ranks with an absolute OUT: the ranks run on other hosts.) Again for
+the tcgen05 absorb (N = 32 / 48 columns there), main 21a9174 against the
+rebased branch (`work/tf.sh 20|36`): top-1 1.0000, relRMS max 0.00000 at 20
+and 36 rows, 8 ranks.
 - **kda_core KDA_SPLIT** (a (b, h) item on a 2-CTA cluster, each CTA half the
   state by bulk copy and half the dv rows, attn halves exchanged by DSMEM,
   the window shift deferred past the cluster barrier; bit-identical): the
