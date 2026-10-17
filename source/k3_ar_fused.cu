@@ -447,22 +447,54 @@ __device__ __forceinline__ void block_sum(float (&v)[N], float* red, int t) {
 
 // block_sum over a row split into CL slices of SW warps on a cluster of CL blocks (the slices aligned to
 // 32 vectors): each warp's first stage goes into its row-wide warp slot in every block's `red` (the
-// slots past the row from the blocks' spare warps, zero), and behind the cluster barrier every block
-// runs block_sum's second stage over the row's 32 slots: the same sums in the same order as one
-// 1024-thread block.
+// slots past the row from the blocks' spare warps, zero), and once its own `red` holds all of them
+// every block runs block_sum's second stage over the row's 32 slots: the same sums in the same order
+// as one 1024-thread block. With a `bar`, the slots go out by st.async, each completing its bytes on the
+// receiving block's mbarrier (armed with cluster_sum_bytes before a cluster barrier, phase 0): a block
+// waits for its own bytes, not for a cluster barrier's round trip. Without, DSMEM stores and the
+// cluster barrier: st.async a value is slower once a warp sends more than a few (32 values: +0.8 us).
+template <int N, int CL, int SW>
+constexpr unsigned cluster_sum_bytes = CL * (SW + 1) * N * 4;
+
+__device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
+
+__device__ __forceinline__ void bar_arm(unsigned long long* bar, unsigned bytes) {
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(smem_u32(bar)));
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(bar)), "r"(bytes) : "memory");
+}
+
 template <int N, int CL, int SW, int W>
-__device__ __forceinline__ void cluster_block_sum(float (&v)[N], float* red, int t) {
+__device__ __forceinline__ void cluster_block_sum(float (&v)[N], float* red, unsigned long long* bar, int t) {
   static_assert(CL * (SW + 1) == 32, "a row's 32 warp slots: SW a block, one zero slot a block");
   constexpr int SH = 5 - log2_of(N);
   cg::cluster_group cl = cg::this_cluster();
   const int lane = t & 31, warp = t >> 5, me = cl.block_rank();
   halve<N, 16>(v, lane);
   const int slot = warp < SW ? me * SW + warp : CL * SW + me;
-  if (warp <= SW && (lane & ((1 << SH) - 1)) == 0) {
+  if (bar) {
+    if (warp <= SW && (lane & ((1 << SH) - 1)) == 0) {
+      const unsigned at = smem_u32(red + (lane >> SH) * RED_LD + slot), b = smem_u32(bar);
+      const unsigned x = __float_as_uint(warp < SW ? v[0] : 0.f);
 #pragma unroll
-    for (int q = 0; q < CL; ++q) cl.map_shared_rank(red, q)[(lane >> SH) * RED_LD + slot] = warp < SW ? v[0] : 0.f;
+      for (int q = 0; q < CL; ++q) {
+        unsigned ra, rb;
+        asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(ra) : "r"(at), "r"(q));
+        asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(rb) : "r"(b), "r"(q));
+        asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];" ::"r"(ra), "r"(x),
+                     "r"(rb) : "memory");
+      }
+    }
+    asm volatile(
+        "{\n .reg .pred p;\n WAIT_%=:\n mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], 0;\n"
+        " @!p bra WAIT_%=;\n}" ::"r"(smem_u32(bar))
+        : "memory");
+  } else {
+    if (warp <= SW && (lane & ((1 << SH) - 1)) == 0) {
+#pragma unroll
+      for (int q = 0; q < CL; ++q) cl.map_shared_rank(red, q)[(lane >> SH) * RED_LD + slot] = warp < SW ? v[0] : 0.f;
+    }
+    cl.sync();
   }
-  cl.sync();
   if constexpr (N <= BS_SMALL) {
 #pragma unroll
     for (int j = 0; j < N; ++j) v[j] = red[j * RED_LD + lane];
@@ -717,6 +749,7 @@ NB_ENTRIES(AR_ATTNRES_ENTRY)
 
 struct LandSmem {
   float red[2][32 * RED_LD];
+  unsigned long long bar;  // the norm's (cluster_block_sum)
 };
 
 template <int NB>
@@ -749,6 +782,11 @@ __device__ __forceinline__ void land_add2_attnres_rms(const bf16_t* __restrict__
     pr = ldv(prefix2 + off);
   }
   asm volatile("cp.async.commit_group;");
+  // the norm's mbarrier, armed before the scores' cluster barrier: no slot of the norm is sent before it
+  if (NB > 0 && t == 0) {
+    bar_arm(&s.bar, cluster_sum_bytes<1, LAND_CL, LV / 32>);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
   grid_wait();
   V8 pv = pr;
   if (act) {
@@ -786,7 +824,7 @@ __device__ __forceinline__ void land_add2_attnres_rms(const bf16_t* __restrict__
 #pragma unroll
       for (int c = 0; c <= NB; ++c) partial(c < NB ? cand_v(c) : pv, swv, v[2 * c], v[2 * c + 1]);
     }
-    cluster_block_sum<N, LAND_CL, LV / 32, LT / 32>(v, s.red[0], t);
+    cluster_block_sum<N, LAND_CL, LV / 32, LT / 32>(v, s.red[0], nullptr, t);
     float sc[NB + 1], mx = -3.0e38f, den = 0.f;
 #pragma unroll
     for (int c = 0; c <= NB; ++c) mx = fmaxf(mx, sc[c] = score_of(v[2 * c], v[2 * c + 1]));
@@ -815,7 +853,7 @@ __device__ __forceinline__ void land_add2_attnres_rms(const bf16_t* __restrict__
       sq[0] += f.x * f.x; sq[0] += f.y * f.y;
     }
   }
-  cluster_block_sum<1, LAND_CL, LV / 32, LT / 32>(sq, s.red[1], t);
+  cluster_block_sum<1, LAND_CL, LV / 32, LT / 32>(sq, s.red[1], NB > 0 ? &s.bar : nullptr, t);
   const float rr = rsqrtf(sq[0] * (1.0f / (float)KH) + KEPS);
   if (act) {
     V8 o;
