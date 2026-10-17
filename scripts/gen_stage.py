@@ -485,8 +485,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 launch("k3_kda_core", "kern_k3_kda_core", grid=[T, hl, 1], smem=smem, when={"var": T, **when},
                        defines={"KDA_CONV": 1, **(kda_defs or {}), **defs,
                                 **({"LDS": kfused, "WSM_LDS": kfused, "WSM_FA": hl} if kfused else {})})
-                for defs, smem, when in (({"KDA_SMEM_STATE": 1}, KDA_STATE_SMEM, {"max": kda_smem_rows}),
-                                         ({"KDA_MINB": 4}, 0, {"min": kda_smem_rows + 1}))]},
+                for defs, smem, when in (({"KDA_SMEM_STATE": 1, "ROWS_PER_ITER": 1}, KDA_STATE_SMEM, {"max": kda_smem_rows}),
+                                         ({"KDA_MINB": 4, "ROWS_PER_ITER": 2}, 0, {"min": kda_smem_rows + 1}))]},
         },
         "mla_attn": cake_attn_op(seqs_max) if fp8 else mla_attn_op(seqs_max, mla_split_max, reduce=not xchg,
                                                                       slots=mla_slot_ranges(mla_split_max, seqs_max)),

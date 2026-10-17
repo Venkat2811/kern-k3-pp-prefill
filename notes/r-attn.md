@@ -79,3 +79,61 @@ Attention floor (the rank's latent rows once, 1152 B a position): 10.3 /
   tile in registers, a row a thread, to fit 70 KB): slower than the register
   build everywhere from 16 rows (36 rows 13.8 vs 11.1 µs). Dropped: the
   shared-memory build only pays where its blocks are one wave at 2 an SM.
+
+- **mla_prep** (41d420d): the fast path was compiled for gridDim.y == 4
+  (12288 gate columns); at TP8 (1536) GSEGU / NTF was zero passes, so the
+  generator launched (B, 3, 1) onto the generic path. GYF = 1 +
+  ceil(INNER / 4096), a bounded last gate pass, TP8 launches (B, 2, 1).
+  In the step 3.1-3.5 → 1.6-1.9 µs a call. -0.16%.
+
+- **kda_core ROWS_PER_ITER** (S build 1, R build 2): R at 4 rows a lane was
+  128 registers with 24 B of spill; at 2 it is 111 registers, no spill, the
+  same 4 blocks an SM: 26 rows 10.08 → 9.66, 48 rows 13.47 → 13.04, 64 rows
+  20.18 → 18.75 µs. S from shared memory at 1 row a lane: 16 rows 8.16 →
+  7.73. Also measured: R at 3 blocks an SM (166 regs) is 0.1-0.3 µs better
+  at 26-38 rows but loses from 40: not worth a third `when` launch; R at 5-6
+  blocks an SM (80-96 regs, spills) slower.
+
+## Done table (rank 0 busy µs a call in the step, nsys; floors from roofline/decode.md)
+
+A/B shapes, rows × 8k (and 32 × 32k), after 41d420d (kda before its
+ROWS_PER_ITER change: 64 rows is ~1.4 µs lower with it):
+
+| kernel | 1 | 8 | 32 | 64 | 32 × 32k | floor (1 / 8 / 32 / 64 / 32×32k) | main (roofline) |
+|---|---|---|---|---|---|---|---|
+| kda_core | 5.89 | 6.34 | 11.17 | 20.75 | 11.15 | 0.29 / 1.87 / 7.29 / 14.52 / 7.29 | 9.5 / 9.6 / 12.2 / 22.8 / 12.2 |
+| mla_attn (DSL) | 8.82 | 10.70 | 16.38 | 27.02 | 36.20 | 0.42 / 2.48 / 7.36 / 12.99 / 22.80 | 8.8 / 10.5 / 27.2 / 48.1 / 43.7 |
+| mla_absorb | 5.10 | 4.90 | 6.00 | 7.81 | 5.99 | 1.72 (12.6 MB) | 6.5 / 6.3 / 7.9 / 10.1 / 7.8 |
+| mla_prep | 1.63 | 1.56 | 1.62 | 1.93 | 1.62 | launch | 3.5 / 3.1 / 3.1 / 3.5 / 3.0 |
+
+Bench shapes (8 / 24 / 36 rows × 64k, 48 × 128k): kda 6.45 / 9.15 / 11.65 /
+13.68; DSL 21.9 / 46.7 / 65.0 / 160.9 (floors 10.3 / 31 / 46 / 123);
+absorb 5.0 / 5.8 / 6.7 / 6.9; prep 1.6-1.9 after 41d420d.
+
+Named limits for what is not within 1.15x:
+- **kda_core, 1-24 rows** (shared-memory build): a latency chain, not bytes.
+  Ablated at 8 rows (one GPU, cold): empty launch 0.5, prologue alone 3.4
+  (line index → conv window, l2 sums, f_b projection from the smem tile, the
+  decay, one block sum), the 64 KB state bulk copy lands at ~4.2 (issued
+  right after the line index: line index RT + 64 KB into one SM), delta rule
+  from smem + its 64 KB of stores 1.9 (stores alone 0.55; 1.4 at 16-24 rows,
+  the L2 write rate). Its floor is the dependent chain launch → line index
+  → state → one pass → write-back, ~4.5-5 µs; it measures 5.8.
+- **kda_core, 26-64 rows** (register build): every block of the batch is
+  resident at once and in the same phase, so the 3-4 µs prologue does not
+  overlap the state stream (DRAM read = state + inputs, as round 1 measured);
+  at 64 rows 768 blocks are 1.26 waves at 4 an SM. Overlapping them needs a
+  persistent pipeline (item i+1's prologue under item i's stream): not done.
+- **mla_attn**: FlashInfer's prebuilt CuTe-DSL kernel (no source build: the
+  cutlass DSL package is absent; no PDL in the cubin). Its grid is now the
+  plan's slots; the plan is near the kernel's best (uniform splits a row,
+  76 clusters; round 1's makespan plan measured worse). Per launch ~7 µs
+  fixed (q 110 KB a split from L2, 196 KB f32 partial a split written),
+  ~1.7 µs a 128-position tile per cluster: 96 heads pad to 128 MMA rows
+  (MMA-bound below ~53 clusters), ~6.2 TB/s at 72 clusters. Closing it needs
+  a new kernel (a 96-row or positions-as-M tiling).
+- **mla_absorb**: loads alone (W 12.6 MB + q into smem, then return) 3.7 µs
+  = launch + one HBM round trip + 12.6 MB at 7.3 TB/s in one wave; the MMA
+  ~0.4 µs a 16-row tile on top. Only overlapping it with q_b (PDL; round 1:
+  no gain, cuBLAS triggers no early launch) could hide the stream.
+- **mla_prep**: one launch, one L2 round trip, ≤ 0.2 µs of bytes: the launch floor.
