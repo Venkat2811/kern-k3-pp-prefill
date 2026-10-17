@@ -229,3 +229,9 @@ overlapping its stream (register build), as the done table says.
    workspace. Costs one more launch a MLA layer and a contract change in
    k3_dcp; worth it only if real batches' long rows are rare and short rows
    many.
+- **absorb as a programmatic dependent** (pdl, W_UK's loads before
+  griddepcontrol.wait, the query after): bit-identical, but absorb's busy
+  time rises (8 rows 5.03 → 5.34 µs, 24 rows 5.80 → 6.21; its predecessor is
+  q_b's splitKreduce) and D 3.379 → 3.377 / 3.389. Dropped, as in round 1.
+  An L2 prefetch of W_UK from mla_prep has no idle block to run in (every
+  block holds a row at TP8) and would cross q_b's 54 MB.
