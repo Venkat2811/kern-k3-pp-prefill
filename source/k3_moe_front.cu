@@ -1,31 +1,35 @@
 // A DCP decode step's MoE front in one launch: everything between the front
 // GEMM (router | lat_down | this rank's shared gate | up, one f32 row of LDS
-// columns) and the batched GEMMs.
+// columns) and the batched GEMMs, and the shared expert's down projection.
 //
 //   kern_k3_moe_front(const f32* S, const f32* bias, const bf16* rs, i32* idx, f32* wts,
 //       u8* q, u8* sf, bf16* act, i32* ready, i32* done, i32* cta_batch, i32* cta_limit,
-//       i32* num_non_exiting, i32* total_padded, i32* route_map, i32* exp2perm, int first, int T)
-//   grid (T, 1, 1)   block (1024, 1, 1)   T <= 64
+//       i32* num_non_exiting, i32* total_padded, i32* route_map, i32* exp2perm,
+//       const bf16* wsh, bf16* sh_out, int first, int T)
+//   grid (T + NSH / 64, 1, 1)   block (1024, 1, 1)   shared SMEM_SH bytes   T <= 64
 //
-// Row b's block:
+// Launched as a programmatic dependent of the front GEMM: every block waits for it at entry
+// (griddepcontrol.wait), then lets FC1 launch.
+//
+// Row b's block (b < T):
 //   * the router top-k of columns [0, EXPERTS) (k3_router_argmax.cu's picks and
 //     order), exact: warp w < EXPERTS / 32 holds 32 biased scores; tau, the 16th
 //     largest warp maximum, bounds the top 16 from below; the scores >= tau
 //     (16-30 of them on real routing) are compacted and warp 0 sorts them 32 at a
 //     time into a running top 16 (below);
 //   * meanwhile warps 28..31 run k3_land.cu's land_situ on the shared expert's
-//     gate | up (the SH columns after the latent) and publish the row to each CTA c
-//     of the shared expert's down projection (k3_sh_down.cu) running beside this
-//     grid (ready[c * 64 + b] = 1); once the candidates are
-//     in, warps 14..27 land the latent (columns EXPERTS + [0, LATENT)) to bf16
-//     and quantise it to mxfp8 as k3_moe_prefill.cu's kern_k3_moe_quant (four
-//     threads per 32-element group);
-// then the last block to finish (`done`, a zeroed carry it re-zeroes) builds
+//     gate | up (the SH columns after the latent) and publish the row to each
+//     shared-expert block T + c (ready[c * 64 + b] = 1, st.release.gpu); once the
+//     candidates are in, warps 14..27 land the latent (columns EXPERTS + [0, LATENT))
+//     to bf16 and quantise it to mxfp8 as k3_moe_prefill.cu's kern_k3_moe_quant
+//     (four threads per 32-element group);
+// then the last row block to finish (`done`, a zeroed carry it re-zeroes) builds
 // the routing tables of this rank's experts `first + j * STRIDE` (j < LOCAL)
 // over all T rows: what FlashInfer's routing writes for the batched GEMMs'
 // TILE-row CTAs, every expert's rows in the order of shared-memory atomics
 // (as FlashInfer's are; the GEMMs' rows do not depend on it), padding rows
 // routing token 0, exp2perm -1 for another rank's expert.
+// Blocks T + c: the shared expert's down projection of 64 output columns (shared_down, below).
 //
 //   nvcc -cubin -arch=sm_103a -DEXPERTS=896 -DLDS=6016 -DSH=768 -DSTRIDE=8 k3_moe_front.cu
 #include <cuda_bf16.h>
@@ -45,9 +49,10 @@
 #define STRIDE 8
 #endif
 #define LATENT 3584
-#ifndef READERS
-#define READERS 112  // k3_sh_down.cu's CTAs: ready[c * 64 + b] is row b's flag for CTA c
+#ifndef NSH
+#define NSH 7168  // the shared expert's output width (the hidden size)
 #endif
+#define READERS (NSH / 64)  // the shared-expert blocks: ready[c * 64 + b] is row b's flag for block T + c
 #define TOPK 16
 #define TILE 16
 #define LOCAL (EXPERTS / STRIDE)
@@ -197,19 +202,141 @@ __device__ __forceinline__ unsigned long long merge32(unsigned long long v, int 
 static_assert(EXPERTS % 32 == 0 && TOPK <= SORT_WARPS && SORT_WARPS <= 31 && QUANT_WARP0 > 0,
               "a warp of experts each, at least TOPK of them; a warp left for the SiTU, the latent's after warp 0");
 
+// ---- blocks T .. T + NSH / 64 - 1: the shared expert's down projection ----
+// out[t, n] = bf16(sum_k act[t, k] * Wsh[n, k]) for t < T, n < H, k < SH, act the row blocks' SiTU rows.
+// Block T + c takes Wsh's rows [64 c, 64 c + 64): they land in shared memory by cp.async at entry
+// (warps 8-31), the T activation rows once published (ready[64 c + b] = 1 by row block b, polled by
+// warps 0-1; each block clears its own flags for the next layer). Pitch SPITCH: an odd number of 16-byte
+// units, so ldmatrix's eight rows fall on distinct banks. Warp w = 4 h + g multiplies rows 64 c + 16 g +
+// [0, 16) by the row tiles 4 h + [0, 4) on the tensor cores (mma.sync m16n8k16 bf16, f32 accumulators),
+// each output one chain over k = 0, 16, 32, ... in order: the order and instruction cuBLASLt's kernels
+// for this shape sum in (nvjet tst 64 x 8..48 tiles, no split-K), so the result is cuBLASLt's bit for
+// bit (a harness compares every output at 1-64 rows on random and real weights). The row blocks never
+// wait on these and have lower indices, so they are all dispatched first: the polls cannot hang.
+#define SROWS 64
+#define SPITCH (SH * 2 + 16)
+#define SMEM_SH (SROWS * SPITCH + 64 * SPITCH + 64 * SROWS * 2)
+static_assert((SPITCH / 16) % 2 == 1 && SH % 64 == 0, "conflict-free ldmatrix rows");
+
+__device__ __forceinline__ uint32_t smem_at(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+
+__device__ __forceinline__ void mma16816(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                         uint32_t b0, uint32_t b1) {
+  asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+      "{%0, %1, %2, %3};"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+template <int TILES>
+__device__ __forceinline__ void sh_frags(uint32_t a_at, uint32_t b_at, int j0, int tiles, int k, uint32_t (&a)[4],
+                                         uint32_t (&b)[TILES][2]) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+               : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(a_at + k * 2));
+#pragma unroll
+  for (int j = 0; j < TILES; ++j)
+    if (j0 + j < tiles)
+      asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
+                   : "=r"(b[j][0]), "=r"(b[j][1]) : "r"(b_at + (j0 + j) * 8 * SPITCH + k * 2));
+}
+
+// A warp's 16 rows times the row tiles j0 + [0, TILES) below `tiles`, one chain an output, k ascending,
+// the next steps' fragments in flight; the sums, rounded to bf16, to the tile [t][64 rows].
+template <int TILES>
+__device__ __forceinline__ void sh_rows16(uint32_t a_at, uint32_t b_at, int j0, int tiles, __nv_bfloat16* tile,
+                                          int n, int q) {
+  constexpr int DEPTH = 2, STEPS = SH / 16;
+  float acc[TILES][4];
+#pragma unroll
+  for (int j = 0; j < TILES; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+  uint32_t a[DEPTH][4], b[DEPTH][TILES][2];
+#pragma unroll
+  for (int d = 0; d < DEPTH; ++d) sh_frags<TILES>(a_at, b_at, j0, tiles, 16 * d, a[d], b[d]);
+#pragma unroll
+  for (int s = 0; s < STEPS; ++s) {
+    const int d = s % DEPTH;
+#pragma unroll
+    for (int j = 0; j < TILES; ++j)
+      if (j0 + j < tiles) mma16816(acc[j], a[d][0], a[d][1], a[d][2], a[d][3], b[d][j][0], b[d][j][1]);
+    if (s + DEPTH < STEPS) sh_frags<TILES>(a_at, b_at, j0, tiles, 16 * (s + DEPTH), a[d], b[d]);
+  }
+#pragma unroll
+  for (int j = 0; j < TILES; ++j)
+    if (j0 + j < tiles)
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+        tile[((j0 + j) * 8 + 2 * q + i % 2) * SROWS + n + (i / 2) * 8] = __float2bfloat16(acc[j][i]);
+}
+
+__device__ __forceinline__ void shared_down(const __nv_bfloat16* __restrict__ act, int* __restrict__ ready,
+                                            const __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ out,
+                                            int T, int c) {
+  extern __shared__ __align__(128) uint8_t sm[];  // the weight rows, T activation rows, the bf16 tile [T][64]
+  uint8_t* sw = sm;
+  uint8_t* sa = sm + SROWS * SPITCH;
+  __nv_bfloat16* tile = reinterpret_cast<__nv_bfloat16*>(sa + 64 * SPITCH);
+  const int t = threadIdx.x, warp = t / 32, lane = t % 32, n0 = c * SROWS;
+  if (t >= 256)
+    for (int i = t - 256; i < SROWS * (SH / 8); i += THREADS - 256)
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                   ::"r"(smem_at(sw + (i / (SH / 8)) * SPITCH + (i % (SH / 8)) * 16)), "l"(W + (size_t)n0 * SH + i * 8)
+                   : "memory");
+  asm volatile("cp.async.commit_group;" ::: "memory");
+  if (t < T) {
+    int v;
+    int* flag = ready + c * 64 + t;
+    asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(flag) : "memory");
+    while (v != 1) {
+      __nanosleep(64);
+      asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(flag) : "memory");
+    }
+    *flag = 0;
+  }
+  __syncthreads();
+  for (int i = t; i < T * (SH / 8); i += THREADS)
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                 ::"r"(smem_at(sa + (i / (SH / 8)) * SPITCH + (i % (SH / 8)) * 16)), "l"(act + i * 8) : "memory");
+  asm volatile("cp.async.commit_group;" ::: "memory");
+  asm volatile("cp.async.wait_group 0;" ::: "memory");
+  __syncthreads();
+  const int tiles = (T + 7) / 8, g = warp % 4, h = warp / 4;
+  if (h * 4 < tiles) {
+    // ldmatrix rows: A (16 W rows) lane l -> row l % 16, column half l / 16; B (8 act rows) lane l -> row l % 8, half (l / 8) % 2
+    const uint32_t a_at = smem_at(sw + (16 * g + lane % 16) * SPITCH + (lane / 16) * 16);
+    const uint32_t b_at = smem_at(sa + (lane % 8) * SPITCH + ((lane / 8) % 2) * 16);
+    if (tiles <= 1)
+      sh_rows16<1>(a_at, b_at, 0, tiles, tile, 16 * g + lane / 4, lane % 4);
+    else if (tiles <= 3)
+      sh_rows16<3>(a_at, b_at, 0, tiles, tile, 16 * g + lane / 4, lane % 4);
+    else
+      sh_rows16<4>(a_at, b_at, 4 * h, tiles, tile, 16 * g + lane / 4, lane % 4);
+  }
+  __syncthreads();
+  for (int i = t; i < T * (SROWS / 8); i += THREADS) {
+    const int r = i / (SROWS / 8), col = i % (SROWS / 8);
+    reinterpret_cast<uint4*>(out + (size_t)r * NSH + n0)[col] = reinterpret_cast<const uint4*>(tile + r * SROWS)[col];
+  }
+}
+
 extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
     const float* __restrict__ S, const float* __restrict__ bias, const __nv_bfloat16* __restrict__ rs,
     int* __restrict__ idx, float* __restrict__ wts, uint8_t* __restrict__ q, uint8_t* __restrict__ sf,
     __nv_bfloat16* __restrict__ act, int* __restrict__ ready, int* __restrict__ done, int* __restrict__ cta_batch,
     int* __restrict__ cta_limit, int* __restrict__ num_non_exiting, int* __restrict__ total_padded,
-    int* __restrict__ route_map, int* __restrict__ exp2perm, int first, int T) {
+    int* __restrict__ route_map, int* __restrict__ exp2perm, const __nv_bfloat16* __restrict__ wsh,
+    __nv_bfloat16* __restrict__ sh_out, int first, int T) {
   __shared__ float s_sig[EXPERTS];
   __shared__ unsigned long long s_cand[EXPERTS];
   __shared__ u32 s_max[32], s_tau;
   __shared__ int s_n, s_last, s_count[LOCAL];
 
   const int b = blockIdx.x, t = threadIdx.x, warp = t / 32, lane = t % 32;
+  asm volatile("griddepcontrol.wait;" ::: "memory");
   asm volatile("griddepcontrol.launch_dependents;");
+  if (b >= T) {
+    shared_down(act, ready, wsh, sh_out, T, b - T);
+    return;
+  }
   const float* row = S + (long long)b * LDS;
   if (warp < SORT_WARPS) {
     const float sg = 1.0f / (1.0f + expf(-row[t]));
@@ -277,7 +404,7 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
         reinterpret_cast<uint2*>(act + (long long)b * SH)[k] = *reinterpret_cast<const uint2*>(o);
       }
     }
-    // the row's activation published to k3_sh_down.cu, which runs beside this grid (release: cumulative
+    // the row's activation published to the shared-expert blocks (release: cumulative
     // over the SiTU warps' stores, ordered before it by the barrier)
     asm volatile("bar.sync 3, %0;" ::"n"(THREADS - SORT_WARPS * 32));
     for (int c = t - SORT_WARPS * 32; c < READERS; c += THREADS - SORT_WARPS * 32)  // a flag per reader CTA

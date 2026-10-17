@@ -182,7 +182,7 @@ source = "source/k3_kda_core.cu"
 defines = { HEADS = 12, KDA_CONV = 1, LDS = 6400, WSM_FA = 12, WSM_LDS = 6400 }
 
 [kernels."k3_moe_front+EXPERTS=896+LDS=6016+SH=768+STRIDE=8"]
-sha256 = "754cd44d31f511be2f7b53b9fb66794d45faff4d5ce90543afec2798b9c087c1"
+sha256 = "887d30febf9483418d7d6ab24ced7105cc3929a8f105f1de58608680de6a328d"
 source = "source/k3_moe_front.cu"
 defines = { EXPERTS = 896, LDS = 6016, SH = 768, STRIDE = 8 }
 

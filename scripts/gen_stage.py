@@ -643,21 +643,17 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                                          defines={"EXPERTS": experts} if experts != 224 else None)]},
         },
         **({"moe_front": {
-            # router top-k + latent land / mxfp8 + shared situ, then the last row's block builds the routing tables
+            # router top-k + latent land / mxfp8 + shared situ, then the last row's block builds the routing tables;
+            # its blocks past `tokens` run the shared expert's down projection (64 output columns a block). A
+            # programmatic dependent of the front GEMM (it waits at entry), as FC1 is of it.
             "params": ["in buffer<f32>", "in buffer<f32>", "in buffer<bf16>", "out buffer<i32>", "out buffer<f32>",
                        "out buffer<u8>", "out buffer<u8>", "out buffer<bf16>", "inout buffer<i32>", "inout buffer<i32>",
-                       *["out buffer<i32>"] * 6, "i32", "i32"],
-            "impl": {"launches": [launch("k3_moe_front", "kern_k3_moe_front", grid=[T, 1, 1], block=[1024, 1, 1],
-                                         defines={"EXPERTS": experts, "LDS": front, "SH": sh_l, "STRIDE": tp})]},
+                       *["out buffer<i32>"] * 6, "in buffer<bf16>", "out buffer<bf16>", "i32", "i32"],
+            "impl": {"launches": [{**launch("k3_moe_front", "kern_k3_moe_front", grid=[{"add": [T, H // 64]}, 1, 1],
+                                            block=[1024, 1, 1], smem=2 * 64 * (sh_l * 2 + 16) + 64 * 64 * 2,
+                                            defines={"EXPERTS": experts, "LDS": front, "SH": sh_l, "STRIDE": tp}),
+                                   "pdl": True}]},
         }} if front else {}),
-        # the shared expert's down projection beside moe_front (k3_sh_down.cu: a programmatic dependent that
-        # takes moe_front's SiTU rows as they are published, so FC1's wait covers it)
-        **({"sh_down": {
-            "params": ["in buffer<bf16>", "inout buffer<i32>", "in buffer<bf16>", "out buffer<bf16>", "i32"],
-            "impl": {"launches": [{**launch("k3_sh_down", "kern_k3_sh_down", grid=[H // 64, 1, 1], block=[256, 1, 1],
-                                            smem=2 * 64 * (sh_l * 2 + 16) + 64 * 64 * 2,
-                                            defines={"N": H, "K": sh_l}), "pdl": True}]},
-        }} if front and peer_ar else {}),
         **({"rms": {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32"],
             "impl": {"launches": [launch("k3_land", "kern_k3_rms")]},
@@ -1014,7 +1010,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     if front:
         work("front_partial", front, "f32", var=RW)
         buffers["moe_done"] = {"dtype": "i32", "shape": [1], "kind": "carry"}
-        buffers["sh_ready"] = {"dtype": "i32", "shape": [H // 64, 64], "kind": "carry"}  # k3_sh_down.cu's flags
+        buffers["sh_ready"] = {"dtype": "i32", "shape": [H // 64, 64], "kind": "carry"}  # moe_front's shared-expert flags
     else:
         work("router_partial", experts, "f32", var=RW)
     work("topk_idx", TOPK, "i32", var=RW)
@@ -1298,10 +1294,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                          b("topk_weight"), b("latent_q"), b("latent_sf"), b("shared_act"), b("sh_ready"),
                          b("moe_done"), *(b("moe." + n) for n in ("cta_batch", "cta_limit", "num_non_exiting",
                                                                   "total_padded", "route_map", "exp2perm")),
-                         {"rank": "tp"}, B)
-                    if fused_ar:
-                        step(L + "sh_down", "sh_down", b("shared_act"), b("sh_ready"), w("sh_down"),
-                             b("moe_flat", seqs_max * LATENT * 2), B)
+                         w("sh_down"), b("moe_flat", seqs_max * LATENT * 2), {"rank": "tp"}, B)
                 else:
                     gemm(L + "router", b("normed"), w("w_router"), b("router_partial"), experts, H)
                     step(L + "topk", "router_topk", b("router_partial"), w("bias"), w("rs"), b("topk_idx"),
@@ -1320,7 +1313,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 if not front:
                     proj(L + "wsh", b("normed"), w("wsh"), b("shared_partial"), 2 * sh_l, H)
                     land_situ(L + "shared_situ", b("shared_partial"), b("shared_act"), sh_l)
-                if not (front and fused_ar):
+                if not front:
                     proj(L + "sh_down", b("shared_act"), w("sh_down"), b("moe_flat", shared_at), H, sh_l)
                 if fused_ar:
                     # the combine, the sum of both and the latent norm in one launch; fc2's partial read
