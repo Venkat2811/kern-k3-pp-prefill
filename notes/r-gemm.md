@@ -6,6 +6,10 @@ Target: `qkvg`, `front`, `wfu`, `q_b`, `lm_head` (f32 out, `cublas_bf16_tn_f32`)
 
 ## State (rebased on main d85613c)
 
+Offered on this branch: dbedd6a (own split-K GEMM, -0.54% vs main) and 2603ca7 (bf16 projections over the rows
+rounded up to 8: the bench even, 1 row -1.3%, 4 rows -0.3%; bit-identical).
+
+
 Merged on main (95bc0b0): the closing add's hints, the all-reduces' loads, the o_proj evict_last pin (3.488 ->
 3.405). On this branch, for the orchestrator: dbedd6a, our own split-K GEMM for qkvg / front at 1-32 rows.
 Against main d85613c, same lease, 3 rounds each: **3.3873 -> 3.3690 ms/step (-0.54%)**; 8 / 16 / 24 rows -12..-33
@@ -138,6 +142,13 @@ Tried and dropped (A/B in one lease each, ms/step):
   them); our CTAs issuing cp.async.bulk.prefetch.tensor L2 prefetches of their whole slice before
   griddepcontrol.wait: +40 us a step (3.4375).
 - wfu with our GEMM (2 splits, block 56): bit-identical, slower than cuBLAS.
+- the f32 projections over the rows rounded up to 8 too (wfu / q_b 1-row cuBLAS kernels are 0.75x their 8-row
+  rate from L2, bit-identical; our GEMM's buckets unchanged): 1 row +5 us, the bench even (3.3690 vs 3.3680).
+- sh_down pinned at evict_last by our front GEMM's idle warps after its mainloop (prefetch hints, which survive
+  the MoE stream when given time), demoted by the next of our GEMMs before its wait: 3.3615 vs 3.3625 (head), the
+  no-pin build with the same arguments 3.3680: nothing measurable.
+- o_proj kernel holding its whole slice, second try with A boxes sized to the rows and a 12-deep A ring: still
+  6.6 vs 4.6 us after a 9 us PDL predecessor (the dependent 96-MMA chain and the post-wait work, not A).
 - one build for 1-32 rows (run-time N, A box of 32 rows; loop/count 14.6 a layer instead of 19.7): 3.4185 vs
   3.4005 (worse than cuBLAS alone): the buckets' extra ring stages are the whole gain. So the four `when` buckets
   stay; if loop/count is fixed to its own docstring (a `when`-gated launch counts once) they count as one.
