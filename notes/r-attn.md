@@ -273,3 +273,43 @@ overlapping its stream (register build), as the done table says.
   `tp8` kda_core (non-conv build) PASS against its CPU reference. `sass`
   flags k3_dcp's exchange (STACK:16): main's, not this branch's (r-comm's
   kernel now).
+
+## MLA decode: the engines at our shapes (orchestrator 02:52 task 1)
+
+A member's view: 96 heads (every head, a DCP member's positions), latent 512
++ rope 64, bf16. µs a call; DSL in the step (nsys), the others one GPU.
+
+| shape (rows × positions a member) | floor | DSL (ours, prebuilt) | CUTLASS sm100 MLA (example 77, best split) | trtllm-gen MLA | FlashMLA sm100 |
+|---|---|---|---|---|---|
+| 8 × 8k | 10.3 | 21.9 | 50.2 (split 8; auto 78) | n/a | n/a |
+| 24 × 8k | 31 | 46.7 | 128 (auto) | n/a | n/a |
+| 36 × 8k | 46 | 65.0 | 126.5 (auto; split 1-4 131-139) | n/a | n/a |
+| 48 × 16k | 123 | 160.9 | 258 (split 1) | n/a | n/a |
+| 1 × 1k | 0.42 | 8.6 | 45 | n/a | n/a |
+| 64 × 1k | 13.0 | 50.1 | 84 | n/a | n/a |
+
+- CUTLASS: `flashinfer/3rdparty/cutlass/examples/77_blackwell_fmha/77_blackwell_mla.cu`
+  built for sm_103a (`-DFP16`, the same MMA rate as bf16; `work/cmla/`),
+  128 heads (its fixed tile; our 96 pad to it as in the DSL), 128-token pages
+  (its TMA path rejects 64; FlashInfer's `cutlass_mla` wrapper takes the
+  cp.async variant for other sizes), its own split-KV reduction included.
+  A 128 × 128 one-CTA tile: ~0.65-1.0 PF where the DSL's 2-CTA cluster runs
+  ~1.3 PF. 1.6-5× slower everywhere.
+- trtllm-gen MLA (`trtllm_batch_decode_with_kv_cache_mla`'s
+  `FmhaSm100fKernel_QkvBfloat16OBfloat16HQk576HV512...` cubins): the 432
+  HQk576 cubins under `$K3_REF/trtllm/.../fmha/cubin` are git-LFS pointers
+  (130 B each); no flashinfer-cubin wheel on the hosts, none in the kern
+  index or blob cache (scanned every cached blob's entry names). Not
+  loadable here: measure it where the wheel is.
+- FlashMLA: only the sm90 (wgmma) kernel is in the refs (TRT-LLM's
+  kernels/flashMLA); no sm100 decode.
+- The DSL kernel stays the best available. A kernel that beats it must
+  avoid the 96 → 128 head padding: tcgen05 MMAs take M = 64 / 128 (one CTA)
+  or 128 / 256 (a pair), so heads as M always pads; positions as M (S^T =
+  K Q^T with N = 96 heads, O^T = V^T P^T) does not, but its softmax runs over
+  TMEM lanes (a cross-thread max and sum per head per tile). Its ceiling at
+  36 × 8k: the tile from ~1.70 µs (DSL, MMA-bound at 128 rows) to the HBM
+  rate ~1.45 µs, 65 → ~56 µs a call, ~0.9% of the 16-layer step at 36
+  rows. A from-scratch tcgen05 split-KV kernel (paged TMA gather, TMEM,
+  cross-lane softmax, the DSL's partial layout for k3_dcp) is days of work,
+  not this session's remaining hours: not started.
