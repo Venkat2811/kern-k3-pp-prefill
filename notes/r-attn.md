@@ -4,6 +4,15 @@ Kernels: `k3_kda_core`, MLA (`k3_mla_prep`, `k3_mla_absorb_tc` (`_mma` under `--
 `mla_decode_h96_p64` and its grid), the DCP exchange (`k3_dcp`).
 Previous lane notes: `notes/d-attn.md` (round 1, every idea tried there).
 
+## Status (05:45 UTC): moe_front taken (unowned D op), -0.4%
+
+The MLA tile rate has a named limit now (shared memory bandwidth, "MLA decode kernel" below), kda_core's are
+in the done table, so per TASK.md this run took the next most expensive non-GEMM D op no run owns:
+`k3_moe_front` (15 calls a 16-layer step, 6.5 µs, 2.0x its latency floor; r-ar / r-comm / r-gemm targets do
+not include it). f285eb9: the router top-k by a bitonic network, bit-identical, D 3.243 → 3.227 ms/step
+(main 60f4a4d vs main + it, one lease, 3 rounds), every shape faster. Section "moe_front" below.
+The branch is rebased on 60f4a4d (check PASS, bit-identical).
+
 ## Status (05:35 UTC): the MLA kernel exists, correct, 1.25-1.4x the DSL
 
 `source/k3_mla_decode.cu` (kern_k3_mla_decode, the DSL split kernel's contract: acc_o / acc_lse, its grid,
@@ -661,3 +670,31 @@ Where next (the bound is shared memory bytes a tile, ~128 B/clk):
 3. v3's own-page V reuse with a deeper K stream (the 0.9 µs wait): needs ring space beyond two tiles.
 4. A persistent grid over the (row, split) items (the DSL's empty 16-slot clusters, skew's tail): the item
    loop around this kernel's pipeline, O and Q reloaded per item.
+
+## moe_front (`source/k3_moe_front.cu`, taken this session: no round-3 run owns it)
+
+One block a row (1024 threads): sigmoid + biased top-16 of 896 router scores, the latent's mxfp8 quant, the
+shared expert's SiTU, then the last block (an acq_rel counter) builds the routing tables. Harness
+`harness/moe_front.cu` (S warm in L2, graph of 40, outputs byte-compared; the routing tables up to the order
+of an expert's rows, which the shared-memory atomics leave free and the GEMMs / combine do not read).
+
+Where the 5.7 µs went (main's kernel, 8 rows, ablated): empty launch 0.6; no top-k 3.56; no done-atomic /
+route 4.01; no route 4.84; all 5.71. So the top-k ~2.1 µs (two levels of 16 serial REDUX pick rounds), the
+atomic + barrier 0.8, the last block's route 0.9 (an L2 round trip for the ids, smem counts, a scan, the
+tables). Quant and SiTU run beside the top-k.
+
+- **f285eb9, kept**: u64 keys (ord(score) << 32 | ~expert, the picks' total order), each warp a bitonic
+  sort32 by shuffles, a 5-level tree of merge32 over 32 lists of 16 (4 empty), quant on warps 16-29, SiTU on
+  8-13 after the first merge: 5.57-6.20 → 4.90-5.28 µs (1-64 rows); bit-identical in the step.
+- 14 warps sorting 64 (2 a lane, 21 steps) + 4 merge levels, warps leaving levels by `bar.arrive`, quant and
+  SiTU from the start: no faster (4.91-5.40).
+- Threshold top-k (the 16th largest of the 28 group maxima bounds the 16th pick; ~20 candidates ranked by
+  counting): 0.1-0.15 µs better, but its ranking is O(candidates^2): tie-heavy scores took 24 µs. Dropped
+  (an exact fallback would be a second path for 0.15 µs).
+- In-kernel clocks (block 0, 8 rows, sorted version): S row loaded 1.0 µs after entry, sort32 done 2.0,
+  picks 2.9, quant 1.1, SiTU 1.2, the done atomic + barrier 3.9, the route 5.1. What is left: the S load
+  (L2 latency at the launch ramp; the slowest warp's sets every barrier), the shuffle chains of the network
+  (latency-bound, 4-7 warps an SMSP), and the tail's two dependent round trips (counter, then the other rows'
+  ids), which any grid-wide routing has: ~1.3 µs of the tail's 1.75 is that floor.
+- Not tried: a cluster of all rows (≤ 8) with DSMEM picks and a cluster barrier instead of the counter (~1 µs
+  at 8 rows only, a second `when` build).
