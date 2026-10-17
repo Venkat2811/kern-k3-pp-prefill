@@ -193,13 +193,17 @@ def gemm_t_op(n, k):
                          "block": [128, 1, 1], "grid": [tiles * 3, 1, 1], "cluster": [3, 1, 1],
                          "shared_mem": (kb + 1) * 1024, "pdl": True, "when": {"var": T, "min": lo, "max": hi},
                          "params": ["bytes<128>", "bytes<128>", "out buffer<f32>", "i32", "i32", "i32", "i32", "i32",
-                                    "i32"],
+                                    "i32", "in buffer<bf16>", "i64", "in buffer<bf16>", "i64"],
                          "args": [tmap(1, n, GEMM_T_BM), tmap(0, 0, bn), {"param": 2}, {"param": 6}, {"param": 3},
-                                  {"param": 4}, {"param": 5}, {"i32": GEMM_T_SPLIT[0]}, {"i32": GEMM_T_SPLIT[1]}]})
+                                  {"param": 4}, {"param": 5}, {"i32": GEMM_T_SPLIT[0]}, {"i32": GEMM_T_SPLIT[1]},
+                                  *({"param": i} for i in range(7, 11))]})
         lo = hi + 1
-    launches.append({"entry": "extern:cublas_bf16_tn_f32", "when": {"var": T, "min": lo}})
-    return {"params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32", "i32"],
-            "impl": {"launches": launches}}
+    launches.append({"entry": "extern:cublas_bf16_tn_f32", "when": {"var": T, "min": lo},
+                     "params": GEMM_PARAMS_F32, "args": [{"param": i} for i in range(7)]})
+    return {"params": [*GEMM_PARAMS_F32, *PF_PARAMS, *PF_PARAMS], "impl": {"launches": launches}}
+
+
+GEMM_PARAMS_F32 = ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32", "i32"]
 
 
 def is_mla(i):
@@ -1410,7 +1414,14 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         size = lambda w: math.prod(buffers[w["buf"]]["shape"]) * {"bf16": 2, "f32": 4, "u8": 1}[
             buffers[w["buf"]]["dtype"]] - w.get("offset", 0)
         last = {}
+        pinned = first = None  # the sh_down weight our front GEMM pinned, for the next of our GEMMs to demote
         for k, c in enumerate(prog):
+            if c["op"].startswith("gemm_t"):
+                j, g = next(((j, g) for j, g in gemms if j > k and g["label"].endswith(".sh_down")), (None, None))
+                pin = g["args"][1] if g and c["label"].endswith(".front") else None
+                own = c["args"][1]
+                c["args"] += [pin or own, i64(size(pin) if pin else 0), pinned or own, i64(size(pinned) if pinned else 0)]
+                pinned, first = pin, first or c
             if c["op"] in PF_OPS:
                 w = next(g["args"][1] for j, g in gemms if j > k)
                 c["args"] += [w, i64(min(size(w), LAND_PF_MAX if c["op"].startswith("land") else PF_MAX))]
@@ -1422,6 +1433,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             if c["op"] == "ar_attnres_rms":
                 j = max(j for j, _ in gemms if j < k)
                 c["args"] += [last[j], i64(size(last[j]))] if j in last else [w, i64(0)]
+        if pinned:  # the step's last pin: the first of our GEMMs demotes it in the next replay
+            first["args"][-2:] = [pinned, i64(size(pinned))]
         return prog
 
     if chunk:

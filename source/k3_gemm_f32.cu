@@ -131,7 +131,8 @@ __device__ __forceinline__ void st_dsmem4(uint32_t addr, const float* v) {
 
 extern "C" __global__ void __launch_bounds__(128, 1)
     kern_k3_gemm_f32(const __grid_constant__ CUtensorMap tw, const __grid_constant__ CUtensorMap ta, float* __restrict__ C,
-                     int ldc, int m, int N, int K, int b1, int b2) {
+                     int ldc, int m, int N, int K, int b1, int b2, const uint8_t* __restrict__ pin,
+                     long long pin_bytes, const uint8_t* __restrict__ unpin, long long unpin_bytes) {
   asm volatile("griddepcontrol.launch_dependents;");
 #ifdef GF_TIMES
   unsigned long long t0, t1 = 0, t2;
@@ -179,6 +180,11 @@ extern "C" __global__ void __launch_bounds__(128, 1)
         tma_2d(s.a[st], &ta, &s.full[st], (kb0 + i) * BK, 0);
       }
     }
+  } else if (warp >= 2) {
+    // warps 2-3: put `unpin` (a weight an earlier call pinned) back to evict_normal before the wait
+    const long long t = (long long)blockIdx.x * 64 + threadIdx.x - 64, step = (long long)gridDim.x * 64 * 128;
+    for (long long o = t * 128; o < unpin_bytes; o += step)
+      asm volatile("applypriority.global.L2::evict_normal [%0], 128;" ::"l"(unpin + o));
   } else if (warp == 1) {
     // the whole warp walks the loop (uniform descriptors), one elected lane issues every MMA and commit
     uint32_t leader;
@@ -266,4 +272,16 @@ extern "C" __global__ void __launch_bounds__(128, 1)
     reinterpret_cast<unsigned long long*>(C + 56 * (size_t)ldc)[blockIdx.x * 4 + 3] = t3;
   }
 #endif
+  // `pin`: a weight read a few kernels on (past the MoE's stream), pulled into L2 at evict_last, a CTA's share by one
+  // bulk prefetch once its stores are out
+  if (pin_bytes && threadIdx.x == 0) {
+    const long long per = (pin_bytes / gridDim.x + 15) & ~15ll, o = (long long)blockIdx.x * per;
+    if (o < pin_bytes) {
+      uint64_t pol;
+      asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
+      asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], %1, %2;" ::"l"(pin + o),
+                   "r"((unsigned)(per < pin_bytes - o ? per : pin_bytes - o)), "l"(pol)
+                   : "memory");
+    }
+  }
 }

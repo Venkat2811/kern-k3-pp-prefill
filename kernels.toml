@@ -225,41 +225,41 @@ source = "source/k3_kda_core.cu"
 defines = { CONV_TAP_MAJOR = 1, HEADS = 12, KDA_CONV = 1, LDS = 6400, LINE_GUARD = 1, WSM_FA = 12, WSM_LDS = 6400 }
 
 [kernels."k3_gemm_f32+BN=8+CTA_KB=73+SPLITS=3"]
-sha256 = "1dd554f980f73c6825c9e489abca796041cda8ba42b4bacdd7a4a6b3560c1a0e"
+sha256 = "73ce25a87d9544fe2af8b3d7c2e9c2490ad524c1e3fb0bc6e68d894e8f07430a"
 source = "source/k3_gemm_f32.cu"
 defines = { BN = 8, CTA_KB = 73, SPLITS = 3 }
 
 [kernels."k3_gemm_f32+BN=16+CTA_KB=73+SPLITS=3"]
-sha256 = "b6f77a5814833857366f1373eed28a1feccbfcfb586b289fc7dbd47f31561b30"
+sha256 = "4f38e86b05d7af96c14e778141a22912d192590b7ec897f60b29125c6173c9b8"
 source = "source/k3_gemm_f32.cu"
 defines = { BN = 16, CTA_KB = 73, SPLITS = 3 }
 
 [kernels."k3_gemm_f32+BN=24+CTA_KB=73+SPLITS=3"]
-sha256 = "ee0845e88ff5d1fb0afbb8549a49519cd8b03ee7d4ba1f64c7fa77f00daaf240"
+sha256 = "ff58500db604d492bf61d20a5c761270b52d1aa6b259e2a4a9d939f010254298"
 source = "source/k3_gemm_f32.cu"
 defines = { BN = 24, CTA_KB = 73, SPLITS = 3 }
 
 [kernels."k3_gemm_f32+BN=8+CTA_KB=100+SPLITS=3"]
-sha256 = "5592d9ab4d1aab2b4105bdf3574fabc063e5d21395a2f57f9e66c30cf3fe4402"
+sha256 = "a7bd1d008d298951fa7610ccfc9fd7185a521ca553ae0e28f11ee91b603ec675"
 source = "source/k3_gemm_f32.cu"
 defines = { BN = 8, CTA_KB = 100, SPLITS = 3 }
 
 [kernels."k3_gemm_f32+BN=16+CTA_KB=100+SPLITS=3"]
-sha256 = "b84f57f99a05b4a3c224afeb8e41c77a708c2b300061d9f74968348359219b39"
+sha256 = "7fe5fc1bb8b101f1d7ae2cb85eb3439f7ce1916e8ddabf7285dd378c014ffce6"
 source = "source/k3_gemm_f32.cu"
 defines = { BN = 16, CTA_KB = 100, SPLITS = 3 }
 
 [kernels."k3_gemm_f32+BN=24+CTA_KB=100+SPLITS=3"]
-sha256 = "669d5263d60f466265f61d4292d4ad21070d9ec6898681a2eca0520b6bf3cdb8"
+sha256 = "0d03c2f3836fee80be244483c2cb11ae61fef22f7827f68408ba0cb1c0190dd2"
 source = "source/k3_gemm_f32.cu"
 defines = { BN = 24, CTA_KB = 100, SPLITS = 3 }
 
 [kernels."k3_gemm_f32+BN=32+CTA_KB=73+SPLITS=3"]
-sha256 = "52a78af4b275b0f8598c94bf3eb564ad77d06bb706a00676454e72f78b170134"
+sha256 = "083df9d941fdb43b691fb73695685262673a8e8bc9cd4ff05d50ea839ea5e5d9"
 source = "source/k3_gemm_f32.cu"
 defines = { BN = 32, CTA_KB = 73, SPLITS = 3 }
 
 [kernels."k3_gemm_f32+BN=32+CTA_KB=100+SPLITS=3"]
-sha256 = "1f67575ff9931df0058be01fe1c057c4a51a01d0ddba41f8a1ab83f359c83fbc"
+sha256 = "928627f27ea4e05d04f4821042bb1cbbb9624867691fc6ca37f4d015f767599c"
 source = "source/k3_gemm_f32.cu"
 defines = { BN = 32, CTA_KB = 100, SPLITS = 3 }
