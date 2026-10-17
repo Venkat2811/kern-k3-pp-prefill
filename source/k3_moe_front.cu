@@ -226,6 +226,8 @@ static_assert(EXPERTS % 32 == 0 && TOPK <= SORT_WARPS && SORT_WARPS <= 31 && QUA
 #define SPITCH (SH * 2 + 16)
 #define SMEM_SH (SROWS * SPITCH + 64 * SPITCH + 64 * SROWS * 2)
 #define UMMA_ROWS 24
+#define WORKERS (THREADS - 32)  // warp 31 prefetches FC1's first expert (prefetch_first), the rest project
+#define work_sync() asm volatile("bar.sync 1, %0;" ::"n"(WORKERS) : "memory")
 #define ACOL (SROWS * 128)  // a 64-column swizzle atom column of 64 rows
 #define UMMA_OPERAND (SH / 64 * ACOL)
 static_assert((SPITCH / 16) % 2 == 1 && SH % 64 == 0, "conflict-free ldmatrix rows");
@@ -243,7 +245,8 @@ __device__ __forceinline__ uint64_t umma_desc(uint32_t at) {
 }
 
 // out tile [t][64] = W (64 x SH, at sw) x act (rows x SH, at sa)^T: one thread issues the K steps into
-// TMEM columns [0, 8 tiles), then warp w moves tile w / 4 of its lane quarter (rows 16 (w % 4) + [0, 16)).
+// TMEM columns [0, 8 tiles), then warp w < 31 moves tiles w / 4, w / 4 + 8 (7 in lane quarter 3, whose
+// warp 31 prefetches) .. of its lane quarter (rows 16 (w % 4) + [0, 16)).
 __device__ __forceinline__ void umma_rows(uint32_t sw, uint32_t sa, uint32_t tm, uint64_t* bar, int tiles,
                                           __nv_bfloat16* tile) {
   const int t = threadIdx.x, warp = t / 32, lane = t % 32;
@@ -261,8 +264,8 @@ __device__ __forceinline__ void umma_rows(uint32_t sw, uint32_t sa, uint32_t tm,
     asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" ::"r"(smem_at(bar))
                  : "memory");
   }
-  const int j = warp / 4, q = warp % 4;
-  if (j < tiles) {
+  const int q = warp % 4;
+  for (int j = warp / 4; j < tiles; j += q == 3 ? WORKERS / 128 : WORKERS / 128 + 1) {
     asm volatile("{\n.reg .pred p;\nW: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], 0;\n@!p bra W;\n}"
                  ::"r"(smem_at(bar)) : "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
@@ -326,8 +329,8 @@ __device__ __forceinline__ void sh_rows16(uint32_t a_at, uint32_t b_at, int tile
 }
 
 // FC1's first CTAs take the touched expert of the lowest local index: once every row's ids are in
-// (ids[c * 64 + b] = 1, cleared here), one warp of block T + c pulls its share of that expert's FC1
-// weights and scales into L2 while HBM is otherwise idle.
+// (ids[c * 64 + b] = 1, cleared here), warp 31 of block T + c, apart from the projection from the start,
+// pulls its share of that expert's FC1 weights and scales into L2 while HBM is otherwise idle.
 __device__ __forceinline__ void prefetch_first(const int* __restrict__ idx, int* __restrict__ ids, int first, int T,
                                                int c, const uint8_t* __restrict__ w13, const uint8_t* __restrict__ w13_sf) {
   const int lane = threadIdx.x % 32;
@@ -361,13 +364,17 @@ __device__ __forceinline__ void shared_down(const __nv_bfloat16* __restrict__ ac
   __shared__ __align__(8) uint64_t s_bar;
   __shared__ uint32_t s_tmem;
   const int t = threadIdx.x, warp = t / 32, lane = t % 32, n0 = c * SROWS;
+  if (t >= WORKERS) {
+    prefetch_first(idx, ids, first, T, c, w13, w13_sf);
+    return;
+  }
   const bool umma = T > UMMA_ROWS;
   uint8_t* sw = umma ? sm + ((1024 - (smem_at(sm) & 1023)) & 1023) : sm;  // swizzle atoms 1 KB aligned
   uint8_t* sa = sw + (umma ? UMMA_OPERAND : SROWS * SPITCH);
   __nv_bfloat16* tile = reinterpret_cast<__nv_bfloat16*>(sa + (umma ? UMMA_OPERAND : 64 * SPITCH));
   const auto at = [umma](int r, int k) { return umma ? swizzled(r, k) : pitched(r, k); };
   if (t >= 256)
-    for (int i = t - 256; i < SROWS * (SH / 8); i += THREADS - 256)
+    for (int i = t - 256; i < SROWS * (SH / 8); i += WORKERS - 256)
       asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
                    ::"r"(smem_at(sw + at(i / (SH / 8), i % (SH / 8)))), "l"(W + (size_t)n0 * SH + i * 8) : "memory");
   asm volatile("cp.async.commit_group;" ::: "memory");
@@ -386,27 +393,24 @@ __device__ __forceinline__ void shared_down(const __nv_bfloat16* __restrict__ ac
     }
     *flag = 0;
   }
-  __syncthreads();
-  for (int i = t; i < T * (SH / 8); i += THREADS)
+  work_sync();
+  for (int i = t; i < T * (SH / 8); i += WORKERS)
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
                  ::"r"(smem_at(sa + at(i / (SH / 8), i % (SH / 8)))), "l"(act + i * 8) : "memory");
   asm volatile("cp.async.commit_group;" ::: "memory");
   asm volatile("cp.async.wait_group 0;" ::: "memory");
   const int tiles = (T + 7) / 8;
-  const bool prefetcher = warp == 31 && tiles < 8;  // idle in either product below
   if (umma) {
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // the operands, to the tensor cores' reads
     asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
-    __syncthreads();
+    work_sync();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-    if (prefetcher) prefetch_first(idx, ids, first, T, c, w13, w13_sf);
     umma_rows(smem_at(sw), smem_at(sa), s_tmem, &s_bar, tiles, tile);
     asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
-    __syncthreads();
+    work_sync();
     if (warp == 2) asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 64;" ::"r"(s_tmem) : "memory");
   } else {
-    __syncthreads();
-    if (prefetcher) prefetch_first(idx, ids, first, T, c, w13, w13_sf);
+    work_sync();
     if (warp < 4) {
       // ldmatrix rows: A (16 W rows) lane l -> row l % 16, column half l / 16; B (8 act rows) lane l -> row l % 8, half (l / 8) % 2
       const uint32_t a_at = smem_at(sw + (16 * warp + lane % 16) * SPITCH + (lane / 16) * 16);
@@ -416,9 +420,9 @@ __device__ __forceinline__ void shared_down(const __nv_bfloat16* __restrict__ ac
       else
         sh_rows16<3>(a_at, b_at, tiles, tile, 16 * warp + lane / 4, lane % 4);
     }
-    __syncthreads();
+    work_sync();
   }
-  for (int i = t; i < T * (SROWS / 8); i += THREADS) {
+  for (int i = t; i < T * (SROWS / 8); i += WORKERS) {
     const int r = i / (SROWS / 8), col = i % (SROWS / 8);
     reinterpret_cast<uint4*>(out + (size_t)r * NSH + n0)[col] = reinterpret_cast<const uint4*>(tile + r * SROWS)[col];
   }
