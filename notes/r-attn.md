@@ -43,10 +43,18 @@ Attention floor (the rank's latent rows once, 1152 B a position): 10.3 /
 
 ## Done
 
-- **MLA split slots** (e33e3a1): grid z = 16 below 16 rows, 4 from 16 rows
-  (`MLA_SLOTS`), the plan capped to match. Cap 2 from 32 rows tried: at 48 x
-  128k the plan wants 3 splits (2 waves of 144 clusters); capped at 2 it
-  takes 1 split, +65 µs a step. -0.37%.
+- **MLA split slots** (e33e3a1, **reverted** in 779342f): grid z = 16 below
+  16 rows, 4 from 16 rows, the plan capped to match: -0.37% on the uniform
+  bench. The orchestrator asked for skewed batches: measured in-graph (work/
+  skew.py adds a test kernel that rewrites seq_lens into a workspace copy
+  every call reads: row 0 at the bench's 256k, the rest at 8-16k or spread
+  over 10k-250k), 16 slots vs the tiers, ms/step: one long row 16 rows
+  2.885 → 3.080, 24 rows 3.280 → 3.455, 48 rows 4.138 → 4.271; spread 16
+  rows 3.042 → 3.103, 36 rows 4.114 → 4.204. The capped long row (4 splits
+  where the plan wants 16+) is every MLA layer's tail. The slots would have
+  to follow the batch's longest row; no launch expression sees it and the
+  DSL kernel is non-persistent. Back to 16. (A split cap of 32 would help
+  skewed batches further but costs ~0.8% on the uniform bench, round 1.)
 
 - **kda_core** (4f31f73): ablation on one GPU (work/t/kda.cu under nsys,
   `work/t/kda.sh`) showed a call at 8 rows was 9.0 µs of which 7.0 with no
