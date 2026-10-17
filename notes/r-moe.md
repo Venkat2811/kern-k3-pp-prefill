@@ -93,6 +93,10 @@ the tables ~0.5. Measured 5.5-5.7 in the step, 5.1-5.4 in the harness: 1.2-1.3x 
   - At 1 / 2 / 4 rows main's pair is also the best (FC1 8.8 / 12.2 / 17.9, FC2 5.4 / 6.4 / 8.8).
   - Grid: the batch dim is launched at its bound (112 + T CTA rows, mostly exiting at once). Cutting the
     bound to 40 + T (a timing-only hack) changed FC1 / FC2 by <= 1%: exiting CTAs are cheap.
+- Bytes are the minimum (ncu, single-pass metrics inside the TP8 step, 8 rows real text, one layer;
+  `work/ncu2.sh`: kernel replay cannot save a 200 GB device): FC1 read 198.9 MB = 17.00 touched
+  experts x 11.70 MB, FC2 99.6 MB = 17.02 x 5.85 MB. Alone (no PDL overlap) FC1 took 41.3 us (4.8 TB/s,
+  1.52x) and FC2 25.3 us (3.9 TB/s, 1.86x); in the step FC2's early weight loads hide part of that.
 - So per-bucket routing (`when`) has nothing to route to; the generator change that would do it
   (`--moe-buckets`, moe_front's TILE define) was written, measured, and not committed.
 
@@ -165,7 +169,14 @@ Tried:
   expert reachable on two ranks; the batch is replicated, so every rank can compute the same balanced
   assignment from the picks with no exchange. Memory is the cost (a second copy of a share of the
   experts).
-- **A persistent MoE kernel** (FC1 -> FC2 per expert panel, sh_down filling the drain): removes FC1's
+- **A persistent MoE kernel** (FC1 -> FC2 per expert panel, sh_down filling the drain). References:
+  DeepGEMM's `sm100_fp8_fp4_mega_moe.cuh` (fp8 x fp4 tcgen05, FC1 + SiTU + FC2 in one persistent
+  kernel, but built around EP dispatch / combine over symmetric buffers), and the kernel index's
+  `k3_mega_moe` (a K3 build of it, 224 experts only, r1-r16). Our layout (replicated batch, every rank
+  its experts over every row, then the all-reduce) would need its dispatch removed and the routing
+  tables built in it. What it could take back, from the waves above: FC1's and FC2's last-wave
+  quantization (half a wave each, 2.5-2.7 / ~2 us), the FC1 -> FC2 boundary, sh_down's 3.7 us tail;
+  roughly 5-8 us a layer at 8-48 rows, 75-120 us a step of the 16-layer bench (2-3.5%). removes FC1's
   entry wait behind the tables only if the tables are built inside it, and FC1's / FC2's last-wave
   quantization (half a wave each, 2-3 us). Needs block-scaled tcgen05 MMA and, for numerics, the
   GEMM.md proof (FC1's mxfp8 output requantizes any change of summation order).
