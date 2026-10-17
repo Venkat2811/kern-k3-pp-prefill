@@ -187,6 +187,9 @@ Tried and dropped (A/B in one lease each, ms/step):
 - on main 21a9174 (r-ar's load window: AR_GRACE_NS 500, 8 MB in flight, closing-add hints capped at 16 MB), with
   this branch's GEMMs: the attention all-reduce's grace at 1.5 / 2.5 us 3.2720 / 3.2825, the closing add's hints
   at 48 MB 3.2770, against 3.2630 as r-ar set them: their window is right for our GEMMs too.
+- 33-48 rows with 128-row tiles (A's share of a stage halved, qkvg's 50 clusters fit at two CTAs an SM) and the
+  partials over the ring after one more cluster barrier (4 stages at 100 KB): bit-identical, but qkvg 20.8 vs
+  18.0 us cold (cuBLAS), front 19.7 vs 16.4 (the 64-row build): fatter CTAs stream worse.
 - o_proj by a kernel holding its whole 192 KB weight slice in shared memory, requested before
   griddepcontrol.wait (work/h/k3_gemm_pre.cu, bit-identical 1..64 rows): 8.6 vs 5.2 us alone, 7.1 vs 4.7 after a
   9 us PDL predecessor: A's 64-row boxes through a 3-deep ring after the wait cost more than the preload saves.
