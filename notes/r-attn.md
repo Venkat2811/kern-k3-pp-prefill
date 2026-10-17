@@ -455,10 +455,19 @@ math, TMEM O, bf16 P) to write and tune from PTX, more than this session.
   48 / 64 rows: 4.64 4.77 4.96 5.63 6.34 6.66 7.49 → 4.96 4.64 4.58 4.80 5.09
   5.12 5.44. 1 row loses 0.3 µs: the last group's commit → TMEM read →
   stores is longer than one mma.sync tile, and 96 blocks pull 128 KB each.
-- The fp8 query (`--kv fp8`) keeps k3_mla_absorb_mma: its e4m3 casts without
-  saturation are software (16.4 µs at 48 rows in either build); a cast by
-  `cvt.rn.satfinite` with a NaN fix-up past 448 would be the same bits and
-  hardware speed. Not D's bench: noted, not done.
+- The fp8 query (`--kv fp8`) keeps k3_mla_absorb_mma. Its e4m3 casts were
+  cuda_fp8's software __NV_NOSAT (~40 integer instructions a pair: 16.4 µs at
+  48 rows). aac88c1: `cvt.rn.satfinite.e4m3x2` with |x| > 464 put back to
+  NaN with x's sign (`source/k3_e4m3.cuh`) is the same byte for all 2^32
+  floats (`work/mma/e4m3.cu`, exhaustive; 464 itself rounds to 448, every
+  NaN gives 0x7f); the absorb's and mla_prep's fp8 builds use it. Absorb
+  fp8, µs at 1 / 8 / 24 / 48 / 64 rows: 6.50 6.62 10.46 16.38 20.38 → 4.70
+  4.86 6.14 8.06 9.09, byte-identical. The tcgen05 build with the same cast
+  (a byte a column, then lane pairs by shuffle, then the fix-up skipped by a
+  warp vote): 5.18-5.55 / 8.10-10.40 µs at 1 / 48 rows, byte-identical but no
+  faster: with one block an SM, its epilogue is 96 values a thread at 48
+  rows and the cast's instructions are on the critical path. Kept on
+  mma.sync.
 - **W_UK into L2 from mla_prep** (two launches before absorb; HBM idle
   while q_b's CTAs wait on mla_prep), nsys rank 0, µs at 8 × 64k / 48 × 128k:
   one thread a block issuing 128 KB `cp.async.bulk.prefetch.L2`: mla_prep
