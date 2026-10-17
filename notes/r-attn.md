@@ -4,6 +4,15 @@ Kernels: `k3_kda_core`, MLA (`k3_mla_prep`, `k3_mla_absorb_tc` (`_mma` under `--
 `mla_decode_h96_p64` and its grid), the DCP exchange (`k3_dcp`).
 Previous lane notes: `notes/d-attn.md` (round 1, every idea tried there).
 
+## Status (06:25 UTC): k3_mla_decode in the step from 24 rows, -0.19%
+
+4ebcfd9: D's MLA attention runs on our kernel (`source/k3_mla_decode.cu`) from 24 rows, the DSL below (one
+`when` launch each). D weighted 3.219 → 3.213 ms/step (branch HEAD vs it, one lease, 3 rounds); at the A/B
+shapes 32 / 64 rows x 8k -24 / -64 µs a step, x 32k -15 / -56 (the DSL's 16-slot grid's empty clusters cost
+ours ~0.7 µs a cluster, an early exit after the lengths load). Numerics at 36 rows (teacher-forced, the
+oracle alongside): in main's band (table in the commit). "MLA decode kernel" has the versions; what made it:
+two counters that were wrong (shared memory is not the limit: ncu) and the MMA warp's instruction count.
+
 ## Status (05:45 UTC): moe_front taken (unowned D op), -0.4%
 
 The MLA tile rate has a named limit now (shared memory bandwidth, "MLA decode kernel" below), kda_core's are
@@ -175,7 +184,8 @@ The branch on main 21a9174 at 2f5eb5f (`work/prof.sh`, 16 layers):
 | kernel | 1 | 8 | 32 | 64 | 32 × 32k | floor (1 / 8 / 32 / 64 / 32×32k) | named limit |
 |---|---|---|---|---|---|---|---|
 | kda_core | 5.79 | 6.14 | 11.15 | 19.41 | 10.90 | 0.29 / 1.87 / 7.29 / 14.52 / 7.29 | chain (≤ 25 rows), prologue beside the state (R build) |
-| mla_attn (DSL, 16 slots) | 8.68 | 10.60 | 27.37 | 48.51 | 43.82 | 0.42 / 2.48 / 7.36 / 12.99 / 22.80 | not a hardware ceiling (ncu in the step: tensor 44%, DRAM ~60%, smem banks 20%); latency / pipelining, ~7 µs a launch, empty and quantized waves; a kernel of ours did not beat it ("MLA decode kernel") |
+| mla_attn (DSL, 16 slots) | 8.68 | 10.60 | 27.37 | 48.51 | 43.82 | 0.42 / 2.48 / 7.36 / 12.99 / 22.80 | not a hardware ceiling (ncu in the step: tensor 44%, DRAM ~60%, smem banks 20%); latency / pipelining, ~7 µs a launch, empty and quantized waves |
+| mla_attn from 24 rows (k3_mla_decode, 4ebcfd9; harness, KV cold) | | | 19.5 (32 x 1k) | 32.1 (64 x 1k) | 37.6 (32 x 4k) | same | tensor 46%, DRAM 56%: one tile of K and of V in flight a pair (smem), ~3 µs a launch fixed (setup, first page, f32 partial out) |
 | mla_absorb (tcgen05) | 5.02 | 4.84 | 5.33 | 5.79 | 5.09 | 1.72 (12.6 MB) | launch + HBM round trip + 12.6 MB (loads alone 3.7) |
 | mla_prep | 1.71 | 1.62 | 1.96 | 1.87 | 1.63 | launch | the launch |
 | moe_front (f285eb9; main 6.5 at every shape) | | 5.73 (8 x 64k) | | | | 3.26 (estimate: two dependent passes) | S row's L2 latency (~1.0 µs after entry), the top-k network's shuffle chains (~1.85), the tail's counter + ids round trips (~1.3 of 1.75) |
@@ -670,6 +680,30 @@ commits, 13 waits and fences) with the pipe idle.
 a kernel that kept the KV stream continuous (Q K^T of tile i + 2 issued before P V of tile i, three S
 buffers: 192 + 256 TMEM columns) and fewer, larger MMAs (N 256 Q K^T) could approach the HBM share
 (1.53 µs a tile at 76 pairs), ~10% of the call. Not reached here (v3-v5).
+
+**v6-v15 (this session, after the correction), harness µs at 8 x 8k / 24 x 8k / 36 x 8k / 48 x 16k:**
+
+| step | 8 x 8k | 24 x 8k | 36 x 8k | 48 x 16k | what |
+|---|---|---|---|---|---|
+| v4 | 28.1 | 58.0 | 79.2 | 200.8 | |
+| v6: three S buffers, Q K^T of tile i + 2 before P V of tile i | 28.7 | 58.7 | 80.0 | 202.7 | the MMA warp, not the K stream, was the limit |
+| v7: descriptors precomputed (a base each, offsets in the address field), slot / phase counters, boxes unrolled | 25.6 | 52.1 | 69.7 | 174.5 | ~30 instructions an MMA were ~0.5 µs a tile of the issuing thread |
+| v9: the loaders on counters too | 25.6 | 52.1 | 69.5 | 174.0 | |
+| v10: the epilogue's f32 rows staged in the free ring, out by bulk store | 23.4 | 49.8 | 67.5 | 170.2 | a thread a row (32 lines an instruction) took 5 µs in CTA 0 |
+| v12: out a warp a row (512 B a store) | 23.2 | 49.6 | 67.2 | 168.6 | TMA store ~55 GB/s from one SM; LSU ~61 |
+| v14: the cluster barrier split (arrive after the barriers' init, the loaders wait, warp 0 allocates TMEM meanwhile) | 22.7 | 49.2 | 67.0 | 168.5 | -0.4 µs of the 1.7 µs setup |
+| v15: heads 48c .. 48c + 63 a CTA, 48 written each | 22.5 | 49.1 | 66.7 | 169.6 | the epilogue balanced |
+
+DSL in the step: 21.9 / 46.7 / 65.0 / 160.9. Tried and dropped on v15: L2 prefetch 1-3 tiles ahead (again
+slower at every distance), K / V rings 11 / 3, 13 / 2, 7 / 5, 5 / 6 boxes (9 / 4 best: a tile each), the
+epilogue's TMEM loads four at a time (no change). In the step (A/B against the DSL everywhere, 3 rounds):
+equal weighted (3.217 / 3.215), 36 / 48 rows x 64k -20..-25 µs a step, 8 / 16 rows +7..+15 (the DSL's ~2.5
+µs less a launch at 8 tiles an item, and its tiles faster when only 64 pairs run): hence the 24-row split.
+
+What is left in ours (v15, 8 x 8k, clocks in the kernel): setup to TMEM 1.4 µs (the lengths' load 0.7,
+the pair's TMEM alloc 0.4, the cluster barrier), Q and the first page ~1 µs more, the epilogue's 96 KB of
+f32 out ~1.6 µs (the DSL writes the same partial), per tile ~1.8 µs at 72 pairs (tensor 46%, DRAM 56%:
+latency-bound with one tile of K and one of V in flight a pair, 137 KB of ring after Q's 72 KB).
 
 Where next:
 1. Q K^T at N 256 (256-position tiles, each CTA two pages): the Q re-reads halve, -36 KB per 128 positions;
