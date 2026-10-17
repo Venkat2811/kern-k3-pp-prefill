@@ -104,6 +104,29 @@ kernel's work). ar_finalize_rms's mean over ranks is 1.6-3x its own time: the EP
 The closing add: the add -> score -> mix -> norm chain over a cluster of 4 (two cluster reductions) and its
 16 MB of next-weight hints; at 64 rows nb 2 its snapshot reads add ~1 us.
 
+**In the 93-layer step** (head on main 8319034, nsys, all 8 ranks, own time us a call, 8 / 64 rows x 8k; by
+snapshot count, calls a step in brackets):
+
+| nb | ar_attnres_rms | land_add2_attnres_rms |
+|---|---:|---:|
+| 1 | 8.5 / 8.9 (13) | 3.1 / 4.0 (11) |
+| 2 | 8.4 / 9.5 (12) | 3.2 / 4.8 (12) |
+| 3 | 8.4 / 10.3 (12) | 3.3 / 5.3 (12) |
+| 4 | 9.1 / 10.9 (12) | 3.5 / 5.8 (12) |
+| 5 | 9.5 / 11.1 (12) | 3.7 / 6.1 (12) |
+| 6 | 9.9 / 11.3 (12) | 3.7 / 6.5 (12) |
+| 7 | 10.2 / 11.8 (12) | 3.8 / 6.9 (12) |
+| 8 | 10.8 / 12.2 (9) | 4.4 / 8.8 (9) |
+| ar_finalize_rms | 7.9 / 9.4 (92; mean over ranks 19.0 / 27.3) | |
+
+A snapshot costs the all-reduce 0.33 / 0.46 us and the closing add 0.18 / 0.6 us a call at 8 / 64 rows. The
+closing add's phases (harness stamps, `g_land_st`, mean over row blocks, ns, 8 rows nb 1 / 8 rows nb 8 / 64
+rows nb 8): score reduction 703 / 1367 / 1962 (at nb 8 18 values padded to a 32-value cluster reduction), norm
+reduction 625 / 635 / 844, mix 179 / 559 / 757, partials 75 / 290 / 419, the loads, add and stores ~0.5 us. A
+cluster reduction costs ~0.25 us over one block's (the DSMEM broadcast and the cluster barrier); the two are
+dependent (the norm needs the mix, the mix the scores). Not the snapshots' bytes: kept in L2 they measured
+nothing (above).
+
 ## Cold code: why nb >= 2 cost +6 us a call in the step (05:00 UTC)
 
 Per-call own time in the step (work/ar/percall.py: end minus the previous kernel's end, min over the ranks) put
