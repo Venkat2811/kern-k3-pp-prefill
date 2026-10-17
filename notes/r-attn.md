@@ -459,3 +459,12 @@ math, TMEM O, bf16 P) to write and tune from PTX, more than this session.
   saturation are software (16.4 µs at 48 rows in either build); a cast by
   `cvt.rn.satfinite` with a NaN fix-up past 448 would be the same bits and
   hardware speed. Not D's bench: noted, not done.
+- **W_UK into L2 from mla_prep** (two launches before absorb; HBM idle
+  while q_b's CTAs wait on mla_prep), nsys rank 0, µs at 8 × 64k / 48 × 128k:
+  one thread a block issuing 128 KB `cp.async.bulk.prefetch.L2`: mla_prep
+  1.68 → 5.12 / 1.73 → 3.30, absorb 4.98 → 4.38 / 5.31 → 5.12, q_b
+  unchanged; a `prefetch.global.L2` a line over every thread of the grid:
+  mla_prep 4.99 / 3.31, absorb 4.35 / 5.17. Issuing 12.6 MB of requests keeps
+  the kernel open about as long as HBM takes to serve them (1.7 µs at full
+  rate, longer from few SMs), and absorb gains less than that. D A/B
+  (bulk): 3.378 / 3.376 → 3.376 / 3.375, 8 rows worse. Dropped.
