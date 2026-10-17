@@ -178,6 +178,9 @@ Tried and dropped (A/B in one lease each, ms/step):
   scratch by the last of three; work/h/k3_gemm_f32w.cu): bit-identical 1..48, but 26 vs 18 us cold, 20 vs 10 hot.
   Its loop is fine (7.0 us) and the epilogue 1.7; a 194 KB CTA cannot sit beside the kernel before it, so every
   call pays its whole start (~2.5 us) after the predecessor, and it is worse back to back.
+- on main 21a9174 (r-ar's load window: AR_GRACE_NS 500, 8 MB in flight, closing-add hints capped at 16 MB), with
+  this branch's GEMMs: the attention all-reduce's grace at 1.5 / 2.5 us 3.2720 / 3.2825, the closing add's hints
+  at 48 MB 3.2770, against 3.2630 as r-ar set them: their window is right for our GEMMs too.
 - o_proj by a kernel holding its whole 192 KB weight slice in shared memory, requested before
   griddepcontrol.wait (work/h/k3_gemm_pre.cu, bit-identical 1..64 rows): 8.6 vs 5.2 us alone, 7.1 vs 4.7 after a
   9 us PDL predecessor: A's 64-row boxes through a 3-deep ring after the wait cost more than the preload saves.
